@@ -401,10 +401,169 @@
     rafId = requestAnimationFrame(draw);
   }
 
+  function initQRStory() {
+    const canvas = $("#qr-story-canvas");
+    const section = $(".qr-story-section");
+    const stepEl = $("#qrStoryStep");
+    const textEl = $("#qrStoryText");
+    if (!canvas || !section) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const isMobile = window.matchMedia("(pointer: coarse)").matches;
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+
+    const QR_SIZE = 21;
+    const steps = [
+      { text: "Un lien devient matrice.", threshold: 0 },
+      { text: "Chaque pixel trouve sa place.", threshold: 0.25 },
+      { text: "La couleur donne vie au code.", threshold: 0.5 },
+      { text: "Un scan, et tout s'ouvre.", threshold: 0.75 },
+    ];
+
+    let width, height, cellSize, offsetX, offsetY;
+    let grid = [];
+    let currentStep = -1;
+    let rafId = null;
+    let isVisible = false;
+
+    function generateGrid() {
+      const seed = 42;
+      grid = [];
+      for (let i = 0; i < QR_SIZE * QR_SIZE; i++) {
+        const row = Math.floor(i / QR_SIZE);
+        const col = i % QR_SIZE;
+        const isFinder = (row < 7 && col < 7) || (row < 7 && col >= QR_SIZE - 7) || (row >= QR_SIZE - 7 && col < 7);
+        const isDark = isFinder
+          ? (row === 0 || row === 6 || col === 0 || col === 6 || (row >= 2 && row <= 4 && col >= 2 && col <= 4))
+          : ((i * seed + row * 7 + col * 13) % 3 === 0);
+        grid.push(isDark);
+      }
+    }
+
+    function resize() {
+      width = window.innerWidth;
+      height = window.innerHeight;
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      ctx.scale(dpr, dpr);
+      cellSize = Math.min(width, height) * 0.5 / QR_SIZE;
+      offsetX = (width - cellSize * QR_SIZE) / 2;
+      offsetY = (height - cellSize * QR_SIZE) / 2;
+    }
+
+    function getScrollProgress() {
+      const rect = section.getBoundingClientRect();
+      const sectionHeight = section.offsetHeight - window.innerHeight;
+      if (sectionHeight <= 0) return 0;
+      return Math.max(0, Math.min(-rect.top / sectionHeight, 1));
+    }
+
+    function draw() {
+      if (!isVisible) return;
+
+      const progress = getScrollProgress();
+      ctx.clearRect(0, 0, width, height);
+
+      const generateProgress = Math.min(progress / 0.25, 1);
+      const colorProgress = Math.max(0, Math.min((progress - 0.25) / 0.25, 1));
+      const scanProgress = Math.max(0, Math.min((progress - 0.5) / 0.25, 1));
+      const scaleProgress = Math.max(0, Math.min((progress - 0.75) / 0.25, 1));
+
+      const scale = 1 - scaleProgress * 0.3;
+      const currentCellSize = cellSize * scale;
+      const currentOffsetX = offsetX + (cellSize * QR_SIZE - currentCellSize * QR_SIZE) / 2;
+      const currentOffsetY = offsetY + (cellSize * QR_SIZE - currentCellSize * QR_SIZE) / 2;
+
+      const totalPixels = QR_SIZE * QR_SIZE;
+      const pixelsToDraw = Math.floor(totalPixels * generateProgress);
+
+      for (let i = 0; i < pixelsToDraw; i++) {
+        const row = Math.floor(i / QR_SIZE);
+        const col = i % QR_SIZE;
+        const isDark = grid[i];
+        if (!isDark) continue;
+
+        const x = currentOffsetX + col * currentCellSize;
+        const y = currentOffsetY + row * currentCellSize;
+
+        const isCoral = colorProgress > 0 && (i % 5 === 0 || (row < 7 && col < 7) || (row < 7 && col >= QR_SIZE - 7) || (row >= QR_SIZE - 7 && col < 7));
+        ctx.fillStyle = isCoral ? "#bd3c34" : "#101b33";
+        ctx.globalAlpha = 0.9;
+        ctx.fillRect(x, y, currentCellSize - 1, currentCellSize - 1);
+      }
+
+      if (scanProgress > 0 && scanProgress < 1) {
+        const scanY = currentOffsetY + scanProgress * currentCellSize * QR_SIZE;
+        const gradient = ctx.createLinearGradient(0, scanY - 20, 0, scanY + 20);
+        gradient.addColorStop(0, "rgba(189, 60, 52, 0)");
+        gradient.addColorStop(0.5, "rgba(189, 60, 52, 0.3)");
+        gradient.addColorStop(1, "rgba(189, 60, 52, 0)");
+        ctx.fillStyle = gradient;
+        ctx.fillRect(currentOffsetX, scanY - 20, currentCellSize * QR_SIZE, 40);
+      }
+
+      ctx.globalAlpha = 1;
+
+      let stepIndex = 0;
+      for (let i = steps.length - 1; i >= 0; i--) {
+        if (progress >= steps[i].threshold) {
+          stepIndex = i;
+          break;
+        }
+      }
+      if (stepIndex !== currentStep) {
+        currentStep = stepIndex;
+        if (stepEl) stepEl.textContent = `0${stepIndex + 1}`;
+        if (textEl) textEl.textContent = steps[stepIndex].text;
+      }
+
+      rafId = requestAnimationFrame(draw);
+    }
+
+    function checkVisibility() {
+      const rect = section.getBoundingClientRect();
+      isVisible = rect.top < window.innerHeight && rect.bottom > 0;
+      if (isVisible && !rafId) {
+        rafId = requestAnimationFrame(draw);
+      } else if (!isVisible && rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+    }
+
+    if (reduceMotion) {
+      generateGrid();
+      resize();
+      const progress = getScrollProgress();
+      let stepIndex = 0;
+      for (let i = steps.length - 1; i >= 0; i--) {
+        if (progress >= steps[i].threshold) {
+          stepIndex = i;
+          break;
+        }
+      }
+      if (stepEl) stepEl.textContent = `0${stepIndex + 1}`;
+      if (textEl) textEl.textContent = steps[stepIndex].text;
+      return;
+    }
+
+    generateGrid();
+    resize();
+    window.addEventListener("resize", resize);
+    window.addEventListener("scroll", checkVisibility, { passive: true });
+    checkVisibility();
+  }
+
   async function init() {
     cacheElements();
     bindEvents();
     initIntro();
+    initQRStory();
     initHeroParallax();
     initScrollAnimations();
     initParallax();
