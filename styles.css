@@ -2339,15 +2339,19 @@ body.modal-open {
   align-items: center;
   gap: 7px;
   max-width: 150px;
-  color: var(--ink-soft);
+  color: var(--coral);
   font-size: 10px;
   font-weight: 800;
   text-decoration: none;
   border-radius: 999px;
+  padding: 4px 8px;
+  background: rgba(189, 60, 52, 0.1);
+  transition: background 0.2s;
 }
 
 .user-chip:hover,
 .user-chip:focus-visible {
+  background: rgba(189, 60, 52, 0.2);
   color: var(--ink);
 }
 
