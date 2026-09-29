@@ -9,9 +9,9 @@
       content="Créez des QR codes personnalisés à partir d'un lien ou de vos coordonnées en quelques secondes."
     />
     <title>QROOD — Créez des QR codes qui font avancer</title>
-    <link rel="stylesheet" href="styles.css?v=9" />
+    <link rel="stylesheet" href="styles.css?v=14" />
     <script src="qrcode-generator.js" defer></script>
-    <script src="app.js?v=15" defer></script>
+    <script src="app.js?v=16" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -38,7 +38,7 @@
               <button class="button button-dark button-small" id="registerButton" type="button">Créer un compte</button>
             </div>
             <div class="user-actions" id="userActions" hidden>
-              <span class="user-chip" title="Compte connecté"><span class="user-avatar" id="userAvatar">Q</span><span id="userName">Mon compte</span></span>
+              <a class="user-chip" href="/compte" title="Gérer mon compte"><span class="user-avatar" id="userAvatar">Q</span><span id="userName">Mon compte</span></a>
               <button class="plan-badge" id="planBadge" type="button" title="Changer d’offre">Découverte</button>
               <button class="auth-link" id="logoutButton" type="button">Déconnexion</button>
             </div>
@@ -449,7 +449,8 @@
       <footer class="footer">
         <a class="brand footer-brand" href="#top"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span><span class="brand-name">QROOD<span class="brand-dot">.</span></span></a>
         <p>Fait pour les idées qui se partagent.</p>
-        <div class="footer-meta"><span>© 2024 QROOD</span><span class="footer-separator">/</span><a href="#guide">Besoin d’aide&nbsp;?</a></div>
+        <p class="footer-made">Créé avec<span class="footer-heart" aria-hidden="true"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" focusable="false"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"></path></svg></span></p>
+        <div class="footer-meta"><span id="footerYear">© 2024 QROOD</span><span class="footer-separator">/</span><a href="#guide">Besoin d’aide&nbsp;?</a></div>
       </footer>
     </div>
 

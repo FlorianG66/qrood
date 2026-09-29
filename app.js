@@ -94,6 +94,7 @@
     bindEvents();
     renderHistory();
     updatePreview();
+    renderFooterYear();
     // Les tarifs sont publics : la requête part en parallèle de la session, pour
     // que la section soit lisible sans attendre la réponse d'authentification.
     const offersPromise = loadOffers();
@@ -196,6 +197,11 @@
     elements.toast = $("#toast");
     elements.toastMessage = $("#toastMessage");
     elements.copyLabel = $("#copyLabel");
+    elements.footerYear = $("#footerYear");
+  }
+
+  function renderFooterYear() {
+    elements.footerYear.textContent = `© ${new Date().getFullYear()} QROOD`;
   }
 
   function bindEvents() {

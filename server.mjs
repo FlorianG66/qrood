@@ -15,6 +15,7 @@ import {
   redactSecrets,
 } from "./billing-rules.mjs";
 import {
+  buildEmailChangeMessage,
   buildResetMessage,
   buildVerificationMessage,
   createApiTransport,
@@ -148,8 +149,14 @@ const MAX_RATE_BUCKETS = 10_000;
 // voler un lien de réinitialisation ne valide pas une adresse par surprise.
 const VERIFICATION_PURPOSE = "email_verification";
 const RESET_PURPOSE = "password_reset";
+// Le changement d'adresse a son propre but : son lien ne vaut ni confirmation
+// ni réinitialisation. Il ne s'applique qu'à l'adresse en attente, donc le
+// voler ne donne accès à rien, mais le séparer évite qu'un lien de
+// réinitialisation interprete une adresse jamais prouvée comme confirmée.
+const EMAIL_CHANGE_PURPOSE = "email_change";
 const VERIFICATION_TOKEN_TTL_MS = readInteger("QROOD_VERIFICATION_TOKEN_HOURS", 24, 1, 168) * 60 * 60 * 1_000;
 const RESET_TOKEN_TTL_MS = readInteger("QROOD_RESET_TOKEN_MINUTES", 60, 5, 1_440) * 60 * 1_000;
+const EMAIL_CHANGE_TOKEN_TTL_MS = readInteger("QROOD_EMAIL_CHANGE_TOKEN_MINUTES", 60, 5, 1_440) * 60 * 1_000;
 // Plancher entre deux envois pour une même adresse et un même but : il
 // dépend de l'heure du dernier envoi, donc il survit au redémarrage.
 const MAIL_RESEND_DELAY_MS = readInteger("QROOD_MAIL_RESEND_DELAY_SECONDS", 60, 0, 3_600) * 1_000;
@@ -192,7 +199,7 @@ if (DB_PATH !== ":memory:") {
 }
 
 const db = new DatabaseSync(DB_PATH);
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 // La version est lue avant toute écriture : c'est elle qui distingue une base
 // existante d'une base neuve, et donc une migration d'un simple rattrapage.
 const previousSchemaVersion = Number(db.prepare("PRAGMA user_version").get()?.user_version || 0);
@@ -205,7 +212,8 @@ db.exec(`
     display_name TEXT NOT NULL,
     email TEXT NOT NULL COLLATE NOCASE UNIQUE,
     password_hash TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    pending_email TEXT
   ) STRICT;
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -324,7 +332,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS auth_tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    purpose TEXT NOT NULL CHECK(purpose IN ('email_verification','password_reset')),
+    purpose TEXT NOT NULL CHECK(purpose IN ('email_verification','password_reset','email_change')),
     token_hash TEXT NOT NULL UNIQUE,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
@@ -421,11 +429,54 @@ function migrateEntreprisePlanRemoval() {
   `);
 }
 
+function ensurePendingEmailColumn() {
+  const names = new Set(db.prepare("PRAGMA table_info(users)").all().map((column) => column.name));
+  if (!names.has("pending_email")) {
+    db.exec("ALTER TABLE users ADD COLUMN pending_email TEXT");
+  }
+  // L'unicité est aussi vérifiée à chaque demande : l'index est la garantie
+  // matérielle en cas de deux requêtes simultanées, là où le SELECT voit le même état.
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_pending_email
+      ON users(pending_email)
+      WHERE pending_email IS NOT NULL
+  `);
+}
+
+// Le but « email_change » rejoint la liste des causes autorisées pour auth_tokens.
+// SQLite ne sait pas modifier un CHECK : comme pour les abonnements, la table est
+// recréée à l'identique, jetons conservés, puis les deux index reposés. Un jeton
+// de changement d'adresse en cours au moment du déploiement reste donc valable.
+function migrateAuthTokenPurposes() {
+  const table = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'auth_tokens'").get();
+  if (!table?.sql || table.sql.includes("'email_change'")) return;
+  db.exec(`
+    BEGIN;
+    CREATE TABLE auth_tokens_retablies (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      purpose TEXT NOT NULL CHECK(purpose IN ('email_verification','password_reset','email_change')),
+      token_hash TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      used_at INTEGER
+    ) STRICT;
+    INSERT INTO auth_tokens_retablies SELECT * FROM auth_tokens;
+    DROP TABLE auth_tokens;
+    ALTER TABLE auth_tokens_retablies RENAME TO auth_tokens;
+    CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id, purpose);
+    CREATE INDEX IF NOT EXISTS idx_auth_tokens_expiry ON auth_tokens(expires_at);
+    COMMIT;
+  `);
+}
+
 ensureQrcodeLegacyKey();
 ensureQrcodeStyleColumns();
 ensureQrcodeActivityColumns();
 ensureEmailVerificationColumns();
+ensurePendingEmailColumn();
 migrateEntreprisePlanRemoval();
+migrateAuthTokenPurposes();
 
 function backfillScanRollups() {
   // Réconciliation plutôt qu’un test « table vide » : le calcul est rejoué à
@@ -475,8 +526,11 @@ backfillScanRollups();
 const staticFiles = new Map([
   ["/", "index.html"],
   ["/index.html", "index.html"],
+  ["/compte", "compte.html"],
+  ["/compte.html", "compte.html"],
   ["/styles.css", "styles.css"],
   ["/app.js", "app.js"],
+  ["/compte.js", "compte.js"],
   ["/qrcode-generator.js", "qrcode-generator.js"],
 ]);
 
@@ -620,7 +674,7 @@ function getSession(request) {
   if (!token || !/^[A-Za-z0-9_-]{32,128}$/.test(token)) return null;
   const session = db.prepare(`
     SELECT s.id, s.user_id, s.csrf_token, s.last_seen_at, s.expires_at,
-           u.id AS user_id_value, u.display_name, u.email, u.email_verified_at
+           u.id AS user_id_value, u.display_name, u.email, u.email_verified_at, u.pending_email
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ? AND s.expires_at > ?
@@ -637,6 +691,7 @@ function getSession(request) {
     displayName: session.display_name,
     email: session.email,
     emailVerifiedAt: session.email_verified_at,
+    pendingEmail: session.pending_email,
   };
 }
 
@@ -824,6 +879,16 @@ async function sendPasswordResetEmail(user, token) {
     name: user.display_name,
     url,
     validMinutes: Math.round(RESET_TOKEN_TTL_MS / 60_000),
+  }));
+}
+
+async function sendEmailChangeEmail(user, token) {
+  const url = `${PUBLIC_ORIGIN}/compte?confirmation-email=${encodeURIComponent(token)}`;
+  return sendMail(buildEmailChangeMessage({
+    to: user.pending_email,
+    name: user.display_name,
+    url,
+    validMinutes: Math.round(EMAIL_CHANGE_TOKEN_TTL_MS / 60_000),
   }));
 }
 
@@ -2020,6 +2085,10 @@ function publicUser(row) {
     displayName: row.displayName ?? row.display_name,
     email: row.email,
     emailVerified: Boolean(row.emailVerifiedAt ?? row.email_verified_at),
+    // L'adresse en attente est exposée pour que l'interface puisse rappeler qu'un
+    // changement est en cours : sans cela, il disparaîtrait à chaque rechargement
+    // alors que le changement, lui, attend toujours son lien.
+    pendingEmail: row.pendingEmail ?? row.pending_email ?? null,
   };
 }
 
@@ -2212,7 +2281,242 @@ async function handleAuthApi(request, response, url) {
   throw new HttpError(404, "Ressource introuvable.", "not_found");
 }
 
-// Le délai minimal entre deux envois est mesuré sur le dernier envoi réel, pas
+// -- Gestion du compte ------------------------------------------------------
+//
+// Toute action qui change l'identité du compte — adresse, mot de passe,
+// suppression — exige le mot de passe actuel, en plus du jeton de session. Un
+// cookie volé sur un poste partagé donne l'accès à la bibliothèque, pas la
+// propriété du compte : sans ce second facteur, un attaquant s'y installerait
+// durablement en changeant l'adresse, ce qui coupe aussi la réinitialisation
+// de mot de passe à la victime.
+
+async function requireCurrentPassword(session, body) {
+  if (typeof body.currentPassword !== "string" || body.currentPassword.length < 1 || body.currentPassword.length > 128) {
+    throw new HttpError(400, "Saisis ton mot de passe actuel pour confirmer.", "current_password_required");
+  }
+  const row = db.prepare("SELECT password_hash FROM users WHERE id = ?").get(session.userId);
+  const valid = await verifyPassword(body.currentPassword, row?.password_hash || DUMMY_PASSWORD_HASH);
+  if (!row || !valid) {
+    throw new HttpError(403, "Mot de passe actuel incorrect.", "invalid_current_password");
+  }
+}
+
+// Ferme les autres sessions sans toucher à celle qui vient d'agir : sans cela,
+// changer son mot de passe depuis un poste déconnecterait l'écran en cours, et
+// l'utilisateur pourrait croire s'être déconnecté lui-même.
+function revokeOtherSessions(userId, keepSessionId) {
+  db.prepare("DELETE FROM sessions WHERE user_id = ? AND id != ?").run(userId, keepSessionId);
+}
+
+function hasLiveSubscription(userId) {
+  const row = db.prepare(`
+    SELECT 1 AS live FROM subscriptions
+    WHERE user_id = ? AND status NOT IN ('canceled','incomplete_expired')
+    LIMIT 1
+  `).get(userId);
+  return Boolean(row);
+}
+
+function buildAccountExport(userId) {
+  const user = db.prepare(`
+    SELECT display_name, email, email_verified_at, created_at, pending_email FROM users WHERE id = ?
+  `).get(userId);
+  const qrcodes = db.prepare(`
+    SELECT q.id, q.public_token, q.name, q.mode, q.destination, q.contact_data, q.vcard,
+           q.foreground, q.background, q.style, q.logo, q.is_active, q.created_at, q.updated_at,
+           COALESCE((SELECT SUM(r.scan_count) FROM scan_rollups r WHERE r.qrcode_id = q.id), 0) AS scan_count,
+           (SELECT MAX(r.last_scan_at) FROM scan_rollups r WHERE r.qrcode_id = q.id) AS last_scan_at
+    FROM qrcodes q WHERE q.user_id = ? ORDER BY q.id
+  `).all(userId);
+  // Les statistiques sortent agrégées par jour, type d'appareil et domaine de
+  // provenance : c'est déjà ce que l'interface affiche, et cela évite d'exporter
+  // un journal de scans horodaté événement par événement.
+  const rollups = db.prepare(`
+    SELECT r.qrcode_id, r.day, r.device_type, r.referrer_host, r.scan_count, r.last_scan_at
+    FROM scan_rollups r JOIN qrcodes q ON q.id = r.qrcode_id
+    WHERE q.user_id = ?
+    ORDER BY r.qrcode_id, r.day
+  `).all(userId);
+  return {
+    exportedAt: new Date().toISOString(),
+    account: {
+      displayName: user?.display_name,
+      email: user?.email,
+      emailVerified: Boolean(user?.email_verified_at),
+      createdAt: isoDate(user?.created_at),
+      pendingEmail: user?.pending_email ?? null,
+    },
+    subscription: getSubscriptionSummary(userId),
+    qrcodes: qrcodes.map((row) => ({
+      id: row.id,
+      publicToken: row.public_token,
+      name: row.name,
+      mode: row.mode,
+      destination: row.destination,
+      contactData: parseStoredJson(row.contact_data),
+      vcard: row.vcard,
+      appearance: { foreground: row.foreground, background: row.background, style: row.style, logo: row.logo },
+      isActive: Boolean(row.is_active),
+      createdAt: isoDate(row.created_at),
+      updatedAt: isoDate(row.updated_at),
+      scanCount: row.scan_count,
+      lastScanAt: isoDate(row.last_scan_at),
+    })),
+    statistics: rollups.map((row) => ({
+      qrcodeId: row.qrcode_id,
+      day: row.day,
+      deviceType: row.device_type,
+      referrerHost: row.referrer_host,
+      scanCount: row.scan_count,
+      lastScanAt: isoDate(row.last_scan_at),
+    })),
+  };
+}
+
+async function handleAccountApi(request, response, url, session) {
+  if (request.method === "PATCH" && url.pathname === "/api/account/profile") {
+    verifyCsrf(request, session);
+    checkRateLimit(`profile:${session.userId}`, 20, 60 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    const displayName = validateDisplayName(body.displayName);
+    db.prepare("UPDATE users SET display_name = ? WHERE id = ?").run(displayName, session.userId);
+    sendJson(response, 200, { user: publicUser({ ...session, displayName }) });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/account/email") {
+    verifyCsrf(request, session);
+    checkRateLimit(`email-change:${session.userId}`, 5, 60 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    await requireCurrentPassword(session, body);
+    const email = validateEmail(body.email);
+    if (email === session.email) {
+      throw new HttpError(400, "Cette adresse est déjà celle de ton compte.", "email_unchanged");
+    }
+    // L'adresse en attente est réservée le temps de la confirmation : sans cela,
+    // deux comptes pourraient viser la même boîte, et le premier lien ouvert
+    // adopterait une adresse que le second avait déjà demandée.
+    const taken = db.prepare("SELECT 1 AS taken FROM users WHERE email = ? OR pending_email = ?")
+      .get(email, email);
+    if (taken) {
+      throw new HttpError(409, "Cette adresse est déjà utilisée par un autre compte.", "email_taken");
+    }
+    db.prepare("UPDATE users SET pending_email = ? WHERE id = ?").run(email, session.userId);
+    const issued = issueAuthToken(session.userId, EMAIL_CHANGE_PURPOSE, EMAIL_CHANGE_TOKEN_TTL_MS);
+    const user = db.prepare("SELECT display_name, pending_email FROM users WHERE id = ?").get(session.userId);
+    await sendEmailChangeEmail(user, issued.token);
+    sendJson(response, 200, { pendingEmail: email });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/account/email/confirm") {
+    verifyCsrf(request, session);
+    checkRateLimit(`email-confirm:${session.userId}`, 10, 60 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    const token = cleanText(body.token, 128);
+    // Le propriétaire est contrôlé *avant* la consommation. Consommer d'abord
+    // laisserait quiconque détient le lien — même sans la session du titulaire
+    // — le brûler et interdire définitivement le changement à son destinataire :
+    // un simple mot de passe.envoyé par erreur suffirait à tout bloquer.
+    const state = authTokenState(token, EMAIL_CHANGE_PURPOSE);
+    if (!state || state.user_id !== session.userId || state.used_at !== null || state.expires_at <= now()) {
+      throw new HttpError(400, "Ce lien de confirmation est invalide ou a expiré.", "invalid_token");
+    }
+    // La consommation reste atomique : c'est elle, et non la lecture au-dessus,
+    // qui garantit qu'un lien ne sert qu'une fois.
+    if (!consumeAuthToken(token, EMAIL_CHANGE_PURPOSE)) {
+      throw new HttpError(400, "Ce lien de confirmation est invalide ou a expiré.", "invalid_token");
+    }
+    const user = db.prepare("SELECT email, pending_email FROM users WHERE id = ?").get(session.userId);
+    if (!user?.pending_email) {
+      throw new HttpError(400, "Aucun changement d'adresse n'est en attente.", "no_pending_email");
+    }
+    // Le changement est refusé si l'adresse a été prise entre-temps. La session
+    // est fermée pour toutes les autres : l'ancienne adresse ne reçoit plus rien
+    // et l'ancienne session ne doit pas survivre au transfert de propriété.
+    const taken = db.prepare("SELECT 1 AS taken FROM users WHERE email = ? AND id != ?")
+      .get(user.pending_email, session.userId);
+    if (taken) {
+      db.prepare("UPDATE users SET pending_email = NULL WHERE id = ?").run(session.userId);
+      throw new HttpError(409, "Cette adresse vient d'être utilisée par un autre compte.", "email_taken");
+    }
+    db.prepare("UPDATE users SET email = ?, pending_email = NULL, email_verified_at = ? WHERE id = ?")
+      .run(user.pending_email, now(), session.userId);
+    db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(session.userId);
+    revokeOtherSessions(session.userId, session.id);
+    sendJson(response, 200, {
+      // `pendingEmail` est forcé à null : la session en mémoire portait encore
+      // l'attente, que la ligne vient de vider en base. Sans cette précision, la
+      // page afficherait un changement en cours alors qu'il est accompli.
+      user: publicUser({ ...session, email: user.pending_email, emailVerifiedAt: now(), pendingEmail: null }),
+    });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/account/password") {
+    verifyCsrf(request, session);
+    checkRateLimit(`password-change:${session.userId}`, 5, 60 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    await requireCurrentPassword(session, body);
+    const password = validatePassword(body.newPassword);
+    if (await verifyPassword(password, db.prepare("SELECT password_hash FROM users WHERE id = ?").get(session.userId).password_hash)) {
+      throw new HttpError(400, "Le nouveau mot de passe doit différer de l'ancien.", "password_unchanged");
+    }
+    const passwordHash = await hashPassword(password);
+    db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(passwordHash, session.userId);
+    db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(session.userId);
+    revokeOtherSessions(session.userId, session.id);
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/account/export") {
+    verifyCsrf(request, session);
+    checkRateLimit(`export:${session.userId}`, 6, 60 * 60 * 1_000);
+    // Un export passe par POST et non par GET : en GET, un simple lien — ou une
+    // balise image sur un site tiers — suffirait à déclencher le téléchargement
+    // du fichier chez quelqu'un d'autre que le titulaire.
+    const stamp = new Date().toISOString().slice(0, 10);
+    sendJson(response, 200, buildAccountExport(session.userId), {
+      "Content-Disposition": `attachment; filename="qrood-donnees-${stamp}.json"`,
+    });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/account/delete") {
+    verifyCsrf(request, session);
+    checkRateLimit(`delete:${session.userId}`, 5, 60 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    await requireCurrentPassword(session, body);
+    if (cleanText(body.confirmation, 32) !== "SUPPRIMER") {
+      throw new HttpError(400, "Confirme la suppression en écrivant SUPPRIMER.", "confirmation_required");
+    }
+    // Supprimer un compte souscripteur laisserait un abonnement se rebiller sans
+    // personne pour le piloter : il faut passer par le portail d'abord.
+    if (hasLiveSubscription(session.userId)) {
+      throw new HttpError(
+        409,
+        "Résilie d'abord ton abonnement depuis le portail de facturation, puis reviens supprimer ton compte.",
+        "subscription_active",
+      );
+    }
+    // users porte les clés étrangères en cascade : QR codes, scans, sessions,
+    // jetons et abonnements partent avec le compte, en une transaction.
+    db.exec("BEGIN");
+    try {
+      db.prepare("DELETE FROM users WHERE id = ?").run(session.userId);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    sendJson(response, 200, { ok: true }, { "Set-Cookie": clearSessionCookie() });
+    return;
+  }
+
+  throw new HttpError(404, "Ressource introuvable.", "not_found");
+}
+
 // sur un compteur en mémoire : il tient après un redémarrage, et il empêche
 // d'utiliser l'endpoint pour remplir la boîte d'un tiers.
 async function issueAndSendVerification(userId) {
@@ -2445,6 +2749,11 @@ async function handleApi(request, response, url) {
   if (url.pathname.startsWith("/api/qrcodes")) {
     const session = requireSession(request);
     await handleQrApi(request, response, url, session);
+    return;
+  }
+  if (url.pathname.startsWith("/api/account/")) {
+    const session = requireSession(request);
+    await handleAccountApi(request, response, url, session);
     return;
   }
   if (url.pathname === "/api/billing/stripe/webhook") {

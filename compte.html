@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#101b33" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="description" content="Gère ton compte QROOD : profil, adresse e-mail, mot de passe, abonnement et données." />
+    <title>Mon compte — QROOD</title>
+    <link rel="stylesheet" href="styles.css?v=14" />
+    <script src="compte.js?v=1" defer></script>
+  </head>
+  <body class="account-body">
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="QROOD, accueil">
+          <span class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span><span></span>
+          </span>
+          <span class="brand-name">QROOD<span class="brand-dot">.</span></span>
+        </a>
+        <nav class="account-nav" aria-label="Navigation du compte">
+          <a class="nav-link" href="/">Retour à l'atelier</a>
+          <button class="button button-dark button-small" id="logoutButton" type="button">Se déconnecter</button>
+        </nav>
+      </header>
+
+      <main class="account-main" id="accountMain" hidden>
+        <div class="account-intro">
+          <h1>Mon compte</h1>
+          <p>Tes informations, ton abonnement et tes données, au même endroit.</p>
+        </div>
+
+        <section class="account-card" aria-labelledby="profileTitle">
+          <h2 id="profileTitle">Profil</h2>
+          <form id="profileForm">
+            <div class="field-group">
+              <label for="displayName">Nom affiché</label>
+              <input id="displayName" name="displayName" type="text" minlength="2" maxlength="80" autocomplete="name" required />
+              <p class="field-hint">C'est ce nom qui t accompanies dans ton espace.</p>
+            </div>
+            <div class="field-group">
+              <label for="currentEmail">Adresse e-mail actuelle</label>
+              <input id="currentEmail" type="email" readonly aria-describedby="emailStatus" />
+              <p class="field-hint" id="emailStatus">Chargement…</p>
+            </div>
+            <button class="button button-dark button-small" type="submit">Enregistrer le nom</button>
+          </form>
+        </section>
+
+        <section class="account-card" aria-labelledby="emailTitle">
+          <h2 id="emailTitle">Adresse e-mail</h2>
+          <p class="account-note" id="pendingEmailNote" hidden></p>
+          <form id="emailForm">
+            <div class="field-group">
+              <label for="newEmail">Nouvelle adresse e-mail</label>
+              <input id="newEmail" name="email" type="email" maxlength="254" autocomplete="email" required />
+            </div>
+            <div class="field-group">
+              <label for="emailPassword">Mot de passe actuel</label>
+              <input id="emailPassword" name="currentPassword" type="password" maxlength="128" autocomplete="current-password" required />
+            </div>
+            <button class="button button-dark button-small" type="submit">Envoyer le lien de confirmation</button>
+            <p class="field-hint">
+              L'adresse ne change qu'après avoir ouvert le lien reçu à la nouvelle adresse. Tant que ce
+              n'est pas fait, l'adresse actuelle reste valable pour te reconnecter.
+            </p>
+          </form>
+        </section>
+
+        <section class="account-card" aria-labelledby="passwordTitle">
+          <h2 id="passwordTitle">Mot de passe</h2>
+          <form id="passwordForm">
+            <div class="field-group">
+              <label for="oldPassword">Mot de passe actuel</label>
+              <input id="oldPassword" name="currentPassword" type="password" maxlength="128" autocomplete="current-password" required />
+            </div>
+            <div class="field-group">
+              <label for="newPassword">Nouveau mot de passe</label>
+              <input id="newPassword" name="newPassword" type="password" minlength="12" maxlength="128" autocomplete="new-password" aria-describedby="passwordHint" required />
+              <p class="field-hint" id="passwordHint">12 caractères minimum, avec une majuscule, une minuscule et un chiffre.</p>
+            </div>
+            <div class="field-group">
+              <label for="confirmPassword">Confirmer le nouveau mot de passe</label>
+              <input id="confirmPassword" name="confirmPassword" type="password" minlength="12" maxlength="128" autocomplete="new-password" required />
+            </div>
+            <button class="button button-dark button-small" type="submit">Changer le mot de passe</button>
+            <p class="field-hint">Tes autres sessions ouvertes seront déconnectées.</p>
+          </form>
+        </section>
+
+        <section class="account-card" aria-labelledby="planTitle">
+          <h2 id="planTitle">Abonnement</h2>
+          <dl class="account-facts" id="planFacts">
+            <div><dt>Offre</dt><dd id="planName">—</dd></div>
+            <div><dt>Statut</dt><dd id="planStatus">—</dd></div>
+            <div><dt>Renouvellement</dt><dd id="planRenewal">—</dd></div>
+          </dl>
+          <button class="button button-light button-small" id="portalButton" type="button">Gérer mon abonnement</button>
+          <p class="field-hint" id="planHint"></p>
+        </section>
+
+        <section class="account-card" aria-labelledby="dataTitle">
+          <h2 id="dataTitle">Mes données</h2>
+          <p class="account-note">
+            Télécharge une copie complète de ton compte : profil, QR codes, contenu exporté et
+            statistiques de scans agrégées par jour.
+          </p>
+          <button class="button button-dark button-small" id="exportButton" type="button">Télécharger mes données</button>
+        </section>
+
+        <section class="account-card account-card-danger" aria-labelledby="dangerTitle">
+          <h2 id="dangerTitle">Zone sensible</h2>
+          <p class="account-note">
+            Supprimer ton compte efface définitivement tes QR codes, leurs statistiques et tes
+            informations. Cette action est irréversible.
+          </p>
+          <form id="deleteForm">
+            <div class="field-group">
+              <label for="deletePassword">Mot de passe actuel</label>
+              <input id="deletePassword" name="currentPassword" type="password" maxlength="128" autocomplete="current-password" required />
+            </div>
+            <div class="field-group">
+              <label for="deleteConfirmation">Écris SUPPRIMER pour confirmer</label>
+              <input id="deleteConfirmation" name="confirmation" type="text" maxlength="32" autocomplete="off" required />
+            </div>
+            <button class="button button-danger button-small" type="submit">Supprimer mon compte</button>
+          </form>
+        </section>
+      </main>
+
+      <main class="account-main account-main-loading" id="accountLoading">
+        <p>Chargement de ton compte…</p>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"><span class="toast-icon">V</span><span id="toastMessage"></span></div>
+  </body>
+</html>

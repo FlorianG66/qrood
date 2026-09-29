@@ -138,9 +138,9 @@ a {
 
 .nav-link {
   position: relative;
-  padding: 31px 0 29px;
+  padding: 27px 0 25px;
   color: var(--ink-soft);
-  font-size: 13px;
+  font-size: 16px;
   font-weight: 700;
   letter-spacing: -0.01em;
   transition: color 180ms ease;
@@ -150,7 +150,7 @@ a {
   content: "";
   position: absolute;
   right: 0;
-  bottom: 20px;
+  bottom: 16px;
   left: 0;
   height: 2px;
   border-radius: 2px;
@@ -2039,7 +2039,7 @@ input.invalid {
   margin: 0 auto;
   border-top: 1px solid rgba(16, 27, 51, 0.1);
   color: var(--muted);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .footer-brand {
@@ -2047,12 +2047,12 @@ input.invalid {
 }
 
 .footer-brand .brand-name {
-  font-size: 17px;
+  font-size: 18px;
 }
 
 .footer-brand .brand-mark {
-  width: 21px;
-  height: 21px;
+  width: 22px;
+  height: 22px;
   gap: 2px;
 }
 
@@ -2061,13 +2061,195 @@ input.invalid {
   color: var(--muted);
 }
 
+.footer-made {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.footer-heart {
+  display: inline-flex;
+  color: var(--coral);
+  transform-origin: center;
+  transition: transform 180ms ease;
+}
+
+.footer-heart:hover {
+  animation: heart-beat 900ms ease-in-out infinite;
+}
+
+@keyframes heart-beat {
+  0% { transform: scale(1); }
+  12% { transform: scale(1.32); }
+  24% { transform: scale(1); }
+  38% { transform: scale(1.22); }
+  52% { transform: scale(1); }
+  100% { transform: scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .footer-heart:hover {
+    animation: none;
+  }
+}
+
+/* -- Page « Mon compte » ---------------------------------------------------
+   Une carte par sujet, dans une colonne étroite : les réglages se lisent l'un
+   après l'autre, et le danger est isolé dans la dernière carte, à l'écart des
+   gestes courants. */
+
+.account-body .topbar {
+  position: static;
+}
+
+.account-nav {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  margin-left: auto;
+}
+
+.account-nav .nav-link {
+  padding: 0;
+  font-size: 13px;
+}
+
+.account-main {
+  width: min(760px, calc(100% - 64px));
+  margin: 0 auto;
+  padding: 58px 0 84px;
+}
+
+.account-main-loading {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.account-intro h1 {
+  margin: 0;
+  font-size: 40px;
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+}
+
+.account-intro p {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.account-card {
+  margin-top: 26px;
+  padding: 30px 32px 32px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--white);
+  box-shadow: var(--shadow);
+}
+
+.account-card h2 {
+  margin: 0 0 20px;
+  font-size: 17px;
+  letter-spacing: -0.02em;
+}
+
+.account-card .field-group + .field-group {
+  margin-top: 18px;
+}
+
+.account-card form + p,
+.account-card .field-group + .button {
+  margin-top: 20px;
+}
+
+.account-note {
+  margin: 0 0 20px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.account-facts {
+  display: grid;
+  gap: 14px;
+  margin: 0 0 22px;
+}
+
+.account-facts > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 20px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.account-facts dt {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.account-facts dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  text-transform: capitalize;
+}
+
+.button-danger {
+  color: var(--white);
+  background: var(--coral);
+  box-shadow: 0 8px 18px rgba(189, 60, 52, 0.22);
+}
+
+.button-danger:hover {
+  background: var(--coral-deep);
+}
+
+.account-card-danger {
+  border-color: rgba(189, 60, 52, 0.3);
+}
+
+.account-card-danger h2 {
+  color: var(--coral);
+}
+
+.account-main input[readonly] {
+  color: var(--muted);
+  background: var(--paper);
+  cursor: not-allowed;
+}
+
+@media (max-width: 700px) {
+  .account-main {
+    width: calc(100% - 32px);
+    padding: 38px 0 64px;
+  }
+
+  .account-card {
+    padding: 24px 20px 26px;
+  }
+
+  .account-intro h1 {
+    font-size: 32px;
+  }
+
+  .account-nav {
+    gap: 14px;
+  }
+}
+
 .footer-meta {
   display: flex;
   align-items: center;
   gap: 11px;
   margin-left: auto;
   font-family: var(--mono);
-  font-size: 8px;
+  font-size: 9px;
 }
 
 .footer-separator {
@@ -2160,6 +2342,13 @@ body.modal-open {
   color: var(--ink-soft);
   font-size: 10px;
   font-weight: 800;
+  text-decoration: none;
+  border-radius: 999px;
+}
+
+.user-chip:hover,
+.user-chip:focus-visible {
+  color: var(--ink);
 }
 
 .user-avatar {

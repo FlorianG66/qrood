@@ -98,6 +98,35 @@ export function buildResetMessage({ to, name, url, validMinutes = 60 }) {
 }
 
 /**
+ * Message de changement d'adresse.
+ *
+ * Il part à la nouvelle adresse, jamais à l'ancienne : c'est la seule preuve
+ * que la boîte existe. Tant qu'il n'est pas cliqué, le compte conserve son
+ * adresse courante, donc une faute de frappe ne verrouille pas l'accès.
+ */
+export function buildEmailChangeMessage({ to, name, url, validMinutes = 60 }) {
+  const greeting = name ? `Bonjour ${name},` : "Bonjour,";
+  return {
+    purpose: "email_change",
+    to,
+    subject: "Confirmez votre nouvelle adresse e-mail — QROOD",
+    text: [
+      greeting,
+      "",
+      "Un changement d'adresse e-mail a été demandé pour ce compte QROOD.",
+      "",
+      `Confirmer la nouvelle adresse : ${url}`,
+      "",
+      `Ce lien est valable ${formatMinutes(validMinutes)} et ne fonctionne qu'une fois.`,
+      "",
+      "Tant que tu ne l'as pas ouvert, ton adresse actuelle reste la seule valable : la réinitialisation de mot de passe continue de partir vers elle. Pour abandonner ce changement, ne clique pas et ignore ce message.",
+      "",
+      "— QROOD",
+    ].join("\n"),
+  };
+}
+
+/**
  * Transport de développement : un fichier JSON par message.
  *
  * Le fichier contient un lien à usage unique, donc il est écrit en `0o600` et
