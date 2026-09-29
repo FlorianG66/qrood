@@ -1460,10 +1460,27 @@ function linkStripeCustomer(userId, customerId) {
 
 async function getOrCreateStripeCustomer(userId) {
   const existing = db.prepare("SELECT stripe_customer_id FROM billing_customers WHERE user_id = ?").get(userId);
-  if (existing) return existing.stripe_customer_id;
   const user = db.prepare("SELECT display_name, email FROM users WHERE id = ?").get(userId);
   if (!user) throw new HttpError(404, "Compte introuvable.", "user_not_found");
   const stripe = await getStripe();
+
+  // Un customer stocké peut avoir été supprimé côté Stripe, ou avoir été créé
+  // avec d'autres clés (changement de compte, environnement de test). Sans cette
+  // vérification, la checkout session échouerait avec « No such customer » et
+  // l'utilisateur ne pourrait jamais souscrire.
+  if (existing) {
+    try {
+      await stripe.customers.retrieve(existing.stripe_customer_id);
+      return existing.stripe_customer_id;
+    } catch (error) {
+      if (error.code !== "resource_missing") throw error;
+      console.warn(
+        `qrood billing: customer Stripe ${existing.stripe_customer_id} introuvable, création d'un nouveau.`
+      );
+      db.prepare("DELETE FROM billing_customers WHERE user_id = ?").run(userId);
+    }
+  }
+
   const customer = await stripe.customers.create({
     email: user.email,
     name: user.display_name,
