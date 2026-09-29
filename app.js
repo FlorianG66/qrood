@@ -229,9 +229,182 @@
     document.addEventListener("mousemove", onMouseMove);
   }
 
+  function initIntro() {
+    const canvas = $("#intro-canvas");
+    const skipBtn = $("#intro-skip");
+    if (!canvas || !skipBtn) return;
+
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const sessionKey = "qrood-intro-seen";
+    if (reduceMotion || sessionStorage.getItem(sessionKey)) {
+      canvas.style.display = "none";
+      skipBtn.style.display = "none";
+      return;
+    }
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      canvas.style.display = "none";
+      skipBtn.style.display = "none";
+      return;
+    }
+
+    const isMobile = window.matchMedia("(pointer: coarse)").matches;
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    const particleCount = isMobile ? 300 : 800;
+    const duration = isMobile ? 1500 : 2500;
+
+    let width, height, particles = [], qrGrid = [];
+    let startTime = null;
+    let rafId = null;
+    let skipped = false;
+
+    const QR_SIZE = 21;
+    const CELL_SIZE = 12;
+    const QR_PIXEL_COUNT = QR_SIZE * QR_SIZE;
+
+    function generateQRGrid() {
+      const grid = [];
+      const seed = 42;
+      for (let i = 0; i < QR_PIXEL_COUNT; i++) {
+        const row = Math.floor(i / QR_SIZE);
+        const col = i % QR_SIZE;
+        const isFinder = (row < 7 && col < 7) || (row < 7 && col >= QR_SIZE - 7) || (row >= QR_SIZE - 7 && col < 7);
+        const isDark = isFinder
+          ? (row === 0 || row === 6 || col === 0 || col === 6 || (row >= 2 && row <= 4 && col >= 2 && col <= 4))
+          : ((i * seed + row * 7 + col * 13) % 3 === 0);
+        if (isDark) grid.push(i);
+      }
+      return grid;
+    }
+
+    function resize() {
+      width = window.innerWidth;
+      height = window.innerHeight;
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      ctx.scale(dpr, dpr);
+    }
+
+    function createParticles() {
+      const qrWidth = QR_SIZE * CELL_SIZE;
+      const qrHeight = QR_SIZE * CELL_SIZE;
+      const startX = (width - qrWidth) / 2;
+      const startY = (height - qrHeight) / 2;
+      const darkIndices = generateQRGrid();
+      const targetSet = new Set(darkIndices);
+
+      particles = [];
+      for (let i = 0; i < particleCount; i++) {
+        const isCoral = i % 5 === 0;
+        const targetIdx = darkIndices[i % darkIndices.length];
+        const targetRow = Math.floor(targetIdx / QR_SIZE);
+        const targetCol = targetIdx % QR_SIZE;
+        const tx = startX + targetCol * CELL_SIZE + CELL_SIZE / 2;
+        const ty = startY + targetRow * CELL_SIZE + CELL_SIZE / 2;
+
+        particles.push({
+          x: Math.random() * width,
+          y: -Math.random() * height * 0.5,
+          tx,
+          ty,
+          vx: 0,
+          vy: 0,
+          size: isCoral ? 3 : 2,
+          color: isCoral ? "#bd3c34" : "#101b33",
+          delay: Math.random() * 0.3,
+          alpha: 0,
+        });
+      }
+    }
+
+    function easeOutCubic(t) {
+      return 1 - Math.pow(1 - t, 3);
+    }
+
+    function easeInOutCubic(t) {
+      return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    }
+
+    function draw(timestamp) {
+      if (!startTime) startTime = timestamp;
+      const elapsed = timestamp - startTime;
+      const progress = Math.min(elapsed / duration, 1);
+      const phase = progress < 0.4 ? 0 : progress < 0.7 ? 1 : 2;
+
+      ctx.clearRect(0, 0, width, height);
+
+      const gatherProgress = easeOutCubic(Math.min(progress / 0.4, 1));
+      const pulseProgress = phase === 1 ? Math.sin((progress - 0.4) / 0.3 * Math.PI) : 0;
+      const dissolveProgress = phase === 2 ? easeInOutCubic((progress - 0.7) / 0.3) : 0;
+
+      for (const p of particles) {
+        const localProgress = Math.max(0, Math.min((gatherProgress - p.delay) / (1 - p.delay), 1));
+        const eased = easeOutCubic(localProgress);
+
+        p.x = p.x + (p.tx - p.x) * eased * 0.08;
+        p.y = p.y + (p.ty - p.y) * eased * 0.08;
+
+        if (phase === 2) {
+          p.x += (Math.random() - 0.5) * dissolveProgress * 8;
+          p.y += (Math.random() - 0.5) * dissolveProgress * 8;
+          p.alpha = 1 - dissolveProgress;
+        } else {
+          p.alpha = Math.min(localProgress * 2, 1);
+        }
+
+        const scale = 1 + pulseProgress * 0.3;
+        ctx.globalAlpha = p.alpha;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(
+          p.x - (p.size * scale) / 2,
+          p.y - (p.size * scale) / 2,
+          p.size * scale,
+          p.size * scale
+        );
+      }
+
+      ctx.globalAlpha = 1;
+
+      if (progress < 1) {
+        rafId = requestAnimationFrame(draw);
+      } else {
+        finish();
+      }
+    }
+
+    function finish() {
+      if (skipped) return;
+      skipped = true;
+      sessionStorage.setItem(sessionKey, "1");
+      canvas.style.opacity = "0";
+      canvas.style.transition = "opacity 400ms ease";
+      skipBtn.classList.remove("visible");
+      setTimeout(() => {
+        canvas.style.display = "none";
+        skipBtn.style.display = "none";
+      }, 400);
+    }
+
+    skipBtn.addEventListener("click", finish);
+    skipBtn.classList.add("visible");
+
+    resize();
+    createParticles();
+    window.addEventListener("resize", () => {
+      resize();
+      createParticles();
+    });
+
+    rafId = requestAnimationFrame(draw);
+  }
+
   async function init() {
     cacheElements();
     bindEvents();
+    initIntro();
     initHeroParallax();
     initScrollAnimations();
     initParallax();
