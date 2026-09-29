@@ -8,24 +8,25 @@
       name="description"
       content="Créez des QR codes personnalisés à partir d'un lien ou de vos coordonnées en quelques secondes."
     />
-    <title>qraft — Créez des QR codes qui font avancer</title>
-    <link rel="stylesheet" href="styles.css?v=7" />
+    <title>QROOD — Créez des QR codes qui font avancer</title>
+    <link rel="stylesheet" href="styles.css?v=9" />
     <script src="qrcode-generator.js" defer></script>
-    <script src="app.js?v=11" defer></script>
+    <script src="app.js?v=15" defer></script>
   </head>
   <body>
     <div class="app-shell">
       <header class="topbar">
-        <a class="brand" href="#top" aria-label="qraft, accueil">
+        <a class="brand" href="#top" aria-label="QROOD, accueil">
           <span class="brand-mark" aria-hidden="true">
             <span></span><span></span><span></span><span></span>
           </span>
-          <span class="brand-name">qraft<span class="brand-dot">.</span></span>
+          <span class="brand-name">QROOD<span class="brand-dot">.</span></span>
         </a>
 
         <nav class="main-nav" aria-label="Navigation principale">
           <a class="nav-link active" href="#createur">Créer</a>
           <a class="nav-link" href="#creations">Mes QR codes</a>
+          <a class="nav-link" href="#tarifs">Tarifs</a>
           <a class="nav-link" href="#guide">Guide</a>
         </nav>
 
@@ -120,7 +121,7 @@
                   <label for="linkInput">Lien à partager <span class="required-mark">*</span></label>
                   <div class="input-wrap input-with-icon">
                     <span class="input-leading-icon" aria-hidden="true">↗</span>
-                    <input id="linkInput" type="url" inputmode="url" placeholder="https://votre-site.com" value="https://qraft.example/hello" autocomplete="url" />
+                    <input id="linkInput" type="url" inputmode="url" placeholder="https://votre-site.com" value="https://qrood.example/hello" autocomplete="url" />
                     <span class="input-valid" id="linkValid" aria-hidden="true">✓</span>
                   </div>
                   <p class="field-hint">Un lien court est plus joli à scanner. En local, le QR code reste direct pour être lu par un téléphone.</p>
@@ -133,7 +134,7 @@
                   <button class="quick-chip" type="button" data-sample="https://www.youtube.com/watch?v=dQw4w9WgXcQ">
                     <span class="chip-icon play-icon">▶</span> Vidéo
                   </button>
-                  <button class="quick-chip" type="button" data-sample="https://qraft.example/menu">
+                  <button class="quick-chip" type="button" data-sample="https://qrood.example/menu">
                     <span class="chip-icon menu-icon">▤</span> Menu
                   </button>
                 </div>
@@ -353,13 +354,13 @@
                 <div class="qr-card">
                   <div class="qr-card-top">
                     <span class="mini-brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
-                    <span>qraft / <b id="previewTypeLabel">LINK</b></span>
+                    <span>QROOD / <b id="previewTypeLabel">LINK</b></span>
                   </div>
                   <div class="qr-frame" id="qrFrame">
                     <canvas id="qrCanvas" width="1024" height="1024" aria-label="Aperçu du QR code"></canvas>
                   </div>
                   <div class="qr-card-bottom">
-                    <span id="previewLabel">qraft.example/hello</span>
+                    <span id="previewLabel">qrood.example/hello</span>
                     <span class="scan-arrow">↗</span>
                   </div>
                 </div>
@@ -405,9 +406,30 @@
           <div class="history-grid" id="historyGrid"></div>
         </section>
 
+        <section class="pricing-section" id="tarifs" aria-labelledby="pricing-title">
+          <div class="section-heading pricing-heading">
+            <div>
+              <span class="section-kicker">03 — TARIFS</span>
+              <h2 id="pricing-title">Un prix clair.<br /><span>Sans surprise.</span></h2>
+            </div>
+            <p>Commencez gratuitement,changez d’offre quand il vous en faut. Résiliable à tout mois, sans frais de dossier.</p>
+          </div>
+
+          <div class="pricing-grid" id="pricingGrid">
+            <p class="pricing-loading">Chargement des tarifs…</p>
+          </div>
+
+          <p class="pricing-notice" id="pricingNotice" role="status" hidden></p>
+
+          <div class="pricing-foot" id="pricingFoot" hidden>
+            <p id="pricingFootText"></p>
+            <button class="button button-light button-small" type="button" id="pricingManageButton">Gérer mon abonnement <span>↗</span></button>
+          </div>
+        </section>
+
         <section class="guide-section" id="guide" aria-labelledby="guide-title">
           <div class="guide-card">
-            <div class="guide-number">03</div>
+            <div class="guide-number">04</div>
             <div class="guide-content">
               <span class="section-kicker light-kicker">PETIT CONSEIL</span>
               <h2 id="guide-title">Un QR code<br /><em>à votre image.</em></h2>
@@ -425,16 +447,16 @@
       </main>
 
       <footer class="footer">
-        <a class="brand footer-brand" href="#top"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span><span class="brand-name">qraft<span class="brand-dot">.</span></span></a>
+        <a class="brand footer-brand" href="#top"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span><span class="brand-name">QROOD<span class="brand-dot">.</span></span></a>
         <p>Fait pour les idées qui se partagent.</p>
-        <div class="footer-meta"><span>© 2024 qraft</span><span class="footer-separator">/</span><a href="#guide">Besoin d’aide&nbsp;?</a></div>
+        <div class="footer-meta"><span>© 2024 QROOD</span><span class="footer-separator">/</span><a href="#guide">Besoin d’aide&nbsp;?</a></div>
       </footer>
     </div>
 
     <div class="modal-backdrop" id="authModal" hidden>
       <section class="modal-card auth-modal-card" role="dialog" aria-modal="true" aria-labelledby="authModalTitle">
         <button class="modal-close" type="button" data-close-modal="authModal" aria-label="Fermer">×</button>
-        <div class="modal-brand"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span><b>qraft.</b></div>
+        <div class="modal-brand"><span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span><b>QROOD.</b></div>
         <h2 id="authModalTitle">Votre espace QR personnel</h2>
         <p class="modal-intro">Retrouvez vos créations et leurs statistiques sur tous vos appareils.</p>
         <div class="auth-tabs" role="tablist" aria-label="Authentification">
@@ -488,43 +510,6 @@
           <p id="offersManagementText"></p>
           <button class="button button-light button-small" type="button" id="openPortalButton">Gérer mon abonnement</button>
         </div>
-
-        <form class="enterprise-form" id="enterpriseFormElement" hidden>
-          <span class="section-kicker">DEMANDE DE DEVIS</span>
-          <h3 id="enterpriseTitle">Parlez-nous de vos besoins</h3>
-          <p class="modal-intro">Offre sur mesure : volume illimité, jusqu’à 730 jours de statistiques, support prioritaire. Nous répondons sous deux jours ouvrés.</p>
-          <div class="enterprise-grid">
-            <div class="field-group">
-              <label for="enterpriseCompany">Société</label>
-              <input id="enterpriseCompany" name="company" type="text" maxlength="120" required />
-            </div>
-            <div class="field-group">
-              <label for="enterpriseContactName">Votre nom</label>
-              <input id="enterpriseContactName" name="contactName" type="text" maxlength="120" autocomplete="name" />
-            </div>
-            <div class="field-group">
-              <label for="enterpriseEmail">E-mail professionnel</label>
-              <input id="enterpriseEmail" name="email" type="email" maxlength="254" autocomplete="email" required />
-            </div>
-            <div class="field-group">
-              <label for="enterprisePhone">Téléphone</label>
-              <input id="enterprisePhone" name="phone" type="tel" maxlength="40" autocomplete="tel" />
-            </div>
-          </div>
-          <div class="field-group">
-            <label for="enterpriseVolume">Volume de QR codes prévu</label>
-            <input id="enterpriseVolume" name="volume" type="text" maxlength="40" placeholder="ex. 5 000" />
-          </div>
-          <div class="field-group">
-            <label for="enterpriseMessage">Votre besoin</label>
-            <textarea id="enterpriseMessage" name="message" rows="4" maxlength="2000" required placeholder="Usage, secteurs, délais…"></textarea>
-          </div>
-          <p class="enterprise-error" id="enterpriseError" role="alert" hidden></p>
-          <div class="enterprise-actions">
-            <button class="button button-light" type="button" id="enterpriseCancel">Retour aux offres</button>
-            <button class="button button-dark" type="submit" id="enterpriseSubmit">Envoyer la demande</button>
-          </div>
-        </form>
       </section>
     </div>
 

@@ -64,7 +64,7 @@ export function buildCheckoutParams({ userId, plan, customerId, priceId, publicO
     billing_address_collection: "required",
     customer_update: { address: "auto", name: "auto" },
     allow_promotion_codes: true,
-    subscription_data: { metadata: { plan, qraft_user_id: String(userId) } },
+    subscription_data: { metadata: { plan, qrood_user_id: String(userId) } },
     success_url: `${publicOrigin}/?billing=success&session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${publicOrigin}/?billing=cancelled`,
   };

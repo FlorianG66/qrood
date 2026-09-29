@@ -1,0 +1,22 @@
+[Unit]
+Description=QROOD (plateforme de QR codes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qrood
+Group=qrood
+WorkingDirectory=/opt/qrood
+EnvironmentFile=/etc/qrood.env
+ExecStart=/usr/bin/node server.mjs
+Restart=always
+RestartSec=3
+
+# QROOD_IDLE_TIMEOUT_MINUTES=0 (dans /etc/qrood.env) désactive l'arrêt par
+# inactivité ; si le serveur meurt malgré tout, Restart=always le relance.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/qrood/data

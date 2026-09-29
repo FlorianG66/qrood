@@ -1,0 +1,16 @@
+# Caddyfile — reverse proxy HTTPS de QROOD.
+# Le domaine doit correspondre exactement à QROOD_PUBLIC_ORIGIN dans
+# /etc/qrood.env : c'est l'origine gravée dans les QR codes.
+#
+# Installation de Caddy :  sudo apt install caddy
+# Ce fichier :               sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+# Recharger :                sudo systemctl reload caddy
+
+qrood.fr, www.qrood.fr {
+	# tout passer sur le domaine nu : une seule et même origine dans les QR codes
+	@www host www.qrood.fr
+	redir @www https://qrood.fr{uri} permanent
+
+	reverse_proxy 127.0.0.1:3000
+	encode zstd gzip
+}

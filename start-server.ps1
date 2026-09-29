@@ -23,11 +23,11 @@ if (-not $npm) {
   throw "npm est requis pour installer la dépendance Stripe. Installez Node.js (npm inclus) puis relancez."
 }
 
-$env:QRAFT_PORT = "$Port"
-$env:QRAFT_HOST = $HostAddress
-$env:QRAFT_IDLE_TIMEOUT_MINUTES = "$IdleTimeoutMinutes"
-if (-not $env:QRAFT_PUBLIC_ORIGIN) {
-  $env:QRAFT_PUBLIC_ORIGIN = "http://localhost:$Port"
+$env:QROOD_PORT = "$Port"
+$env:QROOD_HOST = $HostAddress
+$env:QROOD_IDLE_TIMEOUT_MINUTES = "$IdleTimeoutMinutes"
+if (-not $env:QROOD_PUBLIC_ORIGIN) {
+  $env:QROOD_PUBLIC_ORIGIN = "http://localhost:$Port"
 }
 
 # Le SDK Stripe officiel est la seule dépendance npm : sans lui, la

@@ -1,8 +1,8 @@
-# qraft
+# QROOD
 
-qraft est une plateforme web de génération de QR codes avec comptes utilisateurs, bibliothèque personnelle et statistiques de scan.
+QROOD est une plateforme web de génération de QR codes avec comptes utilisateurs, bibliothèque personnelle et statistiques de scan.
 
-Un QR code de lien peut utiliser une URL de suivi qraft (`/r/…`) : un scan est mesuré, puis l’utilisateur est redirigé vers la destination. En mode local, l’origine par défaut est `http://localhost:3000` : afin qu’un téléphone puisse lire le QR code, qraft encode directement la destination saisie tant qu’aucune origine publique ou réseau joignable n’est configurée. Un QR code de coordonnées ouvre une page de contact qraft (`/c/…`) qui permet de télécharger la vCard, ou encode directement la vCard en mode local. Les QR codes doivent être enregistrés dans un compte ; le suivi s’active lorsque l’origine qraft est joignable par le scanner.
+Un QR code de lien peut utiliser une URL de suivi QROOD (`/r/…`) : un scan est mesuré, puis l’utilisateur est redirigé vers la destination. En mode local, l’origine par défaut est `http://localhost:3000` : afin qu’un téléphone puisse lire le QR code, QROOD encode directement la destination saisie tant qu’aucune origine publique ou réseau joignable n’est configurée. Un QR code de coordonnées ouvre une page de contact QROOD (`/c/…`) qui permet de télécharger la vCard, ou encode directement la vCard en mode local. Les QR codes doivent être enregistrés dans un compte ; le suivi s’active lorsque l’origine QROOD est joignable par le scanner.
 
 ## Prérequis
 
@@ -31,7 +31,7 @@ Le port et l’arrêt automatique après inactivité sont configurables :
 .\start-server.ps1 -Port 3000 -IdleTimeoutMinutes 30
 ```
 
-Le serveur s’arrête automatiquement après 30 minutes sans requête métier (les probes `/api/health` ne réactivent pas ce délai). `Ctrl+C` permet de l’arrêter manuellement. La base SQLite est créée dans `data/qraft.sqlite` et n’est jamais servie comme fichier statique.
+Le serveur s’arrête automatiquement après 30 minutes sans requête métier (les probes `/api/health` ne réactivent pas ce délai). `Ctrl+C` permet de l’arrêter manuellement. La base SQLite est créée dans `data/qrood.sqlite` et n’est jamais servie comme fichier statique.
 
 ## Fonctionnalités
 
@@ -47,20 +47,42 @@ Le serveur s’arrête automatiquement après 30 minutes sans requête métier (
 - Réconciliation des agrégats à chaque démarrage : un événement brut absent d’un agrégat est réintégré une seule fois
 - Au-delà de 100 domaines de provenance distincts pour un QR code, les nouveaux domaines sont regroupés sous « Autres sources »
 - Suppression et modification des QR codes avec contrôle de propriété
+- Section Tarifs publique, lisible sans compte, avec les montants lus sur Stripe
 - Migration automatique, isolée par compte et idempotente des QR codes précédemment stockés dans `localStorage` (50 par session, y compris les anciennes vCard). Une erreur réseau, de session ou de serveur n’est jamais comptée comme un échec : l’élément est repris à la session suivante
 
 ## Abonnements
 
-Quatre offres, avec deux compteurs indépendants : le nombre de QR codes **enregistrés** et le nombre de QR codes **actifs** en même temps.
+Trois offres, avec deux compteurs indépendants : le nombre de QR codes **enregistrés** et le nombre de QR codes **actifs** en même temps.
 
 | Offre | Enregistrés | Actifs | Statistiques | Personnalisation | Prix |
 | --- | --- | --- | --- | --- | --- |
 | Découverte | 5 | 1 | 30 jours | couleurs, marges | offert |
-| Pro | 25 | illimités | 365 jours | + dégradés, arrondis | 10 € HT / mois |
-| Ultra | illimités | illimités | 730 jours | + logo, formes `dot` et `leaf` | 24,17 € HT / mois |
-| Entreprise | illimités | illimités | 730 jours | + logo, formes `dot` et `leaf` | sur devis |
+| Pro | 25 | illimités | 365 jours | + dégradés, arrondis | 12 € TTC / mois |
+| Ultra | illimités | illimités | 730 jours | + logo, formes `dot` et `leaf` | 29 € TTC / mois |
 
-Prix affichés en HT : la TVA est calculée par Stripe Tax selon le pays du client, pour viser **12 € TTC** (Pro) et **29 € TTC** (Ultra) en France.
+Prix **TTC** : les Prices Stripe sont créés avec `tax_behavior: inclusive`, donc le montant affiché est celui que le client paie, TVA comprise. L'interface lit `tax_behavior` sur le Price et n'ajoute le suffixe « HT » que pour un Price `exclusive`.
+
+### Section Tarifs
+
+La page d'accueil comporte une section Tarifs entre la bibliothèque et le guide, lisible sans compte : c'est le catalogue qui décide d'un abonnement, il doit donc être public.
+
+Les montants ne sont jamais écrits en dur dans l'interface. `GET /api/billing/offers` les lit sur les Prices Stripe (mémorisés une heure par le serveur), et la section affiche ce que le serveur renvoie :
+
+| Situation | Affichage |
+| --- | --- |
+| Price actif en euros, abonnement mensuel | montant et `/ mois` |
+| Price archivé, désactivé, hors euros ou non mensuel | aucun montant, offre « Bientôt disponible » |
+| Aucun Price configuré | aucun montant, bandeau expliquant que la facturation n'est pas activée |
+| Serveur injoignable | message d'erreur et bouton « Réessayer » |
+
+Un montant absent n'est jamais remplacé par une valeur de repli : le test d'intégration vérifie explicitement qu'aucun prix n'est inventé sans configuration Stripe. Les montants du README ci-dessus servent de référence de recette, pas de source de vérité — un Price modifié dans le dashboard Stripe change l'affichage sans toucher au code.
+
+Les boutons d'appel à l'action reprennent les règles du serveur plutôt que de les deviner :
+
+- **Découverte** — crée un compte, ou ramène à l'éditeur si le compte existe déjà ; un abonné est renvoyé vers le portail, seul chemin qui évite deux abonnements vivants ;
+- **Pro** et **Ultra** — ouvrent Stripe Checkout, ou la fenêtre de connexion pour un visiteur.
+
+L'offre courante n'est signalée que pour un compte connecté : un visiteur n'a pas d'offre, et l'indiquer le ferait passer pour abonné.
 
 ### Activation et désactivation d’un QR code
 
@@ -81,28 +103,24 @@ Quand le quota d’actifs est dépassé, l’interface affiche une bannière san
 
 Le retour sur Découverte ne supprime rien : les QR codes publiés continuent de répondre, et les options de personnalisation premium déjà utilisées restent modifiables tant qu’elles ne sont pas changées.
 
-### Entreprise
-
-L’offre Entreprise ne se vend pas en ligne. Le formulaire enregistre une demande en base (`enterprise_leads`) pour un traitement hors ligne, et n’accorde aucun accès automatique.
-
 ## Facturation Stripe
 
 ### Mise en place
 
-1. Créer deux produits récurrifs mensuels en **euros**, avec Stripe Tax activé, et noter les `price_…` :
-   - Pro : **10,00 € HT** (12,00 € TTC en France)
-   - Ultra : **24,17 € HT** (29,00 € TTC en France)
+1. Créer deux produits récurrifs mensuels en **euros**, avec Stripe Tax activé et le Price réglé sur **taxes incluses**, puis noter les `price_…` :
+   - Pro : **12,00 € TTC** / mois (soit 10,00 € HT en France)
+   - Ultra : **29,00 € TTC** / mois (soit 24,17 € HT en France)
 2. Activer le portail client (paramètres Stripe) pour la résiliation et le changement de carte.
 3. Déclarer les variables d’environnement :
 
 ```powershell
-$env:QRAFT_STRIPE_SECRET_KEY = "sk_live_…"
-$env:QRAFT_STRIPE_WEBHOOK_SECRET = "whsec_…"
-$env:QRAFT_STRIPE_PRICE_PRO = "price_…"
-$env:QRAFT_STRIPE_PRICE_ULTRA = "price_…"
+$env:QROOD_STRIPE_SECRET_KEY = "sk_live_…"
+$env:QROOD_STRIPE_WEBHOOK_SECRET = "whsec_…"
+$env:QROOD_STRIPE_PRICE_PRO = "price_…"
+$env:QROOD_STRIPE_PRICE_ULTRA = "price_…"
 ```
 
-Le préfixe `STRIPE_` (`STRIPE_SECRET_KEY`, `STRIPE_PRICE_PRO`, …) est aussi accepté, sans le `QRAFT_`. Une seule des deux offres payantes suffit pour activer la facturation.
+Le préfixe `STRIPE_` (`STRIPE_SECRET_KEY`, `STRIPE_PRICE_PRO`, …) est aussi accepté, sans le `QROOD_`. Une seule des deux offres payantes suffit pour activer la facturation.
 
 **Ces clés ne doivent jamais être versionnées.** Le serveur ne lit aucun fichier `.env` : les variables viennent de l’environnement du processus. Deux conséquences à connaître.
 
@@ -132,11 +150,11 @@ Pour l’é développement local, utiliser le CLI Stripe :
 stripe listen --forward-to localhost:3000/api/billing/stripe/webhook
 ```
 
-Le secret affiché par la commande (`whsec_…`) va dans `QRAFT_STRIPE_WEBHOOK_SECRET`.
+Le secret affiché par la commande (`whsec_…`) va dans `QROOD_STRIPE_WEBHOOK_SECRET`.
 
 ### Fonctionnement
 
-- Le paiement passe par **Stripe Checkout** hébergé (`mode: subscription`), entièrement automatisé, avec adresse de facturation obligatoire et `automatic_tax` : aucune saisie ni validation de paiement côté qraft.
+- Le paiement passe par **Stripe Checkout** hébergé (`mode: subscription`), entièrement automatisé, avec adresse de facturation obligatoire et `automatic_tax` : aucune saisie ni validation de paiement côté QROOD.
 - Un compte ne peut avoir **qu’un seul** abonnement non terminal, garanti par un index unique en base. Acheter une seconde offre est refusé (`409`) et l’utilisateur est envoyé vers le portail client, seul chemin qui évite la coexistence de deux abonnements.
 - La clé d’offre vient de `metadata.plan` écrit à la création du Checkout, avec le `price` en repli : un remappage manuel dans le dashboard Stripe ne peut pas changer l’offre servie.
 - Les webhooks sont vérifiés par signature sur le corps brut, et **idempotents** : le même `event.id` n’est appliqué qu’une fois. En cas d’erreur, le marqueur est effacé pour que Stripe puisse réessayer.
@@ -162,20 +180,20 @@ Le secret affiché par la commande (`whsec_…`) va dans `QRAFT_STRIPE_WEBHOOK_S
 Les variables d’environnement sont utiles pour une installation derrière un proxy HTTPS :
 
 ```powershell
-$env:QRAFT_PUBLIC_ORIGIN = "https://qr.example.com"
-$env:QRAFT_HOST = "0.0.0.0"
-$env:QRAFT_SECURE_COOKIES = "true"
-$env:QRAFT_TRUST_PROXY = "true" # uniquement si le proxy est fiable
+$env:QROOD_PUBLIC_ORIGIN = "https://qr.example.com"
+$env:QROOD_HOST = "0.0.0.0"
+$env:QROOD_SECURE_COOKIES = "true"
+$env:QROOD_TRUST_PROXY = "true" # uniquement si le proxy est fiable
 $env:NODE_ENV = "production"
 powershell -ExecutionPolicy Bypass -File .\start-server.ps1
 ```
 
-`QRAFT_PUBLIC_ORIGIN` doit être l’origine publique HTTPS réellement accessible par les scanners de QR codes. En production, le serveur refuse une origine HTTP ou des cookies non sécurisés. `QRAFT_TRUST_PROXY=true` n’est activable que si le reverse proxy **réécrit** `X-Forwarded-For` : un en-tête fourni par le client serait sinon accepté tel quel pour le rate limiting et la déduplication des scans.
+`QROOD_PUBLIC_ORIGIN` doit être l’origine publique HTTPS réellement accessible par les scanners de QR codes. En production, le serveur refuse une origine HTTP ou des cookies non sécurisés. `QROOD_TRUST_PROXY=true` n’est activable que si le reverse proxy **réécrit** `X-Forwarded-For` : un en-tête fourni par le client serait sinon accepté tel quel pour le rate limiting et la déduplication des scans.
 
-Par défaut, l’interface reste en **mode direct local** : le QR code contient le lien saisi, car `localhost` désigne le téléphone qui scanne et non le PC qui héberge qraft. Pour activer le suivi depuis un téléphone, configurez une origine réellement joignable par ce téléphone (par exemple une adresse HTTPS publique, ou une adresse réseau locale avec `QRAFT_HOST=0.0.0.0` et les règles de pare-feu appropriées), puis redémarrez le serveur. Pour autoriser explicitement une destination locale ou privée (développement interne uniquement) :
+Par défaut, l’interface reste en **mode direct local** : le QR code contient le lien saisi, car `localhost` désigne le téléphone qui scanne et non le PC qui héberge QROOD. Pour activer le suivi depuis un téléphone, configurez une origine réellement joignable par ce téléphone (par exemple une adresse HTTPS publique, ou une adresse réseau locale avec `QROOD_HOST=0.0.0.0` et les règles de pare-feu appropriées), puis redémarrez le serveur. Pour autoriser explicitement une destination locale ou privée (développement interne uniquement) :
 
 ```powershell
-$env:QRAFT_ALLOW_PRIVATE_DESTINATIONS = "true"
+$env:QROOD_ALLOW_PRIVATE_DESTINATIONS = "true"
 ```
 
 ### Limite connue : alias DNS privés
@@ -196,7 +214,7 @@ Le test d’intégration démarre un serveur isolé sur un port libre et une bas
 - les redirections mesurées avant `Location`, les vCards pliées à 75 octets et le contraste des couleurs ;
 - la déduplication des scans, l’absence d’adresse IP dans les statistiques, la réconciliation des agrégats au redémarrage, l’idempotence de cette réconciliation et la purge des événements bruts de plus de 365 jours ;
 - les quotas d’offres (enregistrés et actifs), le refus `402`, la désactivation avec page `410` et sa réactivation, la non-régression des options premium et la grâce de 48 h ;
-- la facturation refusée sans configuration Stripe, le refus du double abonnement, l’enregistrement d’une demande de devis Entreprise, ainsi que le rejet des webhooks non signés, forgés ou rejoués.
+- la facturation refusée sans configuration Stripe, le refus du double abonnement, ainsi que le rejet des webhooks non signés, forgés ou rejoués.
 
 ## Passage en production
 

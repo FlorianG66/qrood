@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -27,6 +27,31 @@ async function getFreePort() {
 function sessionCookie(response) {
   const setCookie = response.headers.getSetCookie?.()[0] || response.headers.get("set-cookie") || "";
   return setCookie.split(";", 1)[0];
+}
+
+// Le transport local `outbox` écrit un fichier JSON par message. Ce helper
+// attend celui qui contient `needle` (l'URL de confirmation ou de
+// réinitialisation) et renvoie son contenu. Le nom du fichier ne porte ni
+// l'adresse du destinataire ni le jeton : on lit donc le corps.
+async function waitForOutbox(directory, needle, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const files = readdirSync(directory).sort();
+    for (let i = files.length - 1; i >= 0; i -= 1) {
+      const raw = readFileSync(path.join(directory, files[i]), "utf8");
+      if (raw.includes(needle)) return JSON.parse(raw);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`aucun courrier contenant « ${needle} » dans ${directory}`);
+}
+
+// Extrait le jeton à usage unique d'une URL d'e-mail (`?verifie=` ou
+// `?reinitialisation=`).
+function tokenFromUrl(text, queryKey) {
+  const match = text.match(new RegExp(`[?&]${queryKey}=([A-Za-z0-9_-]+)`));
+  assert.ok(match, `l'e-mail doit contenir ${queryKey}`);
+  return match[1];
 }
 
 async function request(url, options = {}) {
@@ -70,13 +95,13 @@ async function waitForServer(process) {
 function buildChildEnvironment(overrides = {}) {
   const environment = { ...process.env };
   for (const key of Object.keys(environment)) {
-    if (key.startsWith("QRAFT_")) delete environment[key];
+    if (key.startsWith("QROOD_")) delete environment[key];
   }
   return Object.assign(environment, {
-    QRAFT_PORT: String(PORT),
-    QRAFT_HOST: "127.0.0.1",
-    QRAFT_PUBLIC_ORIGIN: ORIGIN,
-    QRAFT_IDLE_TIMEOUT_MINUTES: "5",
+    QROOD_PORT: String(PORT),
+    QROOD_HOST: "127.0.0.1",
+    QROOD_PUBLIC_ORIGIN: ORIGIN,
+    QROOD_IDLE_TIMEOUT_MINUTES: "5",
     NODE_ENV: "test",
   }, overrides);
 }
@@ -137,6 +162,22 @@ function grantPlan(databasePath, email, plan, overrides = {}) {
   }
 }
 
+// Confirme l'adresse d'un compte directement en base, sur le modèle de
+// `grantPlan` : l'exigence de vérification (« enregistrer et publier ») n'est
+// pas l'objet de ces tests. `getSession` relit `email_verified_at` au fil de
+// l'eau, donc la session courante devient valide dès la requête suivante.
+function verifyEmail(databasePath, email) {
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec("PRAGMA busy_timeout = 5000;");
+    const user = database.prepare("SELECT id FROM users WHERE email = ?").get(email);
+    assert.ok(user, `le compte ${email} doit exister avant d’être confirmé`);
+    database.prepare("UPDATE users SET email_verified_at = ? WHERE id = ?").run(Date.now(), user.id);
+  } finally {
+    database.close();
+  }
+}
+
 function setQrcodeActive(databasePath, qrcodeId, isActive) {
   const database = new DatabaseSync(databasePath);
   try {
@@ -183,7 +224,7 @@ function seedQrcodes(databasePath, email, count) {
   }
 }
 
-async function registerUser(email, password = "MotDePassePlan789", ip = null) {
+async function registerUser(email, password = "MotDePassePlan789", ip = null, databasePath = null) {
   const headers = { Origin: ORIGIN, "Sec-Fetch-Site": "same-origin" };
   if (ip) headers["X-Forwarded-For"] = ip;
   const response = await request("/api/auth/register", {
@@ -193,6 +234,7 @@ async function registerUser(email, password = "MotDePassePlan789", ip = null) {
   });
   assert.equal(response.status, 201, `l’inscription de ${email} doit aboutir`);
   const body = await response.json();
+  if (databasePath) verifyEmail(databasePath, email);
   return {
     cookie: sessionCookie(response),
     csrf: body.csrfToken,
@@ -203,11 +245,11 @@ async function registerUser(email, password = "MotDePassePlan789", ip = null) {
 test("comptes, isolation des QR codes et statistiques", async () => {
   PORT = await getFreePort();
   ORIGIN = `http://localhost:${PORT}`;
-  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qraft-test-"));
+  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qrood-test-"));
   const logSink = { value: "" };
   const serverLog = () => logSink.value;
   const databasePath = path.join(temporaryDirectory, "test.sqlite");
-  const server = await startServer(buildChildEnvironment({ QRAFT_DB_PATH: databasePath }), logSink);
+  const server = await startServer(buildChildEnvironment({ QROOD_DB_PATH: databasePath }), logSink);
 
   try {
 
@@ -224,10 +266,14 @@ test("comptes, isolation des QR codes et statistiques", async () => {
     assert.equal(register.status, 201, serverLog);
     const firstSession = await register.json();
     const firstCookie = sessionCookie(register);
-    assert.ok(firstCookie.startsWith("qraft_session="));
+    assert.ok(firstCookie.startsWith("qrood_session="));
     assert.match(register.headers.get("set-cookie"), /HttpOnly/);
     assert.match(register.headers.get("set-cookie"), /SameSite=Strict/);
     assert.ok(firstSession.csrfToken);
+
+    // Ce test porte sur l'isolation des comptes, pas sur le flux d'e-mail : le
+    // compte confirme son adresse avant de publier.
+    verifyEmail(databasePath, "camille@example.test");
 
     // Ce test porte sur l'isolation des comptes, pas sur les quotas : le compte
     // passe sur Ultra pour que ses QR codes restent sans limite.
@@ -342,12 +388,12 @@ test("comptes, isolation des QR codes et statistiques", async () => {
 
     const headVisit = await request(createdBody.qrcode.trackingUrl, {
       method: "HEAD",
-      headers: { "User-Agent": "qraft-integration-test" },
+      headers: { "User-Agent": "qrood-integration-test" },
     });
     assert.equal(headVisit.status, 302);
 
     const trackedVisit = await request(createdBody.qrcode.trackingUrl, {
-      headers: { "User-Agent": "qraft-integration-test" },
+      headers: { "User-Agent": "qrood-integration-test" },
     });
     assert.equal(trackedVisit.status, 302);
     assert.equal(trackedVisit.headers.get("location"), "https://example.test/menu");
@@ -358,7 +404,7 @@ test("comptes, isolation des QR codes et statistiques", async () => {
     assert.equal(botVisit.status, 302);
 
     const duplicateVisit = await request(createdBody.qrcode.trackingUrl, {
-      headers: { "User-Agent": "qraft-integration-test" },
+      headers: { "User-Agent": "qrood-integration-test" },
     });
     assert.equal(duplicateVisit.status, 302);
 
@@ -388,6 +434,7 @@ test("comptes, isolation des QR codes et statistiques", async () => {
     assert.equal(secondRegister.status, 201, serverLog);
     const secondSession = await secondRegister.json();
     const secondCookie = sessionCookie(secondRegister);
+    verifyEmail(databasePath, "alex@example.test");
     grantPlan(databasePath, "alex@example.test", "ultra");
 
     const forbiddenStats = await request(`/api/qrcodes/${qrcodeId}/stats`, {
@@ -425,7 +472,7 @@ test("comptes, isolation des QR codes et statistiques", async () => {
     assert.equal(contact.status, 201, serverLog);
     const contactBody = await contact.json();
     const contactPage = await request(contactBody.qrcode.trackingUrl, {
-      headers: { "User-Agent": "qraft-integration-test" },
+      headers: { "User-Agent": "qrood-integration-test" },
     });
     assert.equal(contactPage.status, 200);
     assert.equal(contactPage.headers.get("referrer-policy"), "no-referrer");
@@ -502,7 +549,7 @@ test("comptes, isolation des QR codes et statistiques", async () => {
       body: {},
     });
     assert.equal(repeatedLogout.status, 200);
-    assert.match(repeatedLogout.headers.get("set-cookie") || "", /qraft_session=;/);
+    assert.match(repeatedLogout.headers.get("set-cookie") || "", /qrood_session=;/);
     const afterLogout = await request("/api/auth/me", { cookie: firstCookie });
     assert.deepEqual(await afterLogout.json(), { user: null, csrfToken: null });
 
@@ -547,12 +594,12 @@ test("comptes, isolation des QR codes et statistiques", async () => {
 test("agrégats de scans, rétention et absence d’adresse IP", async () => {
   PORT = await getFreePort();
   ORIGIN = `http://localhost:${PORT}`;
-  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qraft-rollup-"));
+  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qrood-rollup-"));
   const databasePath = path.join(temporaryDirectory, "rollup.sqlite");
   const logSink = { value: "" };
   const environment = buildChildEnvironment({
-    QRAFT_DB_PATH: databasePath,
-    QRAFT_TRUST_PROXY: "true",
+    QROOD_DB_PATH: databasePath,
+    QROOD_TRUST_PROXY: "true",
   });
   let server = await startServer(environment, logSink);
 
@@ -565,6 +612,7 @@ test("agrégats de scans, rétention et absence d’adresse IP", async () => {
     assert.equal(register.status, 201, logSink.value);
     const session = await register.json();
     const cookie = sessionCookie(register);
+    verifyEmail(databasePath, "sofia@example.test");
 
     const created = await request("/api/qrcodes", {
       method: "POST",
@@ -586,7 +634,7 @@ test("agrégats de scans, rétention et absence d’adresse IP", async () => {
     for (const visit of visits) {
       const response = await request(qrcode.trackingUrl, {
         headers: {
-          "User-Agent": "qraft-integration-test",
+          "User-Agent": "qrood-integration-test",
           "X-Forwarded-For": visit.forwarded,
           Referer: visit.referer,
         },
@@ -644,9 +692,9 @@ test("agrégats de scans, rétention et absence d’adresse IP", async () => {
 test("personnalisation du QR code : style, dégradé et logo", async () => {
   PORT = await getFreePort();
   ORIGIN = `http://127.0.0.1:${PORT}`;
-  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qraft-style-"));
+  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qrood-style-"));
   const databasePath = path.join(temporaryDirectory, "style.sqlite");
-  const environment = buildChildEnvironment({ QRAFT_DB_PATH: databasePath });
+  const environment = buildChildEnvironment({ QROOD_DB_PATH: databasePath });
   const logSink = { value: "" };
   const logo = `data:image/png;base64,${Buffer.from(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
@@ -666,6 +714,7 @@ test("personnalisation du QR code : style, dégradé et logo", async () => {
     const session = await registered.json();
     const cookie = sessionCookie(registered);
     const auth = { cookie, csrf: session.csrfToken, headers: { Origin: ORIGIN, "Sec-Fetch-Site": "same-origin" } };
+    verifyEmail(databasePath, "style@example.test");
 
     // Les formes, le dégradé et le logo sont des options Ultra : ce test les
     // vérifie donc sur un compte Ultra. Le refus côté Découverte est couvert par
@@ -834,24 +883,24 @@ test("personnalisation du QR code : style, dégradé et logo", async () => {
 test("offres : quotas, QR codes inactifs, régression et grâce de 48 h", async () => {
   PORT = await getFreePort();
   ORIGIN = `http://127.0.0.1:${PORT}`;
-  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qraft-plan-"));
+  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qrood-plan-"));
   const databasePath = path.join(temporaryDirectory, "plan.sqlite");
   const logSink = { value: "" };
-  // `QRAFT_TRUST_PROXY` permet de faire varier l’adresse client pour éprouver la
+  // `QROOD_TRUST_PROXY` permet de faire varier l’adresse client pour éprouver la
   // déduplication des scans sans dépendre d’un vrai second appareil.
   const environment = buildChildEnvironment({
-    QRAFT_DB_PATH: databasePath,
-    QRAFT_TRUST_PROXY: "true",
+    QROOD_DB_PATH: databasePath,
+    QROOD_TRUST_PROXY: "true",
   });
   let server;
 
-  const asClient = (ip) => ({ "User-Agent": "qraft-plan-test", "X-Forwarded-For": ip });
+  const asClient = (ip) => ({ "User-Agent": "qrood-plan-test", "X-Forwarded-For": ip });
 
   try {
     server = await startServer(environment, logSink);
 
     // ── L'offre Découverte est l'état par défaut ──────────────────────────────
-    const free = await registerUser("decouverte@example.test", undefined, "10.9.0.1");
+    const free = await registerUser("decouverte@example.test", undefined, "10.9.0.1", databasePath);
 
     const me = await request("/api/auth/me", { cookie: free.cookie });
     const meBody = await me.json();
@@ -1044,7 +1093,7 @@ test("offres : quotas, QR codes inactifs, régression et grâce de 48 h", async 
     assert.equal((await request(`${contactQrcode.trackingUrl}/vcard`, { headers: asClient("10.1.0.5") })).status, 410);
 
     // ── Le quota de stockage se compte séparément du quota d’actifs ────────────
-    const regression = await registerUser("regression@example.test", undefined, "10.9.0.2");
+    const regression = await registerUser("regression@example.test", undefined, "10.9.0.2", databasePath);
     seedQrcodes(databasePath, "regression@example.test", 12);
     const regressionLibrary = await request("/api/qrcodes", { cookie: regression.cookie });
     const regressionBody = await regressionLibrary.json();
@@ -1103,7 +1152,7 @@ test("offres : quotas, QR codes inactifs, régression et grâce de 48 h", async 
     assert.equal(activeCount, 11, "aucune désactivation automatique ne doit suivre un retour sur Découverte");
 
     // ── Le quota de 5 QR codes stockés bloque la création ─────────────────────
-    const stored = await registerUser("stocke@example.test", undefined, "10.9.0.3");
+    const stored = await registerUser("stocke@example.test", undefined, "10.9.0.3", databasePath);
     const createStored = async (index) => {
       const response = await request("/api/qrcodes", {
         method: "POST",
@@ -1160,7 +1209,7 @@ test("offres : quotas, QR codes inactifs, régression et grâce de 48 h", async 
     );
 
     // ── Une personnalisation déjà enregistrée reste modifiable ────────────────
-    const upgraded = await registerUser("reconstitue@example.test", undefined, "10.9.0.4");
+    const upgraded = await registerUser("reconstitue@example.test", undefined, "10.9.0.4", databasePath);
     grantPlan(databasePath, "reconstitue@example.test", "ultra");
     const premiumCreate = await request("/api/qrcodes", {
       method: "POST",
@@ -1226,7 +1275,7 @@ test("offres : quotas, QR codes inactifs, régression et grâce de 48 h", async 
     assert.equal(freeStatsBody.maxStatsDays, 30);
     assert.equal(freeStatsBody.stats.periodDays, 30, "Découverte est plafonné à 30 jours");
 
-    const ultraUser = await registerUser("ultra@example.test", undefined, "10.9.0.5");
+    const ultraUser = await registerUser("ultra@example.test", undefined, "10.9.0.5", databasePath);
     grantPlan(databasePath, "ultra@example.test", "ultra");
     const ultraCreate = await request("/api/qrcodes", {
       method: "POST",
@@ -1250,7 +1299,7 @@ test("offres : quotas, QR codes inactifs, régression et grâce de 48 h", async 
     assert.equal(ultraEntitlement.statsDays, 730);
 
     // ── La grâce de 48 h ─────────────────────────────────────────────────────
-    const graced = await registerUser("grace@example.test", undefined, "10.9.0.6");
+    const graced = await registerUser("grace@example.test", undefined, "10.9.0.6", databasePath);
     const graceMs = 48 * 3_600 * 1_000;
     const periodEnd = Date.now() + 24 * 3_600 * 1_000;
     grantPlan(databasePath, "grace@example.test", "pro", {
@@ -1278,13 +1327,13 @@ test("offres : quotas, QR codes inactifs, régression et grâce de 48 h", async 
     );
 
     // Un Checkout abandonné n’accorde aucun droit.
-    const incomplete = await registerUser("incomplete@example.test", undefined, "10.9.0.7");
+    const incomplete = await registerUser("incomplete@example.test", undefined, "10.9.0.7", databasePath);
     grantPlan(databasePath, "incomplete@example.test", "ultra", { status: "incomplete" });
     const incompleteLibrary = await request("/api/qrcodes", { cookie: incomplete.cookie });
     assert.equal((await incompleteLibrary.json()).entitlement.plan, "decouverte");
 
     // Un impayé en cours de relance ne doit pas retirer l’accès.
-    const pastDue = await registerUser("impaye@example.test", undefined, "10.9.0.8");
+    const pastDue = await registerUser("impaye@example.test", undefined, "10.9.0.8", databasePath);
     grantPlan(databasePath, "impaye@example.test", "pro", { status: "past_due", graceUntil: null });
     const pastDueLibrary = await request("/api/qrcodes", { cookie: pastDue.cookie });
     assert.equal((await pastDueLibrary.json()).entitlement.plan, "pro", "past_due reste couvert");
@@ -1294,27 +1343,18 @@ test("offres : quotas, QR codes inactifs, régression et grâce de 48 h", async 
   }
 });
 
-test("facturation : offres refusées sans configuration, devis Entreprise et webhooks signés", async () => {
+test("facturation : offres refusées sans configuration et webhooks signés", async () => {
   PORT = await getFreePort();
   ORIGIN = `http://127.0.0.1:${PORT}`;
-  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qraft-billing-"));
+  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qrood-billing-"));
   const databasePath = path.join(temporaryDirectory, "billing.sqlite");
   const logSink = { value: "" };
   let server;
 
-  const readLeads = () => {
-    const database = new DatabaseSync(databasePath);
-    try {
-      return database.prepare("SELECT * FROM enterprise_leads ORDER BY id").all();
-    } finally {
-      database.close();
-    }
-  };
-
   try {
     // ── Serveur sans aucune variable Stripe ───────────────────────────────
-    server = await startServer(buildChildEnvironment({ QRAFT_DB_PATH: databasePath }), logSink);
-    const user = await registerUser("facture@example.test", undefined, "10.9.1.1");
+    server = await startServer(buildChildEnvironment({ QROOD_DB_PATH: databasePath }), logSink);
+    const user = await registerUser("facture@example.test", undefined, "10.9.1.1", databasePath);
 
     const offers = await request("/api/billing/offers");
     assert.equal(offers.status, 200, "la page des offres reste lisible sans Stripe");
@@ -1325,10 +1365,9 @@ test("facturation : offres refusées sans configuration, devis Entreprise et web
     assert.equal(offersBody.taxEnabled, true, "Stripe Tax reste le mode de facturation annoncé");
     assert.deepEqual(
       Object.keys(offersBody.offers),
-      ["decouverte", "pro", "ultra", "entreprise"],
-      "les quatre offres sont publiées même sans configuration",
+      ["decouverte", "pro", "ultra"],
+      "les trois offres sont publiées même sans configuration",
     );
-    assert.equal(offersBody.offers.entreprise.quote, true);
     assert.equal(offersBody.offers.pro.price, null, "aucun prix ne doit être inventé");
     assert.ok(offersBody.offers.ultra.features.includes("Logo au centre"));
 
@@ -1373,7 +1412,7 @@ test("facturation : offres refusées sans configuration, devis Entreprise et web
     assert.equal(webhook.status, 503, "aucun webhook sans secret configuré");
     assert.equal((await webhook.json()).error.code, "webhooks_not_configured");
 
-    // Découverte et Entreprise ne sont pas achetables en ligne.
+    // Découverte n'est pas achetable en ligne, et Entreprise n'existe plus.
     for (const plan of ["decouverte", "entreprise"]) {
       const refused = await request("/api/billing/checkout", {
         method: "POST",
@@ -1386,6 +1425,14 @@ test("facturation : offres refusées sans configuration, devis Entreprise et web
       assert.equal((await refused.json()).error.code, "plan_not_purchasable");
     }
 
+    // La route de devis a disparu avec l'offre : plus rien à y envoyer.
+    const goneLead = await request("/api/billing/enterprise", {
+      method: "POST",
+      headers: { Origin: ORIGIN, "Sec-Fetch-Site": "same-origin", "X-Forwarded-For": "10.9.1.1" },
+      body: { company: "Mairie de Test", email: "achats@example.test", message: "Nous déployons 4 000 QR codes." },
+    });
+    assert.equal(goneLead.status, 404, "l’ancien point d’entrée de devis n’existe plus");
+
     const badSession = await request("/api/billing/confirm", {
       method: "POST",
       cookie: user.cookie,
@@ -1395,77 +1442,19 @@ test("facturation : offres refusées sans configuration, devis Entreprise et web
     });
     assert.equal(badSession.status, 400, "une référence de session mal formée est rejetée");
 
-    // ── Demande de devis Entreprise ───────────────────────────────────────
-    const shortMessage = await request("/api/billing/enterprise", {
-      method: "POST",
-      headers: { Origin: ORIGIN, "Sec-Fetch-Site": "same-origin", "X-Forwarded-For": "10.9.1.1" },
-      body: { company: "Mairie de Test", email: "achats@example.test", message: "vite" },
-    });
-    assert.equal(shortMessage.status, 400, "une demande vide de contexte est refusée");
-
-    const badEmail = await request("/api/billing/enterprise", {
-      method: "POST",
-      headers: { Origin: ORIGIN, "Sec-Fetch-Site": "same-origin", "X-Forwarded-For": "10.9.1.1" },
-      body: { company: "Mairie de Test", email: "pas-un-email", message: "Nous déployons 4 000 QR codes." },
-    });
-    assert.equal(badEmail.status, 400, "l’adresse e-mail est validée");
-
-    const lead = await request("/api/billing/enterprise", {
-      method: "POST",
-      cookie: user.cookie,
-      headers: { Origin: ORIGIN, "Sec-Fetch-Site": "same-origin", "X-Forwarded-For": "10.9.1.1" },
-      body: {
-        company: "Mairie de Test",
-        contactName: "Camille Dupont",
-        email: "achats@example.test",
-        phone: "+33 1 00 00 00 00",
-        volume: "4 000",
-        message: "Nous déployons 4 000 QR codes sur les agents de la mairie.",
-      },
-    });
-    assert.equal(lead.status, 201, logSink.value);
-    assert.deepEqual(await lead.json(), { received: true }, "la réponse ne reprend aucun champ saisi");
-
-    const leads = readLeads();
-    assert.equal(leads.length, 1);
-    assert.equal(leads[0].company, "Mairie de Test");
-    assert.equal(leads[0].email, "achats@example.test");
-    assert.ok(leads[0].user_id, "le compte connecté est rattaché à la demande");
-
-    // Un visiteur non connecté peut aussi demander un devis.
-    const guestLead = await request("/api/billing/enterprise", {
-      method: "POST",
-      headers: { Origin: ORIGIN, "Sec-Fetch-Site": "same-origin", "X-Forwarded-For": "10.9.1.2" },
-      body: { company: "Groupe Invite", email: "contact@invite.test", message: "Besoin d’une offre illimitée." },
-    });
-    assert.equal(guestLead.status, 201);
-    assert.equal(readLeads()[1].user_id, null, "une demande anonyme reste anonyme");
-
-    // Le quota par IP arrête le remplissage automatique.
-    let limited = 0;
-    for (let index = 0; index < 6; index += 1) {
-      const attempt = await request("/api/billing/enterprise", {
-        method: "POST",
-        headers: { Origin: ORIGIN, "Sec-Fetch-Site": "same-origin", "X-Forwarded-For": "10.9.1.9" },
-        body: { company: "Remplissage", email: "spam@example.test", message: "Message de remplissage automatique." },
-      });
-      if (attempt.status === 429) limited += 1;
-    }
-    assert.ok(limited > 0, "le quota de demandes par IP doit finir par s’appliquer");
-
     await stopServer(server);
 
     // ── Serveur configuré (clé factice, aucun appel réseau atteint) ───────
     const stripe = (await import("stripe")).default;
-    const webhookSecret = "whsec_test_qraft";
-    const SECRET_KEY = "sk_test_qraft_SONDE_1234567890";
+    const webhookSecret = "whsec_test_qrood";
+    const SECRET_KEY = "sk_test_qrood_SONDE_1234567890";
     server = await startServer(
       buildChildEnvironment({
-        QRAFT_DB_PATH: databasePath,
-        QRAFT_STRIPE_SECRET_KEY: SECRET_KEY,
-        QRAFT_STRIPE_WEBHOOK_SECRET: webhookSecret,
-        QRAFT_STRIPE_PRICE_PRO: "price_test_pro",
-        QRAFT_STRIPE_PRICE_ULTRA: "price_test_ultra",
+        QROOD_DB_PATH: databasePath,
+        QROOD_STRIPE_SECRET_KEY: SECRET_KEY,
+        QROOD_STRIPE_WEBHOOK_SECRET: webhookSecret,
+        QROOD_STRIPE_PRICE_PRO: "price_test_pro",
+        QROOD_STRIPE_PRICE_ULTRA: "price_test_ultra",
       }),
       logSink,
     );
@@ -1557,6 +1546,141 @@ test("facturation : offres refusées sans configuration, devis Entreprise et web
       "le secret de webhook ne doit jamais être écrit dans le journal",
     );
     assert.ok(!JSON.stringify(await leakedKey.json()).includes("sk_"), "la réponse au client ne doit rien divulguer");
+  } finally {
+    await stopServer(server);
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("courrier : confirmation de l'adresse par lien à usage unique", async () => {
+  PORT = await getFreePort();
+  ORIGIN = `http://127.0.0.1:${PORT}`;
+  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qrood-test-"));
+  const logSink = { value: "" };
+  const databasePath = path.join(temporaryDirectory, "test.sqlite");
+  const outboxDirectory = path.join(temporaryDirectory, "outbox");
+  const server = await startServer(
+    buildChildEnvironment({ QROOD_DB_PATH: databasePath, QROOD_MAIL_OUTBOX_DIR: outboxDirectory }),
+    logSink,
+  );
+
+  try {
+    const register = await request("/api/auth/register", {
+      method: "POST",
+      headers: { Origin: ORIGIN, "Sec-Fetch-Site": "same-origin" },
+      body: { displayName: "Camille Vérifiée", email: "verif@example.test", password: "MotDePasseVerif789" },
+    });
+    assert.equal(register.status, 201, logSink.value);
+    const session = await register.json();
+    const cookie = sessionCookie(register);
+    assert.equal(session.user.emailVerified, false);
+
+    const meBefore = await request("/api/auth/me", { cookie });
+    assert.equal((await meBefore.json()).user.emailVerified, false);
+
+    const mail = await waitForOutbox(outboxDirectory, "verifie=");
+    const token = tokenFromUrl(mail.text, "verifie");
+
+    const wrong = await request("/api/auth/verify-email", {
+      method: "POST",
+      headers: { Origin: ORIGIN },
+      body: { token: "x".repeat(40) },
+    });
+    assert.equal(wrong.status, 400);
+
+    const verify = await request("/api/auth/verify-email", {
+      method: "POST",
+      headers: { Origin: ORIGIN },
+      body: { token },
+    });
+    assert.equal(verify.status, 200);
+    assert.deepEqual(await verify.json(), { verified: true });
+
+    const replayed = await request("/api/auth/verify-email", {
+      method: "POST",
+      headers: { Origin: ORIGIN },
+      body: { token },
+    });
+    assert.equal(replayed.status, 200, "recharger le lien alors que l'adresse est confirmée reste sans erreur");
+
+    const meAfter = await request("/api/auth/me", { cookie });
+    assert.equal((await meAfter.json()).user.emailVerified, true);
+
+    // Une fois l'adresse confirmée, l'enregistrement et la publication passent.
+    const created = await request("/api/qrcodes", {
+      method: "POST",
+      cookie,
+      csrf: session.csrfToken,
+      headers: { Origin: ORIGIN, "Sec-Fetch-Site": "same-origin" },
+      body: { name: "Enfin en ligne", mode: "link", destination: "https://example.test/enfin" },
+    });
+    assert.equal(created.status, 201, logSink.value);
+  } finally {
+    await stopServer(server);
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("courrier : mot de passe oublié et réinitialisation", async () => {
+  PORT = await getFreePort();
+  ORIGIN = `http://127.0.0.1:${PORT}`;
+  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qrood-test-"));
+  const logSink = { value: "" };
+  const databasePath = path.join(temporaryDirectory, "test.sqlite");
+  const outboxDirectory = path.join(temporaryDirectory, "outbox");
+  const server = await startServer(
+    buildChildEnvironment({ QROOD_DB_PATH: databasePath, QROOD_MAIL_OUTBOX_DIR: outboxDirectory }),
+    logSink,
+  );
+
+  try {
+    const register = await request("/api/auth/register", {
+      method: "POST",
+      headers: { Origin: ORIGIN, "Sec-Fetch-Site": "same-origin" },
+      body: { displayName: "Paula Reset", email: "reset@example.test", password: "AncienMotDePasse789" },
+    });
+    assert.equal(register.status, 201, logSink.value);
+
+    const forgot = await request("/api/auth/password/forgot", {
+      method: "POST",
+      headers: { Origin: ORIGIN },
+      body: { email: "reset@example.test" },
+    });
+    assert.equal(forgot.status, 200);
+    assert.deepEqual(await forgot.json(), { accepted: true });
+
+    const mail = await waitForOutbox(outboxDirectory, "reinitialisation=");
+    const token = tokenFromUrl(mail.text, "reinitialisation");
+
+    const reset = await request("/api/auth/password/reset", {
+      method: "POST",
+      headers: { Origin: ORIGIN },
+      body: { token, password: "NouveauMotDePasse456" },
+    });
+    assert.equal(reset.status, 200);
+    assert.deepEqual(await reset.json(), { ok: true });
+
+    const replayed = await request("/api/auth/password/reset", {
+      method: "POST",
+      headers: { Origin: ORIGIN },
+      body: { token, password: "EncoreUnAutre789" },
+    });
+    assert.equal(replayed.status, 400, "le jeton de réinitialisation est à usage unique");
+
+    const loginNew = await request("/api/auth/login", {
+      method: "POST",
+      headers: { Origin: ORIGIN },
+      body: { email: "reset@example.test", password: "NouveauMotDePasse456" },
+    });
+    assert.equal(loginNew.status, 200);
+    assert.ok(sessionCookie(loginNew).startsWith("qrood_session="));
+
+    const loginOld = await request("/api/auth/login", {
+      method: "POST",
+      headers: { Origin: ORIGIN },
+      body: { email: "reset@example.test", password: "AncienMotDePasse789" },
+    });
+    assert.equal(loginOld.status, 401, "l'ancien mot de passe ne doit plus fonctionner");
   } finally {
     await stopServer(server);
     rmSync(temporaryDirectory, { recursive: true, force: true });

@@ -2,7 +2,7 @@ import http from "node:http";
 import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 import { mkdirSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -14,22 +14,30 @@ import {
   readPeriodEnd,
   redactSecrets,
 } from "./billing-rules.mjs";
+import {
+  buildResetMessage,
+  buildVerificationMessage,
+  createApiTransport,
+  createOutboxTransport,
+  isValidMailAddress,
+  validateMailConfiguration,
+} from "./mailer.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const scrypt = promisify(scryptCallback);
-const PORT = readInteger("QRAFT_PORT", 3000, 1, 65535);
-const HOST = process.env.QRAFT_HOST || "127.0.0.1";
-const PUBLIC_ORIGIN = normalizePublicOrigin(process.env.QRAFT_PUBLIC_ORIGIN || `http://localhost:${PORT}`);
-const IDLE_TIMEOUT_MS = process.env.QRAFT_IDLE_TIMEOUT_MS
-  ? readInteger("QRAFT_IDLE_TIMEOUT_MS", 1_800_000, 1_000, 86_400_000)
-  : readInteger("QRAFT_IDLE_TIMEOUT_MINUTES", 30, 1, 1440) * 60_000;
-const SESSION_TTL_MS = readInteger("QRAFT_SESSION_TTL_HOURS", 168, 1, 720) * 60 * 60 * 1_000;
-const DB_PATH = process.env.QRAFT_DB_PATH || path.join(ROOT, "data", "qraft.sqlite");
-const TRUST_PROXY = process.env.QRAFT_TRUST_PROXY === "true";
-const SECURE_COOKIES = process.env.QRAFT_SECURE_COOKIES
-  ? process.env.QRAFT_SECURE_COOKIES === "true"
+const PORT = readInteger("QROOD_PORT", 3000, 1, 65535);
+const HOST = process.env.QROOD_HOST || "127.0.0.1";
+const PUBLIC_ORIGIN = normalizePublicOrigin(process.env.QROOD_PUBLIC_ORIGIN || `http://localhost:${PORT}`);
+const IDLE_TIMEOUT_MS = process.env.QROOD_IDLE_TIMEOUT_MS
+  ? readInteger("QROOD_IDLE_TIMEOUT_MS", 1_800_000, 0, 86_400_000)
+  : readInteger("QROOD_IDLE_TIMEOUT_MINUTES", 30, 0, 1440) * 60_000;
+const SESSION_TTL_MS = readInteger("QROOD_SESSION_TTL_HOURS", 168, 1, 720) * 60 * 60 * 1_000;
+const DB_PATH = process.env.QROOD_DB_PATH || path.join(ROOT, "data", "qrood.sqlite");
+const TRUST_PROXY = process.env.QROOD_TRUST_PROXY === "true";
+const SECURE_COOKIES = process.env.QROOD_SECURE_COOKIES
+  ? process.env.QROOD_SECURE_COOKIES === "true"
   : PUBLIC_ORIGIN.startsWith("https://");
-const ALLOW_PRIVATE_DESTINATIONS = process.env.QRAFT_ALLOW_PRIVATE_DESTINATIONS === "true";
+const ALLOW_PRIVATE_DESTINATIONS = process.env.QROOD_ALLOW_PRIVATE_DESTINATIONS === "true";
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 const MAX_JSON_BYTES = 64 * 1024;
 const MAX_QR_JSON_BYTES = 384 * 1024;
@@ -76,20 +84,10 @@ const PLAN_CATALOG = {
     customization: "complete",
     support: "prioritaire",
   },
-  entreprise: {
-    key: "entreprise",
-    label: "Entreprise",
-    maxQrcodes: null,
-    maxActive: null,
-    statsDays: 730,
-    customization: "complete",
-    support: "prioritaire",
-  },
 };
 const DEFAULT_PLAN = "decouverte";
-// Seules Pro et Ultra sont facturables. Découverte est gratuite et Entreprise
-// passe par un devis, donc aucune de ces deux offres n'a de Price Stripe : le
-// webhook refuse alors de leur attribuer un accès payant.
+// Seules Pro et Ultra sont facturables. Découverte est gratuite, donc elle n'a
+// pas de Price Stripe : le webhook refuse alors de lui attribuer un accès payant.
 const BILLABLE_PLANS = ["pro", "ultra"];
 const STRIPE_PRICE_ENV = {
   pro: "STRIPE_PRICE_PRO",
@@ -144,18 +142,60 @@ const SCAN_DEDUPE_WINDOW_MS = 5 * 60 * 1_000;
 const MAX_SESSIONS_PER_USER = 10;
 const MAX_RATE_BUCKETS = 10_000;
 
+// Adresses e-mail : deux usages distincts, deux jetons distincts, une seule
+// table. La confirmation prouve que la boîte existe, la réinitialisation prouve
+// qu'on la contrôle : les deux liens sont donc consommés séparément, pour que
+// voler un lien de réinitialisation ne valide pas une adresse par surprise.
+const VERIFICATION_PURPOSE = "email_verification";
+const RESET_PURPOSE = "password_reset";
+const VERIFICATION_TOKEN_TTL_MS = readInteger("QROOD_VERIFICATION_TOKEN_HOURS", 24, 1, 168) * 60 * 60 * 1_000;
+const RESET_TOKEN_TTL_MS = readInteger("QROOD_RESET_TOKEN_MINUTES", 60, 5, 1_440) * 60 * 1_000;
+// Plancher entre deux envois pour une même adresse et un même but : il
+// dépend de l'heure du dernier envoi, donc il survit au redémarrage.
+const MAIL_RESEND_DELAY_MS = readInteger("QROOD_MAIL_RESEND_DELAY_SECONDS", 60, 0, 3_600) * 1_000;
+const MAIL_TRANSPORT = (readStripeEnv("MAIL_TRANSPORT") || "outbox").toLowerCase();
+const MAIL_FROM = readStripeEnv("MAIL_FROM") || "no-reply@qrood.example";
+const MAIL_OUTBOX_DIRECTORY = process.env.QROOD_MAIL_OUTBOX_DIR
+  || path.join(DB_PATH === ":memory:" ? path.join(ROOT, "data") : path.dirname(DB_PATH), "outbox");
+const MAIL_API_URL = readStripeEnv("MAIL_API_URL");
+const MAIL_API_KEY = readStripeEnv("MAIL_API_KEY");
+
 if (IS_PRODUCTION && !PUBLIC_ORIGIN.startsWith("https://")) {
-  throw new Error("QRAFT_PUBLIC_ORIGIN doit utiliser HTTPS en production.");
+  throw new Error("QROOD_PUBLIC_ORIGIN doit utiliser HTTPS en production.");
 }
 if (IS_PRODUCTION && PUBLIC_ORIGIN.startsWith("https://") && !SECURE_COOKIES) {
-  throw new Error("QRAFT_SECURE_COOKIES doit être activé en production.");
+  throw new Error("QROOD_SECURE_COOKIES doit être activé en production.");
 }
+
+// La vérification d'adresse et la réinitialisation de mot de passe passent par
+// un envoi d'e-mail : sans transport configuré, un utilisateur ne peut ni
+// confirmer son compte ni récupérer son accès. En production c'est un refus de
+// démarrer, pas une dégradation silencieuse.
+const mailConfigurationError = validateMailConfiguration({
+  transport: MAIL_TRANSPORT,
+  apiUrl: MAIL_API_URL,
+  apiKey: MAIL_API_KEY,
+  production: IS_PRODUCTION,
+});
+if (mailConfigurationError) throw new Error(mailConfigurationError);
+
+if (MAIL_TRANSPORT === "api" && !isValidMailAddress(MAIL_FROM)) {
+  throw new Error("QROOD_MAIL_FROM doit être une adresse e-mail valide, sans nom d'affichage.");
+}
+
+const mailer = MAIL_TRANSPORT === "api"
+  ? createApiTransport({ url: MAIL_API_URL, apiKey: MAIL_API_KEY, from: MAIL_FROM, fetch })
+  : createOutboxTransport({ directory: MAIL_OUTBOX_DIRECTORY, writeFile, mkdir: mkdirSync });
 
 if (DB_PATH !== ":memory:") {
   mkdirSync(path.dirname(DB_PATH), { recursive: true });
 }
 
 const db = new DatabaseSync(DB_PATH);
+const SCHEMA_VERSION = 3;
+// La version est lue avant toute écriture : c'est elle qui distingue une base
+// existante d'une base neuve, et donc une migration d'un simple rattrapage.
+const previousSchemaVersion = Number(db.prepare("PRAGMA user_version").get()?.user_version || 0);
 db.exec("PRAGMA foreign_keys = ON;");
 db.exec("PRAGMA busy_timeout = 5000;");
 if (DB_PATH !== ":memory:") db.exec("PRAGMA journal_mode = WAL;");
@@ -253,7 +293,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS subscriptions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    plan TEXT NOT NULL CHECK(plan IN ('decouverte','pro','ultra','entreprise')),
+    plan TEXT NOT NULL CHECK(plan IN ('decouverte','pro','ultra')),
     status TEXT NOT NULL CHECK(status IN ('active','trialing','past_due','canceled',
                   'unpaid','paused','incomplete','incomplete_expired')),
     stripe_customer_id TEXT NOT NULL,
@@ -278,24 +318,23 @@ db.exec(`
     received_at INTEGER NOT NULL
   ) STRICT;
 
-  -- L'offre Entreprise se négocie : la demande est conservée pour la traiter
-  -- hors ligne, jamais pour accorder un accès automatique. La colonne user_id
-  -- est nullable car la demande peut arriver avant la création du compte.
-  CREATE TABLE IF NOT EXISTS enterprise_leads (
+  -- Jeton à usage unique, jamais stocké en clair : seul son SHA-256 est
+  -- conservé, comme pour les sessions. La colonne used_at rend la
+  -- consommation vérifiable en base, et non seulement dans le code appelant.
+  CREATE TABLE IF NOT EXISTS auth_tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    company TEXT NOT NULL,
-    contact_name TEXT NOT NULL DEFAULT '',
-    email TEXT NOT NULL,
-    phone TEXT NOT NULL DEFAULT '',
-    volume TEXT NOT NULL DEFAULT '',
-    message TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    purpose TEXT NOT NULL CHECK(purpose IN ('email_verification','password_reset')),
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at INTEGER
   ) STRICT;
 
-  CREATE INDEX IF NOT EXISTS idx_enterprise_leads_created ON enterprise_leads(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id, purpose);
+  CREATE INDEX IF NOT EXISTS idx_auth_tokens_expiry ON auth_tokens(expires_at);
 
-  PRAGMA user_version = 1;
+  PRAGMA user_version = ${SCHEMA_VERSION};
 `);
 
 function ensureQrcodeLegacyKey() {
@@ -330,9 +369,63 @@ function ensureQrcodeActivityColumns() {
   db.exec("CREATE INDEX IF NOT EXISTS idx_qrcodes_user_active ON qrcodes(user_id, is_active)");
 }
 
+function ensureEmailVerificationColumns() {
+  const names = new Set(db.prepare("PRAGMA table_info(users)").all().map((column) => column.name));
+  if (!names.has("email_verified_at")) {
+    db.exec("ALTER TABLE users ADD COLUMN email_verified_at INTEGER");
+  }
+  // Les comptes créés avant l'exigence de confirmation sont considérés comme
+  // vérifiés : leur adresse a servi à tout ce qu'ils ont publié, et les
+  // bloquer retroactivement leur retirerait un accès déjà acquis. Le remplissage
+  // est lié à la version de schéma, donc il ne rejoue pas sur les comptes
+  // inscrits depuis, qui doivent au contraire passer par l'e-mail.
+  if (previousSchemaVersion < 2) {
+    db.exec("UPDATE users SET email_verified_at = created_at WHERE email_verified_at IS NULL");
+  }
+}
+
+// L'offre Entreprise, qui se négociait par devis, est retirée du catalogue. La
+// table de ses demandes n'a plus de raison d'exister, et la contrainte CHECK des
+// abonnements est reprise sans elle. SQLite ne sait pas modifier un CHECK : la
+// table est donc recréée à l'identique, lignes conservées, puis l'index d'unicité
+// qui interdit le double abonnement est réposé. Rien d'autre n'` + "`" + `est
+// modifié, et ` + "`" + `foreign_keys` + "`" + ` n'a pas à être désactivé car aucune table ne référence subscriptions.
+function migrateEntreprisePlanRemoval() {
+  db.exec("DROP TABLE IF EXISTS enterprise_leads");
+  const table = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'subscriptions'").get();
+  if (!table?.sql || !table.sql.includes("'entreprise'")) return;
+  db.exec(`
+    BEGIN;
+    CREATE TABLE subscriptions_retablies (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      plan TEXT NOT NULL CHECK(plan IN ('decouverte','pro','ultra')),
+      status TEXT NOT NULL CHECK(status IN ('active','trialing','past_due','canceled',
+                    'unpaid','paused','incomplete','incomplete_expired')),
+      stripe_customer_id TEXT NOT NULL,
+      stripe_subscription_id TEXT UNIQUE,
+      stripe_price_id TEXT NOT NULL,
+      current_period_end INTEGER,
+      cancel_at_period_end INTEGER NOT NULL DEFAULT 0 CHECK(cancel_at_period_end IN (0,1)),
+      grace_until INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    ) STRICT;
+    INSERT INTO subscriptions_retablies SELECT * FROM subscriptions;
+    DROP TABLE subscriptions;
+    ALTER TABLE subscriptions_retablies RENAME TO subscriptions;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_live_user
+      ON subscriptions(user_id)
+      WHERE status NOT IN ('canceled','incomplete_expired');
+    COMMIT;
+  `);
+}
+
 ensureQrcodeLegacyKey();
 ensureQrcodeStyleColumns();
 ensureQrcodeActivityColumns();
+ensureEmailVerificationColumns();
+migrateEntreprisePlanRemoval();
 
 function backfillScanRollups() {
   // Réconciliation plutôt qu’un test « table vide » : le calcul est rejoué à
@@ -412,10 +505,10 @@ function normalizePublicOrigin(value) {
   try {
     parsed = new URL(value);
   } catch {
-    throw new Error("QRAFT_PUBLIC_ORIGIN doit être une origine HTTP ou HTTPS valide.");
+    throw new Error("QROOD_PUBLIC_ORIGIN doit être une origine HTTP ou HTTPS valide.");
   }
   if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
-    throw new Error("QRAFT_PUBLIC_ORIGIN doit contenir uniquement le schéma, l’hôte et le port.");
+    throw new Error("QROOD_PUBLIC_ORIGIN doit contenir uniquement le schéma, l’hôte et le port.");
   }
   return parsed.origin;
 }
@@ -430,11 +523,11 @@ function readInteger(name, fallback, minimum, maximum) {
   return value;
 }
 
-// Les variables Stripe suivent la convention `QRAFT_` du projet, mais la
-// convention `STRIPE_` de l'outillage est aussi acceptée : c'est ce que
-// fournit la console en production. Les deux lisent la même variable.
+// Les variables d'outillage suivent la convention `QROOD_` du projet, mais la
+// convention de leur outil est aussi acceptée : `STRIPE_…` pour Stripe,
+// `MAIL_…` pour l'envoi d'e-mails. Les deux lisent la même variable.
 function readStripeEnv(name) {
-  return cleanText(process.env[`QRAFT_${name}`] || process.env[name] || "", 255);
+  return cleanText(process.env[`QROOD_${name}`] || process.env[name] || "", 255);
 }
 
 // Aucune trace d'une clé ne doit atteindre le journal, même enveloppée dans une
@@ -506,7 +599,7 @@ function parseCookies(header = "") {
 
 function sessionCookie(token) {
   const attributes = [
-    `qraft_session=${token}`,
+    `qrood_session=${token}`,
     "Path=/",
     "HttpOnly",
     "SameSite=Strict",
@@ -517,17 +610,17 @@ function sessionCookie(token) {
 }
 
 function clearSessionCookie() {
-  const attributes = ["qraft_session=", "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=0"];
+  const attributes = ["qrood_session=", "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=0"];
   if (SECURE_COOKIES) attributes.push("Secure");
   return attributes.join("; ");
 }
 
 function getSession(request) {
-  const token = parseCookies(request.headers.cookie).get("qraft_session");
+  const token = parseCookies(request.headers.cookie).get("qrood_session");
   if (!token || !/^[A-Za-z0-9_-]{32,128}$/.test(token)) return null;
   const session = db.prepare(`
     SELECT s.id, s.user_id, s.csrf_token, s.last_seen_at, s.expires_at,
-           u.id AS user_id_value, u.display_name, u.email
+           u.id AS user_id_value, u.display_name, u.email, u.email_verified_at
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ? AND s.expires_at > ?
@@ -543,6 +636,7 @@ function getSession(request) {
     csrfToken: session.csrf_token,
     displayName: session.display_name,
     email: session.email,
+    emailVerifiedAt: session.email_verified_at,
   };
 }
 
@@ -623,6 +717,129 @@ function pruneRateBuckets() {
   for (const [key, bucket] of rateBuckets) {
     if (bucket.resetAt <= timestamp) rateBuckets.delete(key);
   }
+}
+
+// -- Adresses e-mail -------------------------------------------------------
+// Les jetons vivent dans la base et ne sont jamais journalisés : le journal
+// receives des faits (« envoi effectué »), jamais le lien qui autorise l'action.
+
+function lastAuthToken(userId, purpose) {
+  return db.prepare(`
+    SELECT created_at FROM auth_tokens
+    WHERE user_id = ? AND purpose = ?
+    ORDER BY id DESC LIMIT 1
+  `).get(userId, purpose);
+}
+
+function issueAuthToken(userId, purpose, ttlMs) {
+  const timestamp = now();
+  // Un seul jeton vivant par but : un nouveau lien annule le précédent, sinon
+  // un e-mail de réinitialisation resterait valable après une demande plus
+  // récente, et les deux liens seraient acceptés.
+  db.prepare("DELETE FROM auth_tokens WHERE user_id = ? AND purpose = ? AND used_at IS NULL").run(
+    userId,
+    purpose,
+  );
+  const token = randomToken(32);
+  db.prepare(`
+    INSERT INTO auth_tokens (user_id, purpose, token_hash, created_at, expires_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(userId, purpose, hashToken(token), timestamp, timestamp + ttlMs);
+  return { token, expiresAt: timestamp + ttlMs };
+}
+
+/**
+ * Consomme un jeton, une seule fois.
+ *
+ * La consommation est un `UPDATE` conditionnel : deux requêtes simultanées
+ * avec le même jeton ne peuvent pas toutes deux voir `changes === 1`. C'est la
+ * condition `expires_at > now` qui décide, pas l'heure de création du jeton.
+ */
+function consumeAuthToken(token, purpose) {
+  if (typeof token !== "string" || !/^[A-Za-z0-9_-]{32,128}$/.test(token)) return null;
+  const result = db.prepare(`
+    UPDATE auth_tokens SET used_at = ?
+    WHERE token_hash = ? AND purpose = ? AND used_at IS NULL AND expires_at > ?
+  `).run(now(), hashToken(token), purpose, now());
+  if (result.changes !== 1) return null;
+  return db.prepare("SELECT user_id FROM auth_tokens WHERE token_hash = ?").get(hashToken(token));
+}
+
+function authTokenState(token, purpose) {
+  if (typeof token !== "string" || !/^[A-Za-z0-9_-]{32,128}$/.test(token)) return null;
+  return db.prepare(`
+    SELECT user_id, used_at, expires_at FROM auth_tokens WHERE token_hash = ? AND purpose = ?
+  `).get(hashToken(token), purpose);
+}
+
+function purgeAuthTokens() {
+  // Un jeton inutilisé disparaît à son expiration ; un jeton consommé est gardé
+  // un jour, pour que recharger la page après un clic reste une réussite et non
+  // une erreur. Ces deux lignes ne contiennent que des condensats : le délai
+  // d'effacement n'est pas une donnée sensible.
+  db.prepare(`
+    DELETE FROM auth_tokens
+    WHERE (used_at IS NULL AND expires_at <= ?) OR (used_at IS NOT NULL AND used_at <= ?)
+  `).run(now(), now() - 24 * 60 * 60 * 1_000);
+}
+
+/**
+ * Envoie un message sans jamais faire échouer la demande qui l'a déclenché.
+ *
+ * Un e-mail non parti ne doit pas annuler une inscription ni une
+ * réinitialisation déjà validées en base : l'utilisateur peut en demander un
+ * nouveau. L'échec est journalisé sans le lien, qui est une autorisation.
+ */
+async function sendMail(message) {
+  // Un destinataire invalide ne part jamais : une adresse pourrie dans la base
+  // ne doit pas se transformer en tentative d'envoi.
+  if (!isValidMailAddress(message.to)) {
+    console.error(`e-mail ${message.purpose} non envoyé : destinataire invalide.`);
+    return false;
+  }
+  try {
+    await mailer.send(message);
+    console.log(`e-mail ${message.purpose} envoyé (transport : ${mailer.mode}).`);
+    return true;
+  } catch (error) {
+    console.error(redactSecrets(`e-mail ${message.purpose} non envoyé : ${error?.message || error}`));
+    return false;
+  }
+}
+
+async function sendVerificationEmail(user, token) {
+  const url = `${PUBLIC_ORIGIN}/?verifie=${encodeURIComponent(token)}`;
+  return sendMail(buildVerificationMessage({
+    to: user.email,
+    name: user.display_name,
+    url,
+    validHours: Math.round(VERIFICATION_TOKEN_TTL_MS / 3_600_000),
+  }));
+}
+
+async function sendPasswordResetEmail(user, token) {
+  const url = `${PUBLIC_ORIGIN}/?reinitialisation=${encodeURIComponent(token)}`;
+  return sendMail(buildResetMessage({
+    to: user.email,
+    name: user.display_name,
+    url,
+    validMinutes: Math.round(RESET_TOKEN_TTL_MS / 60_000),
+  }));
+}
+
+/**
+ * Refuse une opération qui publie ou consomme un droit tant que l'adresse n'est
+ * pas confirmée. La désactivation et la suppression en sont exemptes : ce sont
+ * des actes de retrait, et les bloquer obligerait un compte mal vérifié à
+ * laisser en ligne ce qu'il voudrait retirer.
+ */
+function requireVerifiedEmail(session) {
+  if (session.emailVerifiedAt) return;
+  throw new HttpError(
+    403,
+    "Confirmez votre adresse e-mail pour enregistrer et publier vos QR codes.",
+    "email_verification_required",
+  );
 }
 
 function validateDisplayName(value) {
@@ -755,7 +972,7 @@ function normalizeHttpUrl(rawValue) {
     throw new HttpError(400, "Les destinations réseau privées ou locales sont refusées.", "private_destination");
   }
   if (parsed.origin === new URL(PUBLIC_ORIGIN).origin) {
-    throw new HttpError(400, "La destination ne peut pas pointer vers qraft.", "self_destination");
+    throw new HttpError(400, "La destination ne peut pas pointer vers QROOD.", "self_destination");
   }
   if (parsed.href.length > MAX_DESTINATION_LENGTH) {
     throw new HttpError(400, "Le lien est trop long.", "invalid_destination");
@@ -1171,7 +1388,7 @@ function linkStripeCustomer(userId, customerId) {
     VALUES (?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET stripe_customer_id = excluded.stripe_customer_id
   `).run(userId, customerId, now());
-  // Le même client Stripe ne peut pas être rattaché à deux comptes qraft.
+  // Le même client Stripe ne peut pas être rattaché à deux comptes QROOD.
   db.prepare("UPDATE billing_customers SET user_id = ? WHERE stripe_customer_id = ? AND user_id <> ?")
     .run(userId, customerId, userId);
 }
@@ -1185,7 +1402,7 @@ async function getOrCreateStripeCustomer(userId) {
   const customer = await stripe.customers.create({
     email: user.email,
     name: user.display_name,
-    metadata: { qraft_user_id: String(userId) },
+    metadata: { qrood_user_id: String(userId) },
   });
   linkStripeCustomer(userId, customer.id);
   const stored = db.prepare("SELECT stripe_customer_id FROM billing_customers WHERE user_id = ?").get(userId);
@@ -1209,15 +1426,15 @@ function syncSubscriptionFromStripe(subscription) {
     if (status === "incomplete" || status === "incomplete_expired") return null;
     if (!plan) {
       console.error(
-        `qraft billing: abonnement Stripe ${stripeSubscriptionId} sur un Price inconnu, accès laissé sur Découverte.`
+        `qrood billing: abonnement Stripe ${stripeSubscriptionId} sur un Price inconnu, accès laissé sur Découverte.`
       );
       return null;
     }
     const userId =
       findUserIdByStripeCustomer(customerId)
-      || findUserIdFromMetadata(subscription.metadata?.qraft_user_id);
+      || findUserIdFromMetadata(subscription.metadata?.qrood_user_id);
     if (!userId) {
-      console.error(`qraft billing: abonnement Stripe ${stripeSubscriptionId} sans compte qraft associé, ignoré.`);
+      console.error(`qrood billing: abonnement Stripe ${stripeSubscriptionId} sans compte QROOD associé, ignoré.`);
       return null;
     }
     if (customerId) linkStripeCustomer(userId, customerId);
@@ -1244,7 +1461,7 @@ function syncSubscriptionFromStripe(subscription) {
 
   if (!plan) {
     console.error(
-      `qraft billing: abonnement Stripe ${stripeSubscriptionId} sur un Price inconnu, offre ${existing.plan} conservée.`
+      `qrood billing: abonnement Stripe ${stripeSubscriptionId} sur un Price inconnu, offre ${existing.plan} conservée.`
     );
     return existing;
   }
@@ -1335,9 +1552,13 @@ async function readStripePrices() {
         amount: price.unit_amount,
         currency: price.currency.toUpperCase(),
         interval: "month",
+        // Un Price `inclusive` porte déjà la TVA dans son montant : l'interface
+        // doit alors l'annoncer en TTC. Sans ce champ, elle afficherait
+        // « 12,00 € HT » pour un montant que le client paie bien à 12,00 €.
+        taxInclusive: price.tax_behavior === "inclusive",
       };
     } catch (error) {
-      console.error(`qraft billing: Price ${priceId} illisible (${redactSecrets(error.message)}).`);
+      console.error(`qrood billing: Price ${priceId} illisible (${redactSecrets(error.message)}).`);
       offers[plan] = null;
     }
   }
@@ -1380,13 +1601,6 @@ function buildOffersPayload(prices) {
       label: PLAN_CATALOG.ultra.label,
       price: prices.ultra || null,
       features: featuresFor("ultra"),
-    },
-    entreprise: {
-      key: "entreprise",
-      label: PLAN_CATALOG.entreprise.label,
-      price: null,
-      quote: true,
-      features: featuresFor("entreprise"),
     },
   };
 }
@@ -1470,7 +1684,7 @@ async function processStripeEvent(event) {
         const userId =
           findUserIdByStripeCustomer(typeof session.customer === "string" ? session.customer : session.customer.id)
           || findUserIdFromMetadata(session.client_reference_id)
-          || findUserIdFromMetadata(session.metadata?.qraft_user_id);
+          || findUserIdFromMetadata(session.metadata?.qrood_user_id);
         if (userId) linkStripeCustomer(userId, typeof session.customer === "string" ? session.customer : session.customer.id);
       }
       const subscriptionId = typeof session.subscription === "string" ? session.subscription : session.subscription?.id;
@@ -1800,6 +2014,15 @@ function sendError(response, error) {
   sendJson(response, status, { error: { code, message } }, headers);
 }
 
+function publicUser(row) {
+  return {
+    id: row.userId ?? row.id,
+    displayName: row.displayName ?? row.display_name,
+    email: row.email,
+    emailVerified: Boolean(row.emailVerifiedAt ?? row.email_verified_at),
+  };
+}
+
 async function handleAuthApi(request, response, url) {
   if (request.method === "GET" && url.pathname === "/api/auth/me") {
     const session = getSession(request);
@@ -1808,7 +2031,7 @@ async function handleAuthApi(request, response, url) {
       return;
     }
     sendJson(response, 200, {
-      user: { id: session.userId, displayName: session.displayName, email: session.email },
+      user: publicUser(session),
       csrfToken: session.csrfToken,
       entitlement: resolveEntitlement(session.userId),
       subscription: getSubscriptionSummary(session.userId),
@@ -1840,9 +2063,14 @@ async function handleAuthApi(request, response, url) {
     }
     const userId = Number(result.lastInsertRowid);
     const createdSession = createSession(userId, request);
+    // Le compte existe immédiatement : l'utilisateur est connecté, mais il ne
+    // peut rien publier tant que l'adresse n'est pas confirmée.
+    const verification = issueAuthToken(userId, VERIFICATION_PURPOSE, VERIFICATION_TOKEN_TTL_MS);
+    await sendVerificationEmail({ email, display_name: displayName }, verification.token);
     sendJson(response, 201, {
-      user: { id: userId, displayName, email },
+      user: { id: userId, displayName, email, emailVerified: false },
       csrfToken: createdSession.csrfToken,
+      verification: { required: true, resendDelaySeconds: Math.round(MAIL_RESEND_DELAY_MS / 1_000) },
     }, { "Set-Cookie": sessionCookie(createdSession.token) });
     return;
   }
@@ -1857,7 +2085,7 @@ async function handleAuthApi(request, response, url) {
       throw new HttpError(400, "Mot de passe invalide.", "invalid_password");
     }
     const user = db.prepare(`
-      SELECT id, display_name, email, password_hash
+      SELECT id, display_name, email, password_hash, email_verified_at
       FROM users WHERE email = ?
     `).get(email);
     const valid = await verifyPassword(body.password, user?.password_hash || DUMMY_PASSWORD_HASH);
@@ -1867,7 +2095,12 @@ async function handleAuthApi(request, response, url) {
     db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(now());
     const createdSession = createSession(user.id, request);
     sendJson(response, 200, {
-      user: { id: user.id, displayName: user.display_name, email: user.email },
+      user: publicUser({
+        id: user.id,
+        display_name: user.display_name,
+        email: user.email,
+        email_verified_at: user.email_verified_at,
+      }),
       csrfToken: createdSession.csrfToken,
     }, { "Set-Cookie": sessionCookie(createdSession.token) });
     return;
@@ -1884,7 +2117,130 @@ async function handleAuthApi(request, response, url) {
     return;
   }
 
+  // Le lien de confirmation est la preuve : aucune session n'est requise, pour
+  // que le clic fonctionne même après une expiration de session. En revanche
+  // aucune session n'est créée non plus — un lien d'e-mail reste une
+  // autorisation à usage unique, pas un billet de connexion.
+  if (request.method === "POST" && url.pathname === "/api/auth/verify-email") {
+    checkRateLimit(`verify:${getClientIp(request)}`, 20, 15 * 60 * 1_000);
+    verifyBrowserOrigin(request);
+    const body = requireObject(await readJson(request));
+    const token = cleanText(body.token, 128);
+    const consumed = consumeAuthToken(token, VERIFICATION_PURPOSE);
+    if (consumed) {
+      const timestamp = now();
+      db.prepare(`
+        UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?
+      `).run(timestamp, consumed.user_id);
+      // Le jeton consommé reste en base (purgeAuthTokens l'efface après 24 h) :
+      // c'est lui qui permet à un second clic sur le même lien de renvoyer une
+      // réussite au lieu d'une erreur.
+      sendJson(response, 200, { verified: true });
+      return;
+    }
+    // Un second clic sur le même lien ne doit pas enregistrer une erreur alors
+    // que l'adresse est bien confirmée : c'est le cas le plus fréquent quand on
+    // recharge la page. Le jeton reste la preuve, rien n'est divulgué de plus.
+    const previous = authTokenState(token, VERIFICATION_PURPOSE);
+    if (previous?.used_at) {
+      const owner = db.prepare("SELECT email_verified_at FROM users WHERE id = ?").get(previous.user_id);
+      if (owner?.email_verified_at) {
+        sendJson(response, 200, { verified: true });
+        return;
+      }
+    }
+    throw new HttpError(400, "Ce lien de confirmation est invalide ou a expiré.", "invalid_token");
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/email/resend") {
+    const ip = getClientIp(request);
+    checkRateLimit(`resend:${ip}`, 20, 60 * 60 * 1_000);
+    const session = requireSession(request);
+    verifyCsrf(request, session);
+    checkRateLimit(`resend:user:${session.userId}`, 10, 60 * 60 * 1_000);
+    if (session.emailVerifiedAt) {
+      sendJson(response, 200, { verified: true });
+      return;
+    }
+    await issueAndSendVerification(session.userId);
+    sendJson(response, 200, { sent: true, resendDelaySeconds: Math.round(MAIL_RESEND_DELAY_MS / 1_000) });
+    return;
+  }
+
+  // Réponse volontairement identique que le compte existe ou non : cette
+  // adresse ne doit pas pouvoir servir à découvrir qui a un compte QROOD.
+  if (request.method === "POST" && url.pathname === "/api/auth/password/forgot") {
+    const ip = getClientIp(request);
+    checkRateLimit(`forgot:${ip}`, 5, 60 * 60 * 1_000);
+    verifyBrowserOrigin(request);
+    const body = requireObject(await readJson(request));
+    const email = validateEmail(body.email);
+    // La clé de compteur est un condensat de l'adresse : les seaux en mémoire
+    // ne conservent donc aucune adresse en clair.
+    checkRateLimit(`forgot:mail:${hashToken(email)}`, 3, 60 * 60 * 1_000);
+    const user = db.prepare("SELECT id, display_name, email FROM users WHERE email = ?").get(email);
+    if (user) {
+      await issueAndSendReset(user);
+    }
+    sendJson(response, 200, { accepted: true });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/password/reset") {
+    checkRateLimit(`reset:${getClientIp(request)}`, 10, 60 * 60 * 1_000);
+    verifyBrowserOrigin(request);
+    const body = requireObject(await readJson(request));
+    const token = cleanText(body.token, 128);
+    const password = validatePassword(body.password);
+    const consumed = consumeAuthToken(token, RESET_PURPOSE);
+    if (!consumed) {
+      throw new HttpError(400, "Ce lien de réinitialisation est invalide ou a expiré.", "invalid_token");
+    }
+    const passwordHash = await hashPassword(password);
+    const timestamp = now();
+    db.prepare("UPDATE users SET password_hash = ?, email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?")
+      .run(passwordHash, timestamp, consumed.user_id);
+    // Un changement de mot de passe ferme les sessions ouvertes : la
+    // réinitialisation sert justement à reprendre la main sur un compte dont
+    // quelqu'un d'autre aurait obtenu l'accès.
+    db.prepare("DELETE FROM sessions WHERE user_id = ?").run(consumed.user_id);
+    db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(consumed.user_id);
+    sendJson(response, 200, { ok: true }, { "Set-Cookie": clearSessionCookie() });
+    return;
+  }
+
   throw new HttpError(404, "Ressource introuvable.", "not_found");
+}
+
+// Le délai minimal entre deux envois est mesuré sur le dernier envoi réel, pas
+// sur un compteur en mémoire : il tient après un redémarrage, et il empêche
+// d'utiliser l'endpoint pour remplir la boîte d'un tiers.
+async function issueAndSendVerification(userId) {
+  const last = lastAuthToken(userId, VERIFICATION_PURPOSE);
+  if (last && MAIL_RESEND_DELAY_MS > 0 && now() - last.created_at < MAIL_RESEND_DELAY_MS) {
+    const error = new HttpError(
+      429,
+      "Un e-mail de confirmation vient d'être envoyé. Patientez quelques instants avant d'en demander un nouveau.",
+      "resend_too_soon",
+    );
+    error.retryAfter = Math.max(1, Math.ceil((MAIL_RESEND_DELAY_MS - (now() - last.created_at)) / 1000));
+    throw error;
+  }
+  const user = db.prepare("SELECT display_name, email FROM users WHERE id = ?").get(userId);
+  if (!user) throw new HttpError(404, "Compte introuvable.", "not_found");
+  const issued = issueAuthToken(userId, VERIFICATION_PURPOSE, VERIFICATION_TOKEN_TTL_MS);
+  await sendVerificationEmail(user, issued.token);
+}
+
+async function issueAndSendReset(user) {
+  const last = lastAuthToken(user.id, RESET_PURPOSE);
+  if (last && MAIL_RESEND_DELAY_MS > 0 && now() - last.created_at < MAIL_RESEND_DELAY_MS) {
+    // La réponse reste neutre : le demandeur n'a pas à savoir qu'un lien
+    // circule déjà, ni être puni pour une cadence trop rapide.
+    return;
+  }
+  const issued = issueAuthToken(user.id, RESET_PURPOSE, RESET_TOKEN_TTL_MS);
+  await sendPasswordResetEmail(user, issued.token);
 }
 
 async function handleQrApi(request, response, url, session) {
@@ -1904,6 +2260,7 @@ async function handleQrApi(request, response, url, session) {
 
   if (request.method === "POST" && url.pathname === "/api/qrcodes") {
     verifyCsrf(request, session);
+    requireVerifiedEmail(session);
     checkRateLimit(`create:${session.userId}`, 120, 60 * 60 * 1_000);
     const body = requireObject(await readJson(request, MAX_QR_JSON_BYTES));
     const entitlement = resolveEntitlement(session.userId);
@@ -1974,6 +2331,7 @@ async function handleQrApi(request, response, url, session) {
 
     if (request.method === "PUT") {
       verifyCsrf(request, session);
+      requireVerifiedEmail(session);
       const entitlement = resolveEntitlement(session.userId);
       const payload = validateQrPayload(
         requireObject(await readJson(request, MAX_QR_JSON_BYTES)),
@@ -2029,6 +2387,10 @@ async function handleQrApi(request, response, url, session) {
       throw new HttpError(400, "Le champ « active » doit être un booléen.", "invalid_body");
     }
     if (body.active && existing.is_active !== 1) {
+      // Réactiver remet un lien en ligne : c'est une publication, donc elle
+      // exige une adresse confirmée. Désactiver, ci-dessus, reste toujours
+      // possible, y compris sans confirmation.
+      requireVerifiedEmail(session);
       const entitlement = resolveEntitlement(session.userId);
       if (entitlement.maxActive !== null && entitlement.usedActive >= entitlement.maxActive) {
         throw new HttpError(
@@ -2086,7 +2448,7 @@ async function handleApi(request, response, url) {
     return;
   }
   if (url.pathname === "/api/billing/stripe/webhook") {
-    // Avant toute session : Stripe n'a pas de cookie qraft. La seule preuve
+    // Avant toute session : Stripe n'a pas de cookie QROOD. La seule preuve
     // d'authenticité est la signature, vérifiée sur le corps brut.
     await handleStripeWebhook(request, response);
     return;
@@ -2116,6 +2478,9 @@ async function handleBillingApi(request, response, url) {
   if (request.method === "POST" && url.pathname === "/api/billing/checkout") {
     const session = requireSession(request);
     verifyCsrf(request, session);
+    // Avant la vérification de la configuration Stripe : un compte non
+    // confirmé n'a pas à apprendre au passage que la facturation manque.
+    requireVerifiedEmail(session);
     const body = requireObject(await readJson(request));
     const plan = cleanText(body.plan, 32);
     const url2 = await createCheckoutSession(session.userId, plan);
@@ -2136,6 +2501,9 @@ async function handleBillingApi(request, response, url) {
     // payer et veut son offre immédiatement, pas après la prochaine livraison.
     const session = requireSession(request);
     verifyCsrf(request, session);
+    // `/portal` reste ouvert : gérer un abonnement existant ne crée aucun
+    // droit, alors que `confirm` en accorde un.
+    requireVerifiedEmail(session);
     const body = requireObject(await readJson(request));
     const checkoutSessionId = cleanText(body.sessionId, 64);
     if (!/^cs_[A-Za-z0-9]{8,}$/.test(checkoutSessionId)) {
@@ -2143,46 +2511,6 @@ async function handleBillingApi(request, response, url) {
     }
     const synced = await confirmCheckoutSession(session.userId, checkoutSessionId);
     sendJson(response, 200, { synced, entitlement: resolveEntitlement(session.userId) });
-    return;
-  }
-
-  if (request.method === "POST" && url.pathname === "/api/billing/enterprise") {
-    // Accessible sans compte : la demande doit pouvoir arriver avant
-    // l'inscription. Le quota par IP limite le remplissage automatique.
-    const ip = getClientIp(request);
-    checkRateLimit(`enterprise:${ip}`, 5, 60 * 60 * 1_000);
-    verifyBrowserOrigin(request);
-    const session = getSession(request);
-    const body = requireObject(await readJson(request));
-    const company = cleanText(body.company, 120);
-    if (company.length < 2) {
-      throw new HttpError(400, "Indiquez le nom de votre société.", "invalid_company");
-    }
-    const message = cleanText(body.message, 2_000);
-    if (message.length < 10) {
-      throw new HttpError(
-        400,
-        "Décrivez votre besoin en une dizaine de caractères au moins.",
-        "invalid_message"
-      );
-    }
-    db.prepare(`
-      INSERT INTO enterprise_leads (
-        user_id, company, contact_name, email, phone, volume, message, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      session ? session.userId : null,
-      company,
-      cleanText(body.contactName, 120),
-      validateEmail(body.email),
-      cleanText(body.phone, 40),
-      cleanText(body.volume, 40),
-      message,
-      now()
-    );
-    // La réponse ne reprend aucun champ saisi : elle ne doit rien confirmer qui
-    // puisse servir à énumérer les demandes reçues.
-    sendJson(response, 201, { received: true });
     return;
   }
 
@@ -2224,7 +2552,7 @@ async function handleStripeWebhook(request, response) {
     // Le marqueur doit disparaître, sinon Stripe ne réessaiera jamais cet
     // événement et l'utilisateur resterait sans son offre.
     db.prepare("DELETE FROM stripe_events WHERE event_id = ?").run(event.id);
-    console.error(`qraft billing: échec du traitement de ${event.type} (${redactSecrets(error.message)}).`);
+    console.error(`qrood billing: échec du traitement de ${event.type} (${redactSecrets(error.message)}).`);
     throw new HttpError(502, "Le paiement est enregistré mais l’offre n’a pas pu être appliquée.", "webhook_failed");
   }
   sendJson(response, 200, { received: true });
@@ -2268,7 +2596,7 @@ function contactPage(row) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
-  <title>${escapeHtml(row.name)} — qraft</title>
+  <title>${escapeHtml(row.name)} — QROOD</title>
   <style>
     :root{color-scheme:light;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#101b33;background:#f5f6f9}
     *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at top right,#ecebff,transparent 42%),#f5f6f9}
@@ -2281,7 +2609,7 @@ function contactPage(row) {
 </head>
 <body><main>
   <div class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
-  <p class="kicker">Contact partagé avec qraft</p>
+  <p class="kicker">Contact partagé avec QROOD</p>
   <h1>${escapeHtml(row.name)}</h1>
   <p>Ajoutez cette carte de visite à vos contacts.</p>
   <div class="details">${details.map((detail) => `<div class="detail">${escapeHtml(detail)}</div>`).join("")}</div>
@@ -2297,7 +2625,7 @@ function inactivePage() {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
-  <title>QR code inactif — qraft</title>
+  <title>QR code inactif — QROOD</title>
   <style>
     :root{color-scheme:light;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#101b33;background:#f5f6f9}
     *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at top right,#ecebff,transparent 42%),#f5f6f9}
@@ -2309,7 +2637,7 @@ function inactivePage() {
 </head>
 <body><main>
   <div class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
-  <p class="kicker">qraft</p>
+  <p class="kicker">QROOD</p>
   <h1>Ce QR code est désactivé</h1>
   <p>Son propriétaire a suspendu la mesure des scans, donc ce lien n’est plus actif. Le QR code imprimé n’est pas responsable&nbsp;: c’est son propriétaire qui l’a désactivé.</p>
   <small>Si ce QR code figure sur un support que vous n’avez pas créé, signalez-le à son propriétaire.</small>
@@ -2372,7 +2700,7 @@ function handlePublicRoute(request, response, url) {
     response.writeHead(200, {
       "Content-Type": "text/vcard; charset=utf-8",
       "Content-Length": body.length,
-      "Content-Disposition": 'attachment; filename="qraft-contact.vcf"',
+      "Content-Disposition": 'attachment; filename="qrood-contact.vcf"',
       "Cache-Control": "no-store",
     });
     response.end(request.method === "HEAD" ? undefined : body);
@@ -2455,7 +2783,7 @@ function shutdown(reason = "manual") {
   if (shuttingDown) return;
   shuttingDown = true;
   if (idleTimer) clearTimeout(idleTimer);
-  console.log(`qraft server stopping (${reason}).`);
+  console.log(`qrood server stopping (${reason}).`);
   const forceTimer = setTimeout(() => process.exit(1), 3_000);
   forceTimer.unref();
   server.close(() => {
@@ -2473,6 +2801,7 @@ setInterval(() => {
     timestamp - MAX_SCAN_RETENTION_DAYS * 24 * 60 * 60 * 1_000,
   );
   db.prepare("DELETE FROM stripe_events WHERE received_at < ?").run(timestamp - 7 * 24 * 60 * 60 * 1_000);
+  purgeAuthTokens();
   pruneRateBuckets();
   for (const [key, expiresAt] of recentScanBuckets) {
     if (expiresAt <= timestamp) recentScanBuckets.delete(key);
@@ -2484,5 +2813,8 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 server.listen(PORT, HOST, () => {
   scheduleIdleShutdown();
-  console.log(`qraft server listening on ${PUBLIC_ORIGIN}/ (idle timeout: ${Math.round(IDLE_TIMEOUT_MS / 60_000)} min)`);
+  const idleLabel = IDLE_TIMEOUT_MS <= 0
+    ? "inactivité : arrêt désactivé"
+    : `inactivité : arrêt après ${Math.round(IDLE_TIMEOUT_MS / 60_000)} min`;
+  console.log(`qrood server listening on ${PUBLIC_ORIGIN}/ (${idleLabel})`);
 });

@@ -1,10 +1,10 @@
 (() => {
   "use strict";
 
-  const STORAGE_KEY = "qraft-qr-history";
+  const STORAGE_KEY = "qrood-qr-history";
   const MAX_LEGACY_IMPORT = 50;
   const MAX_LEGACY_ATTEMPTS = 3;
-  const defaultLink = "https://qraft.example/hello";
+  const defaultLink = "https://qrood.example/hello";
   const MAX_MARGIN = 8;
   const LOGO_MAX_EDGE = 256;
   const LOGO_MAX_DATA_LENGTH = 220_000;
@@ -13,6 +13,10 @@
   const LOGO_SIZE_DEFAULT_PCT = 22;
   const LOGO_MIN_SPAN = 5;
   const LOGO_ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/webp", "image/svg+xml"];
+  // Ordre d'affichage de la section Tarifs et de la modale d'offres : Découverte
+  // sert de point d'entrée, Ultra met la grille en valeur.
+  const PLAN_ORDER = ["decouverte", "pro", "ultra"];
+  const PLAN_FEATURED = "ultra";
   const defaultStyle = Object.freeze({
     moduleShape: "square",
     eyeShape: "square",
@@ -39,8 +43,8 @@
     currentRecordId: null,
     trackingUrl: null,
     offers: null,
+    offersError: "",
     subscription: null,
-    enterpriseOpen: false,
     contentDirty: false,
     isDirty: false,
     isSaving: false,
@@ -90,6 +94,9 @@
     bindEvents();
     renderHistory();
     updatePreview();
+    // Les tarifs sont publics : la requête part en parallèle de la session, pour
+    // que la section soit lisible sans attendre la réponse d'authentification.
+    const offersPromise = loadOffers();
     try {
       await restoreSession();
     } catch (error) {
@@ -97,6 +104,7 @@
       console.error("Session restore failed", error);
       showToast("Le serveur n’est pas disponible. Rechargez la page.");
     }
+    await offersPromise;
     window.addEventListener("load", () => {
       updatePreview();
       renderHistory();
@@ -167,6 +175,11 @@
     elements.quotaModalIntro = $("#quotaModalIntro");
     elements.quotaModalList = $("#quotaModalList");
     elements.quotaModalConfirm = $("#quotaModalConfirm");
+    elements.pricingGrid = $("#pricingGrid");
+    elements.pricingNotice = $("#pricingNotice");
+    elements.pricingFoot = $("#pricingFoot");
+    elements.pricingFootText = $("#pricingFootText");
+    elements.pricingManageButton = $("#pricingManageButton");
     elements.offersModal = $("#offersModal");
     elements.offersModalIntro = $("#offersModalIntro");
     elements.offersNotice = $("#offersNotice");
@@ -175,10 +188,6 @@
     elements.offersManagementText = $("#offersManagementText");
     elements.openPortalButton = $("#openPortalButton");
     elements.quotaBannerUpgrade = $("#quotaBannerUpgrade");
-    elements.enterpriseForm = $("#enterpriseFormElement");
-    elements.enterpriseEmail = $("#enterpriseEmail");
-    elements.enterpriseError = $("#enterpriseError");
-    elements.enterpriseCancel = $("#enterpriseCancel");
     elements.authModal = $("#authModal");
     elements.authError = $("#authError");
     elements.loginForm = $("#loginForm");
@@ -339,9 +348,9 @@
     elements.quotaModalConfirm.addEventListener("click", confirmTrimActiveQrcodes);
     elements.quotaModalList.addEventListener("change", () => syncQuotaModalConfirm());
     elements.openPortalButton.addEventListener("click", openBillingPortal);
-    elements.enterpriseCancel.addEventListener("click", () => setEnterpriseView(false));
-    elements.enterpriseForm.addEventListener("submit", handleEnterpriseLead);
     elements.offersGrid.addEventListener("click", handleOfferAction);
+    elements.pricingGrid.addEventListener("click", handlePricingAction);
+    elements.pricingManageButton.addEventListener("click", openBillingPortal);
     $$("[data-auth-mode]").forEach((button) => {
       button.addEventListener("click", () => setAuthMode(button.dataset.authMode));
     });
@@ -664,9 +673,9 @@
   function createQr(payload, options = {}) {
     if (!payload || typeof window.qrcode !== "function") return null;
     try {
-      if (typeof TextEncoder === "function" && !window.qrcode.__qraftUtf8) {
+      if (typeof TextEncoder === "function" && !window.qrcode.__qroodUtf8) {
         window.qrcode.stringToBytes = (text) => Array.from(new TextEncoder().encode(text));
-        window.qrcode.__qraftUtf8 = true;
+        window.qrcode.__qroodUtf8 = true;
       }
       const qr = window.qrcode(0, options.errorCorrectionLevel || "M");
       qr.addData(payload);
@@ -1163,6 +1172,8 @@
     elements.planBadge.hidden = !signedIn;
     elements.quotaMeters.hidden = !signedIn || !entitlement;
     elements.quotaBanner.hidden = !signedIn || !entitlement || !entitlement.overQuota;
+    // La section Tarifs met en avant l'offre courante : elle suit donc l'entitlement.
+    renderPricing();
     if (!signedIn || !entitlement) return;
 
     elements.planBadge.textContent = planLabel();
@@ -1304,14 +1315,32 @@
   }
 
   function formatOfferAmount(offer) {
-    if (offer.quote) return "Sur devis";
     if (!offer.price) return "Inclus";
-    const amount = new Intl.NumberFormat("fr-FR", {
+    return new Intl.NumberFormat("fr-FR", {
       style: "currency",
       currency: offer.price.currency || "EUR",
       maximumFractionDigits: 2,
     }).format((Number(offer.price.amount) || 0) / 100);
-    return `${amount} HT`;
+  }
+
+  // Le Price décide de l'étiquette fiscale : `inclusive` porte déjà la TVA.
+  function offerTaxLabel(offer) {
+    if (!offer?.price) return "";
+    return offer.price.taxInclusive ? "TTC" : "HT";
+  }
+
+  function hasOfferPrice(offer) {
+    return offer.price !== null && offer.price !== undefined;
+  }
+
+  // Décision partagée par la section Tarifs et la modale d'offres : ce qu'un
+  // visiteur peut faire de cette offre. Seule la mise en forme diffère, jamais
+  // la règle — c'est le serveur qui refuse de toute façon un double abonnement.
+  function offerActionKind(offer, isCurrent) {
+    if (isCurrent) return "current";
+    if (hasOfferPrice(offer)) return "buy";
+    if (offer.key === "decouverte") return "free";
+    return "unavailable";
   }
 
   function renderOffers() {
@@ -1320,34 +1349,26 @@
     const current = state.entitlement?.plan || "decouverte";
     const configured = Boolean(catalog.configured);
     const offers = catalog.offers || {};
-    const order = ["decouverte", "pro", "ultra", "entreprise"];
 
-    elements.offersGrid.innerHTML = order.map((key) => {
+    elements.offersGrid.innerHTML = PLAN_ORDER.map((key) => {
       const offer = offers[key];
       if (!offer) return "";
       const isCurrent = offer.key === current;
-      const isFeatured = !isCurrent && offer.key === "ultra";
-      const hasPrice = offer.price !== null && offer.price !== undefined;
-      let action = "";
-      if (isCurrent) {
-        action = `<button class="button button-light offer-current" type="button" disabled>Offre actuelle</button>`;
-      } else if (offer.quote) {
-        action = `<button class="button button-dark" type="button" data-offer-action="enterprise">Demander un devis</button>`;
-      } else if (hasPrice) {
-        action = `<button class="button ${isFeatured ? "button-primary" : "button-dark"}" type="button" data-offer-action="buy" data-offer-plan="${escapeHtml(offer.key)}">Choisir ${escapeHtml(offer.label)}</button>`;
-      } else if (offer.key === "decouverte") {
-        action = `<button class="button button-light" type="button" disabled>Incluse par défaut</button>`;
-      } else {
-        action = `<button class="button button-light" type="button" disabled>Bientôt disponible</button>`;
-      }
-      const note = offer.key === "decouverte"
-        ? "Sans carte bancaire, sans engagement."
-        : (hasPrice ? "TVA calculée par Stripe selon votre pays. Résiliable à tout mois." : "");
+      const isFeatured = !isCurrent && offer.key === PLAN_FEATURED;
+      const hasPrice = hasOfferPrice(offer);
+      const actions = {
+        current: `<button class="button button-light offer-current" type="button" disabled>Offre actuelle</button>`,
+        buy: `<button class="button ${isFeatured ? "button-primary" : "button-dark"}" type="button" data-offer-action="buy" data-offer-plan="${escapeHtml(offer.key)}">Choisir ${escapeHtml(offer.label)}</button>`,
+        free: `<button class="button button-light" type="button" disabled>Incluse par défaut</button>`,
+        unavailable: `<button class="button button-light" type="button" disabled>Bientôt disponible</button>`,
+      };
+      const action = actions[offerActionKind(offer, isCurrent)];
+      const note = pricingNoteFor(offer, offerActionKind(offer, isCurrent));
       return `
         <article class="offer-card${isCurrent ? " is-current" : ""}${isFeatured ? " is-featured" : ""}" data-offer-key="${escapeHtml(offer.key)}">
           ${isFeatured ? `<span class="offer-flag">La plus complète</span>` : ""}
           <span class="offer-name">${escapeHtml(offer.label)}</span>
-          <p class="offer-price">${formatOfferAmount(offer)} ${hasPrice ? "<span>/ mois</span>" : ""}</p>
+          <p class="offer-price">${formatOfferAmount(offer)} ${hasPrice ? `<span class="offer-tax">${escapeHtml(offerTaxLabel(offer))}</span> <span>/ mois</span>` : ""}</p>
           <ul class="offer-features">
             ${(offer.features || []).map((feature) => `<li>${escapeHtml(feature)}</li>`).join("")}
           </ul>
@@ -1395,51 +1416,171 @@
     elements.offersNotice.hidden = !message;
   }
 
-  function setEnterpriseView(open) {
-    state.enterpriseOpen = open;
-    elements.enterpriseForm.hidden = !open;
-    elements.offersGrid.hidden = open;
-    // `renderOffers` recalcule cette visibilité à chaque ouverture ; seul le
-    // passage au formulaire doit la masquer.
-    if (open) elements.offersManagement.hidden = true;
-    if (open) {
-      showOffersNotice("");
-      if (state.user?.email && !elements.enterpriseEmail.value) {
-        elements.enterpriseEmail.value = state.user.email;
-      }
+  // ── Section Tarifs ─────────────────────────────────────────────────────────
+  // Les montants ne sont jamais calculés ici : ils sont lus sur les Prices
+  // Stripe par le serveur. Une offre payante dont le Price est absent reste donc
+  // sans prix affiché, plutôt que de laisser croire à un tarif.
+  async function loadOffers(options = {}) {
+    if (state.offers && !state.offers.failed && !options.force) return state.offers;
+    try {
+      const result = await api("/api/billing/offers");
+      state.offers = result;
+      state.offersError = "";
+    } catch (error) {
+      state.offers = { failed: true, configured: false, offers: {} };
+      state.offersError = error.message || "Impossible de charger les offres.";
     }
+    renderPricing();
+    return state.offers;
+  }
+
+  function formatPricingAmount(offer) {
+    if (offer.key === "decouverte") return { amount: "Gratuit", period: "", tax: "" };
+    if (!hasOfferPrice(offer)) return { amount: "—", period: "", tax: "" };
+    return { amount: formatOfferAmount(offer), period: "/ mois", tax: offerTaxLabel(offer) };
+  }
+
+  function pricingNoteFor(offer, kind) {
+    if (kind === "free") return "Sans carte bancaire, sans engagement.";
+    if (kind === "buy") {
+      return offer.price?.taxInclusive
+        ? "Prix toutes taxes comprises, résiliable à tout mois."
+        : "TVA calculée par Stripe selon votre pays. Résiliable à tout mois.";
+    }
+    return "";
+  }
+
+  function pricingActionFor(offer, kind, isFeatured) {
+    const actions = {
+      current: `<button class="button button-light pricing-current" type="button" disabled>Offre actuelle</button>`,
+      buy: `<button class="button ${isFeatured ? "button-primary" : "button-dark"}" type="button" data-pricing-action="buy" data-offer-plan="${escapeHtml(offer.key)}">Choisir ${escapeHtml(offer.label)}</button>`,
+      free: `<button class="button button-dark" type="button" data-pricing-action="free">Commencer gratuitement</button>`,
+      unavailable: `<button class="button button-light" type="button" disabled>Bientôt disponible</button>`,
+    };
+    return actions[kind];
+  }
+
+  function pricingNoticeFor(catalog) {
+    if (catalog.failed) return state.offersError;
+    if (!catalog.configured) {
+      return "La facturation n’est pas encore activée sur cette installation. Les offres restent consultables, mais le paiement est indisponible.";
+    }
+    if (!state.user) {
+      return "Le paiement passe par Stripe Checkout : aucune carte bancaire n’est enregistrée chez QROOD.";
+    }
+    return "";
+  }
+
+  function setPricingNotice(message) {
+    elements.pricingNotice.textContent = message;
+    elements.pricingNotice.hidden = !message;
+  }
+
+  function renderPricing() {
+    const catalog = state.offers;
+    // Tant que la requête n'est pas revenue, le squelette du HTML fait office
+    // d'état de chargement : mieux vaut une section vide qu'un prix deviné.
+    if (!catalog) return;
+
+    if (catalog.failed) {
+      elements.pricingGrid.innerHTML = `
+        <p class="pricing-loading">
+          Les tarifs sont indisponibles pour le moment.
+          <button class="button button-light button-small" type="button" data-pricing-action="retry">Réessayer</button>
+        </p>`;
+      setPricingNotice(pricingNoticeFor(catalog));
+      elements.pricingFoot.hidden = true;
+      return;
+    }
+
+    // Un visiteur non connecté n'a pas d'offre : sans session, aucune carte ne
+    // peut être marquée « offre actuelle », sous peine de lui faire croire
+    // qu'il est déjà abonné.
+    const current = state.user ? (state.entitlement?.plan || "decouverte") : null;
+    const offers = catalog.offers || {};
+
+    elements.pricingGrid.innerHTML = PLAN_ORDER.map((key) => {
+      const offer = offers[key];
+      if (!offer) return "";
+      const isCurrent = Boolean(current) && offer.key === current;
+      const isFeatured = !isCurrent && offer.key === PLAN_FEATURED;
+      const amount = formatPricingAmount(offer);
+      const kind = offerActionKind(offer, isCurrent);
+      const note = pricingNoteFor(offer, kind);
+      return `
+        <article class="pricing-card${isCurrent ? " is-current" : ""}${isFeatured ? " is-featured" : ""}" data-offer-key="${escapeHtml(offer.key)}">
+          ${isFeatured ? `<span class="pricing-flag">La plus complète</span>` : ""}
+          <span class="pricing-name">${escapeHtml(offer.label)}</span>
+          <p class="pricing-price"><b>${escapeHtml(amount.amount)}</b>${amount.tax ? `<span class="pricing-tax">${escapeHtml(amount.tax)}</span>` : ""}${amount.period ? `<span>${escapeHtml(amount.period)}</span>` : ""}</p>
+          <ul class="pricing-features">
+            ${(offer.features || []).map((feature) => `<li>${escapeHtml(feature)}</li>`).join("")}
+          </ul>
+          ${note ? `<p class="pricing-note">${escapeHtml(note)}</p>` : ""}
+          ${pricingActionFor(offer, kind, isFeatured)}
+        </article>
+      `;
+    }).join("");
+
+    setPricingNotice(pricingNoticeFor(catalog));
+    renderPricingFoot();
+  }
+
+  function renderPricingFoot() {
+    const summary = state.subscription;
+    const hasPaidPlan = summary && summary.status && summary.plan !== "decouverte";
+    elements.pricingFoot.hidden = !(summary?.hasBillingAccount && hasPaidPlan);
+    if (elements.pricingFoot.hidden) return;
+    elements.pricingFootText.textContent = buildSubscriptionSummaryText(summary);
+  }
+
+  async function handlePricingAction(event) {
+    const button = event.target.closest("button[data-pricing-action]");
+    if (!button) return;
+    const action = button.dataset.pricingAction;
+    if (action === "retry") {
+      await loadOffers({ force: true });
+      return;
+    }
+    if (action === "free") {
+      startFreePlan();
+      return;
+    }
+    if (action === "buy") {
+      await startCheckout(button.dataset.offerPlan, button);
+    }
+  }
+
+  function startFreePlan() {
+    if (!state.user) {
+      openAuthModal("register", "Créez votre compte pour commencer gratuitement.");
+      return;
+    }
+    // Un abonnement existant ne se change pas depuis cette page : le portail
+    // client reste le seul chemin qui évite deux abonnements vivants.
+    if (state.subscription?.hasBillingAccount) {
+      openOffersModal();
+      return;
+    }
+    $("#createur").scrollIntoView({ behavior: "smooth", block: "start" });
+    window.setTimeout(() => elements.linkInput.focus({ preventScroll: true }), 320);
   }
 
   async function openOffersModal() {
     showOffersNotice("");
-    setEnterpriseView(false);
-    elements.offersGrid.hidden = false;
-    if (!state.offers) {
-      elements.offersModal.hidden = false;
-      document.body.classList.add("modal-open");
-      try {
-        const result = await api("/api/billing/offers");
-        state.offers = result;
-      } catch (error) {
-        showOffersNotice(error.message || "Impossible de charger les offres.");
-        state.offers = { configured: false, offers: {} };
-      }
-    }
-    renderOffers();
     elements.offersModal.hidden = false;
     document.body.classList.add("modal-open");
+    // Le prix vient d'un appel Stripe : la modale s'ouvre tout de suite et se
+    // remplit ensuite, plutôt que d'attendre le réseau derrière une grille vide.
+    if (!state.offers) showOffersNotice("Chargement des offres…");
+    await loadOffers();
+    showOffersNotice(state.offers.failed ? state.offersError : "");
+    renderOffers();
   }
 
   async function handleOfferAction(event) {
     const button = event.target.closest("button[data-offer-action]");
     if (!button) return;
-    const action = button.dataset.offerAction;
-    if (action === "enterprise") {
-      setEnterpriseView(true);
-      elements.enterpriseCompany.focus();
-      return;
-    }
-    if (action === "buy") {
+    if (button.dataset.offerAction === "buy") {
       await startCheckout(button.dataset.offerPlan, button);
     }
   }
@@ -1473,35 +1614,6 @@
       window.location.assign(result.url);
     } catch (error) {
       showToast(error.message || "Impossible d’ouvrir l’espace de facturation.");
-    }
-  }
-
-  async function handleEnterpriseLead(event) {
-    event.preventDefault();
-    elements.enterpriseError.hidden = true;
-    const submit = $("#enterpriseSubmit", elements.enterpriseForm);
-    submit.disabled = true;
-    submit.textContent = "Envoi…";
-    try {
-      await api("/api/billing/enterprise", {
-        method: "POST",
-        body: {
-          company: value("enterpriseCompany"),
-          contactName: value("enterpriseContactName"),
-          email: value("enterpriseEmail"),
-          phone: value("enterprisePhone"),
-          volume: value("enterpriseVolume"),
-          message: value("enterpriseMessage"),
-        },
-      });
-      closeModal("offersModal");
-      showToast("Demande envoyée. Nous revenons vers vous sous deux jours ouvrés.");
-    } catch (error) {
-      elements.enterpriseError.textContent = error.message || "Impossible d’envoyer la demande.";
-      elements.enterpriseError.hidden = false;
-    } finally {
-      submit.disabled = false;
-      submit.textContent = "Envoyer la demande";
     }
   }
 
@@ -1665,13 +1777,13 @@
     if (style.gradient) {
       const line = gradientLine(style.gradient.angle, plan.totalModules);
       definitions.push(
-        `<linearGradient id="qraftGradient" gradientUnits="userSpaceOnUse"` +
+        `<linearGradient id="qroodGradient" gradientUnits="userSpaceOnUse"` +
         ` x1="${line.x1}" y1="${line.y1}" x2="${line.x2}" y2="${line.y2}">` +
         `<stop offset="0" stop-color="${escapeXml(style.gradient.from)}"/>` +
         `<stop offset="1" stop-color="${escapeXml(style.gradient.to)}"/>` +
         `</linearGradient>`,
       );
-      foregroundFill = "url(#qraftGradient)";
+      foregroundFill = "url(#qroodGradient)";
     }
 
     const eyeMarkup = [
@@ -1814,7 +1926,7 @@
     }
 
     const raw = String(payload || defaultLink).replace(/^https?:\/\//i, "").replace(/\/$/, "");
-    return raw.length > 42 ? `${raw.slice(0, 39)}…` : raw || "qraft.example/hello";
+    return raw.length > 42 ? `${raw.slice(0, 39)}…` : raw || "qrood.example/hello";
   }
 
   function value(id) {
@@ -2011,8 +2123,8 @@
   function ensureLegacyMigrationKeys() {
     let changed = false;
     for (const item of state.legacyHistory) {
-      if (item && typeof item === "object" && !/^[A-Za-z0-9_-]{16,128}$/.test(String(item._qraftMigrationKey || ""))) {
-        item._qraftMigrationKey = newLegacyMigrationKey();
+      if (item && typeof item === "object" && !/^[A-Za-z0-9_-]{16,128}$/.test(String(item._qroodMigrationKey || ""))) {
+        item._qroodMigrationKey = newLegacyMigrationKey();
         changed = true;
       }
     }
@@ -2021,10 +2133,10 @@
 
   function markLegacyAttempt(item) {
     if (!item || typeof item !== "object") {
-      return { _qraftInvalidLegacyItem: true, _qraftMigrationAttempts: MAX_LEGACY_ATTEMPTS, value: item };
+      return { _qroodInvalidLegacyItem: true, _qroodMigrationAttempts: MAX_LEGACY_ATTEMPTS, value: item };
     }
-    const attempts = Number(item._qraftMigrationAttempts || 0);
-    return { ...item, _qraftMigrationAttempts: Math.min(MAX_LEGACY_ATTEMPTS, attempts + 1) };
+    const attempts = Number(item._qroodMigrationAttempts || 0);
+    return { ...item, _qroodMigrationAttempts: Math.min(MAX_LEGACY_ATTEMPTS, attempts + 1) };
   }
 
   async function migrateLegacyHistory() {
@@ -2072,7 +2184,7 @@
     for (let index = 0; index < pending.length; index += 1) {
       if (!isCurrentSession(userId, epoch)) return migrated;
       const item = pending[index];
-      if (item && typeof item === "object" && Number(item._qraftMigrationAttempts || 0) >= MAX_LEGACY_ATTEMPTS) {
+      if (item && typeof item === "object" && Number(item._qroodMigrationAttempts || 0) >= MAX_LEGACY_ATTEMPTS) {
         failed.push(item);
         skipped += 1;
         continue;
@@ -2122,8 +2234,8 @@
       foreground: item.foreground || "#101b33",
       background: item.background || "#ffffff",
     };
-    if (/^[A-Za-z0-9_-]{16,128}$/.test(String(item._qraftMigrationKey || ""))) {
-      body.legacyKey = item._qraftMigrationKey;
+    if (/^[A-Za-z0-9_-]{16,128}$/.test(String(item._qroodMigrationKey || ""))) {
+      body.legacyKey = item._qroodMigrationKey;
     }
 
     if (mode === "link") {
@@ -2249,7 +2361,6 @@
     const modal = document.getElementById(id);
     if (modal) modal.hidden = true;
     if (id === "statsModal") state.activeStatsId = null;
-    if (id === "offersModal") state.enterpriseOpen = false;
     const allClosed = [elements.authModal, elements.statsModal, elements.quotaModal, elements.offersModal]
       .every((modal) => modal.hidden);
     if (allClosed) document.body.classList.remove("modal-open");
@@ -2487,7 +2598,7 @@
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-+|-+$/g, "")
       .slice(0, 34);
-    return `qraft-${slug || "code"}`;
+    return `qrood-${slug || "code"}`;
   }
 
   function downloadBlob(blob, name) {

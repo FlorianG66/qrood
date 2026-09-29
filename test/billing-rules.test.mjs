@@ -87,7 +87,7 @@ test("règles de facturation : la session Checkout impose Tax et collecte la car
   assert.equal(params.subscription_update, undefined, "un abonnement déjà vivant ne doit jamais être réécrit");
 
   // L'offre voyage dans la métadonnée : c'est elle qui fait foi au webhook.
-  assert.deepEqual(params.subscription_data.metadata, { plan: "pro", qraft_user_id: "42" });
+  assert.deepEqual(params.subscription_data.metadata, { plan: "pro", qrood_user_id: "42" });
 
   assert.equal(params.success_url, "https://qr.example.com/?billing=success&session_id={CHECKOUT_SESSION_ID}");
   assert.equal(params.cancel_url, "https://qr.example.com/?billing=cancelled");
