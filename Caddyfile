@@ -1,0 +1,14 @@
+# Caddyfile — reverse proxy HTTPS de QROOD, utilisé par le service `caddy`
+# de docker-compose.yml (monté sur /etc/caddy/Caddyfile).
+#
+# Le domaine doit correspondre exactement à QROOD_PUBLIC_ORIGIN dans
+# .env.prod : c'est l'origine gravée dans les QR codes.
+
+qrood.fr, www.qrood.fr {
+	# tout passer sur le domaine nu : une seule et même origine dans les QR codes
+	@www host www.qrood.fr
+	redir @www https://qrood.fr{uri} permanent
+
+	reverse_proxy qrood:3000
+	encode zstd gzip
+}

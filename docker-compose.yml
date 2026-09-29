@@ -1,0 +1,25 @@
+# QROOD — déploiement Docker (Caddy en reverse proxy HTTPS).
+# Fichier d'environnement : .env.prod, jamais versionné (voir .gitignore).
+# Les secrets y sont lus par le serveur au démarrage ; le préfixe des variables
+# est QROOD_ ou, sans préfixe pour Stripe et le mail, le nom nu.
+#
+#   cp deploy/qrood.env .env.prod   puis remplacer chaque <...>
+#   docker compose up -d --build
+services:
+  qrood:
+    build: .
+    restart: unless-stopped
+    env_file: .env.prod
+    volumes:
+      - ./data:/app/data
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+volumes:
+  caddy_data:
