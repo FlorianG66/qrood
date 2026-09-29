@@ -611,6 +611,66 @@ a {
 .builder-section {
   padding-top: 41px;
   padding-bottom: 110px;
+  position: relative;
+}
+
+.builder-sticky {
+  position: sticky;
+  top: 100px;
+  z-index: 10;
+  margin-bottom: 40px;
+}
+
+.builder-sticky-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(340px, 0.92fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.reveal {
+  opacity: 0;
+  transform: translateY(30px);
+  transition: opacity var(--duration-slow) var(--ease-out), transform var(--duration-slow) var(--ease-out);
+}
+
+.reveal.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.parallax-layer {
+  will-change: transform;
+}
+
+.float-qr {
+  position: absolute;
+  width: 60px;
+  height: 60px;
+  background: var(--ink);
+  border-radius: 8px;
+  opacity: 0.08;
+  animation: float-qr 6s ease-in-out infinite;
+}
+
+.float-qr::before {
+  content: "";
+  position: absolute;
+  inset: 8px;
+  background:
+    linear-gradient(90deg, var(--white) 2px, transparent 2px) 0 0 / 100% 100%,
+    linear-gradient(0deg, var(--white) 2px, transparent 2px) 0 0 / 100% 100%;
+  background-size: 12px 12px;
+  background-repeat: repeat;
+}
+
+.float-qr-1 { top: 10%; left: -30px; animation-delay: 0s; }
+.float-qr-2 { top: 60%; right: -20px; animation-delay: -2s; width: 45px; height: 45px; }
+.float-qr-3 { top: 30%; right: 5%; animation-delay: -4s; width: 35px; height: 35px; }
+
+@keyframes float-qr {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  50% { transform: translateY(-20px) rotate(5deg); }
 }
 
 .section-heading {

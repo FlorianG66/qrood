@@ -65,10 +65,10 @@
             <h1 id="hero-title">Un scan.<br /><em>Une action.</em></h1>
             <p>
               Transformez un lien ou vos coordonnées en QR code prêt à partager.
-              Personnalisez-le, téléchargez-le, c’est tout.
+              Personnalisez-le, téléchargez-le, c'est tout.
             </p>
           </div>
-          <div class="hero-art" aria-hidden="true">
+          <div class="hero-art parallax-layer" data-speed="0.15" aria-hidden="true">
             <div class="orbit orbit-one"></div>
             <div class="orbit orbit-two"></div>
             <div class="art-card art-card-back"></div>
@@ -95,8 +95,9 @@
             <p>Choisissez un point de départ, ajustez les détails et voyez votre aperçu en temps réel.</p>
           </div>
 
-          <div class="builder-grid">
-            <section class="editor-panel panel" aria-label="Éditeur du QR code">
+          <div class="builder-sticky">
+            <div class="builder-sticky-inner">
+              <section class="editor-panel panel reveal" aria-label="Éditeur du QR code">
               <div class="panel-header">
                 <div>
                   <span class="panel-label">CONTENU DU QR CODE</span>
@@ -344,7 +345,7 @@
               <p class="tracking-status" id="trackingStatus"><span>↗</span> Enregistrez-le pour activer les statistiques de scan.</p>
             </section>
 
-            <aside class="preview-panel panel" aria-label="Aperçu et téléchargement">
+            <aside class="preview-panel panel reveal" aria-label="Aperçu et téléchargement">
               <div class="preview-topline">
                 <span class="panel-label">APERÇU</span>
                 <span class="preview-format"><span class="format-dot"></span>PNG · 1024 px</span>
@@ -377,7 +378,12 @@
               </div>
               <button class="copy-button" id="copyContent" type="button"><span>⧉</span> Copier le contenu encodé <i id="copyLabel">Ctrl C</i></button>
             </aside>
+            </div>
           </div>
+
+          <div class="float-qr float-qr-1" aria-hidden="true"></div>
+          <div class="float-qr float-qr-2" aria-hidden="true"></div>
+          <div class="float-qr float-qr-3" aria-hidden="true"></div>
         </section>
 
         <section class="creations-section" id="creations" aria-labelledby="creations-title">
@@ -407,7 +413,7 @@
         </section>
 
         <section class="pricing-section" id="tarifs" aria-labelledby="pricing-title">
-          <div class="section-heading pricing-heading">
+          <div class="section-heading pricing-heading parallax-layer" data-speed="0.08">
             <div>
               <span class="section-kicker">03 — TARIFS</span>
               <h2 id="pricing-title">Un prix clair.<br /><span>Sans surprise.</span></h2>
