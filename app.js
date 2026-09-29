@@ -190,12 +190,52 @@
     update();
   }
 
+  function initCursorHalo() {
+    const halo = document.createElement("div");
+    halo.className = "cursor-halo";
+    halo.setAttribute("aria-hidden", "true");
+    document.body.appendChild(halo);
+
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const isTouch = window.matchMedia("(pointer: coarse)").matches;
+    if (reduceMotion || isTouch) {
+      halo.style.display = "none";
+      return;
+    }
+
+    let mouseX = 0;
+    let mouseY = 0;
+    let haloX = 0;
+    let haloY = 0;
+    let rafId = null;
+
+    function onMouseMove(event) {
+      mouseX = event.clientX;
+      mouseY = event.clientY;
+      if (!rafId) rafId = requestAnimationFrame(update);
+    }
+
+    function update() {
+      haloX += (mouseX - haloX) * 0.12;
+      haloY += (mouseY - haloY) * 0.12;
+      halo.style.transform = `translate(${haloX - 150}px, ${haloY - 150}px)`;
+      if (Math.abs(mouseX - haloX) > 0.5 || Math.abs(mouseY - haloY) > 0.5) {
+        rafId = requestAnimationFrame(update);
+      } else {
+        rafId = null;
+      }
+    }
+
+    document.addEventListener("mousemove", onMouseMove);
+  }
+
   async function init() {
     cacheElements();
     bindEvents();
     initHeroParallax();
     initScrollAnimations();
     initParallax();
+    initCursorHalo();
     renderHistory();
     updatePreview();
     renderFooterYear();
