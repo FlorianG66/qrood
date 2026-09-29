@@ -63,6 +63,15 @@ body::before {
   pointer-events: none;
 }
 
+#bg-canvas {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
 #intro-canvas {
   position: fixed;
   inset: 0;

@@ -559,11 +559,127 @@
     checkVisibility();
   }
 
+  function initBackground() {
+    const canvas = $("#bg-canvas");
+    if (!canvas) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const isMobile = window.matchMedia("(pointer: coarse)").matches;
+    if (reduceMotion || isMobile) return;
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    const PIXEL_SIZE = 40;
+    const REPULSION_RADIUS = 120;
+    const REPULSION_STRENGTH = 0.6;
+
+    let width, height;
+    let pixels = [];
+    let mouseX = -1000;
+    let mouseY = -1000;
+    let scrollY = 0;
+    let rafId = null;
+
+    function resize() {
+      width = window.innerWidth;
+      height = window.innerHeight;
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      ctx.scale(dpr, dpr);
+      createPixels();
+    }
+
+    function createPixels() {
+      pixels = [];
+      const cols = Math.ceil(width / PIXEL_SIZE) + 1;
+      const rows = Math.ceil(height / PIXEL_SIZE) + 1;
+      for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+          pixels.push({
+            x: col * PIXEL_SIZE,
+            y: row * PIXEL_SIZE,
+            baseX: col * PIXEL_SIZE,
+            baseY: row * PIXEL_SIZE,
+            energy: 0,
+            size: 2,
+          });
+        }
+      }
+    }
+
+    function onMouseMove(event) {
+      mouseX = event.clientX;
+      mouseY = event.clientY;
+      if (!rafId) rafId = requestAnimationFrame(draw);
+    }
+
+    function onMouseLeave() {
+      mouseX = -1000;
+      mouseY = -1000;
+    }
+
+    function onScroll() {
+      scrollY = window.scrollY;
+      if (!rafId) rafId = requestAnimationFrame(draw);
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, width, height);
+
+      const time = Date.now() * 0.001;
+
+      for (const p of pixels) {
+        const dx = p.x - mouseX;
+        const dy = p.y - mouseY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist < REPULSION_RADIUS) {
+          const force = (1 - dist / REPULSION_RADIUS) * REPULSION_STRENGTH;
+          p.energy = Math.min(p.energy + force * 0.3, 1);
+        }
+
+        p.energy *= 0.92;
+
+        const wave = Math.sin((p.baseY + scrollY * 0.3) * 0.01 + time) * 0.5 + 0.5;
+        const alpha = 0.03 + p.energy * 0.15 + wave * 0.02;
+
+        const offsetX = (p.baseX - p.x) * p.energy * 0.5;
+        const offsetY = (p.baseY - p.y) * p.energy * 0.5;
+
+        p.x = p.baseX + offsetX + Math.sin(time + p.baseY * 0.01) * p.energy * 8;
+        p.y = p.baseY + offsetY + Math.cos(time + p.baseX * 0.01) * p.energy * 8;
+
+        const size = p.size + p.energy * 3;
+
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = p.energy > 0.3 ? "#bd3c34" : "#101b33";
+        ctx.fillRect(p.x - size / 2, p.y - size / 2, size, size);
+      }
+
+      ctx.globalAlpha = 1;
+
+      rafId = requestAnimationFrame(draw);
+    }
+
+    resize();
+    window.addEventListener("resize", resize);
+    window.addEventListener("mousemove", onMouseMove, { passive: true });
+    document.addEventListener("mouseleave", onMouseLeave);
+    window.addEventListener("scroll", onScroll, { passive: true });
+
+    rafId = requestAnimationFrame(draw);
+  }
+
   async function init() {
     cacheElements();
     bindEvents();
     initIntro();
     initQRStory();
+    initBackground();
     initHeroParallax();
     initScrollAnimations();
     initParallax();
