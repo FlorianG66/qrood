@@ -89,9 +89,59 @@
 
   document.addEventListener("DOMContentLoaded", init);
 
+  function initHeroParallax() {
+    const hero = $(".hero");
+    if (!hero) return;
+    const art = $(".hero-art");
+    const orbits = $$(".orbit");
+    const cards = $$(".art-card");
+    if (!art || !orbits.length || !cards.length) return;
+
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduceMotion) return;
+
+    let rafId = null;
+    let targetX = 0;
+    let targetY = 0;
+    let currentX = 0;
+    let currentY = 0;
+
+    function onMouseMove(event) {
+      const rect = hero.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      targetX = (event.clientX - centerX) / rect.width;
+      targetY = (event.clientY - centerY) / rect.height;
+      if (!rafId) rafId = requestAnimationFrame(update);
+    }
+
+    function update() {
+      currentX += (targetX - currentX) * 0.08;
+      currentY += (targetY - currentY) * 0.08;
+      art.style.transform = `translate(${currentX * 12}px, ${currentY * 12}px)`;
+      orbits[0].style.transform = `rotate(-22deg) translate(${currentX * -8}px, ${currentY * -8}px)`;
+      orbits[1].style.transform = `rotate(31deg) translate(${currentX * -12}px, ${currentY * -12}px)`;
+      cards[0].style.transform = `rotate(13deg) translate(${currentX * 6}px, ${currentY * 6}px)`;
+      cards[1].style.transform = `rotate(-8deg) translate(${currentX * 10}px, ${currentY * 10}px)`;
+      if (Math.abs(targetX - currentX) > 0.001 || Math.abs(targetY - currentY) > 0.001) {
+        rafId = requestAnimationFrame(update);
+      } else {
+        rafId = null;
+      }
+    }
+
+    hero.addEventListener("mousemove", onMouseMove);
+    hero.addEventListener("mouseleave", () => {
+      targetX = 0;
+      targetY = 0;
+      if (!rafId) rafId = requestAnimationFrame(update);
+    });
+  }
+
   async function init() {
     cacheElements();
     bindEvents();
+    initHeroParallax();
     renderHistory();
     updatePreview();
     renderFooterYear();
