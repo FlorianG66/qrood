@@ -3762,50 +3762,6 @@ body.modal-open {
     margin: 18px 0 0;
   }
 
-.qr-story-section {
-  height: 400vh;
-  position: relative;
-}
-
-.qr-story-sticky {
-  position: sticky;
-  top: 0;
-  height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-}
-
-#qr-story-canvas {
-  display: block;
-}
-
-.qr-story-caption {
-  position: absolute;
-  bottom: 60px;
-  left: 50%;
-  transform: translateX(-50%);
-  text-align: center;
-}
-
-.qr-story-step {
-  display: block;
-  font-family: var(--mono);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.1em;
-  color: var(--coral);
-  margin-bottom: 8px;
-}
-
-.qr-story-caption p {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 700;
-  color: var(--ink);
-}
-
 .builder-section {
     padding-top: 32px;
     padding-bottom: 74px;
