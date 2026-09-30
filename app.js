@@ -333,6 +333,94 @@
     headings.forEach((heading) => observer.observe(heading));
   }
 
+  // Une seule observatrice pour toutes les animations declenchees a
+  // l'arrivee dans le viewport : hors ecran, une animation CSS infinie continue
+  // de consommer du compositeur pour rien.
+  function initLiveSections() {
+    const sections = $$("[data-live]");
+    if (!sections.length) return;
+
+    // Seuil 0 : on demarre des le premier pixel visible. Un seuil en pourcentage
+    // du_ELEMENT_ serait inatteignable pour une section plus de 4x la hauteur de
+    // la fenetre, et l'animation ne demarrerait jamais.
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        entry.target.classList.add("is-live");
+        observer.unobserve(entry.target);
+      });
+    }, { threshold: 0 });
+
+    sections.forEach((section) => observer.observe(section));
+  }
+
+  // Compteurs des bibliotheques. Les valeurs ne s'affichent qu'a l'arrivee dans
+  // le viewport, puis se reaniment a chaque changement reel (enregistrement,
+  // suppression, scans) en partant de la valeur affichee, jamais de zero.
+  const counters = [];
+  let countersRevealed = false;
+
+  function initCounters() {
+    const specs = [
+      { el: elements.historyCount, format: (n) => String(n).padStart(2, "0") },
+      { el: elements.metricQrCount, format: formatCompactNumber },
+      { el: elements.metricScanCount, format: formatCompactNumber },
+      { el: elements.metricWeekCount, format: formatCompactNumber },
+    ];
+    specs.forEach((spec) => {
+      if (spec.el) counters.push({ el: spec.el, format: spec.format, shown: 0, target: 0, raf: null });
+    });
+    if (!counters.length) return;
+
+    const metrics = elements.libraryMetrics;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      countersRevealed = true;
+      observer.disconnect();
+      counters.forEach((counter) => {
+        counter.shown = counter.target;
+        counter.el.textContent = counter.format(counter.shown);
+      });
+    }, { threshold: 0.25 });
+
+    // On observe les elements eux-memes, pas la section : la bibliotheque peut
+    // etre bien plus haute que la fenetre, et un seuil exprime en pourcentage
+    // de la section serait alors inatteignable.
+    if (elements.historyCount) observer.observe(elements.historyCount);
+    if (metrics) observer.observe(metrics);
+  }
+
+  function setCounterValue(el, value) {
+    const counter = counters.find((item) => item.el === el);
+    if (!counter) {
+      if (el) el.textContent = String(value);
+      return;
+    }
+    counter.target = Number(value) || 0;
+    // Tant que la section n'a pas ete vue, ou que la metrique est masquee, on
+    // ecrit la valeur finale sans animer : personne ne la verrait de toute facon.
+    if (!countersRevealed || el.closest("[hidden]")) {
+      if (counter.raf) cancelAnimationFrame(counter.raf);
+      counter.raf = null;
+      counter.shown = counter.target;
+      el.textContent = counter.format(counter.shown);
+      return;
+    }
+    if (counter.raf) cancelAnimationFrame(counter.raf);
+    const from = counter.shown;
+    const to = counter.target;
+    if (from === to) return;
+    const duration = 640;
+    const started = performance.now();
+    const step = (now) => {
+      const t = Math.min((now - started) / duration, 1);
+      counter.shown = Math.round(from + (to - from) * (1 - Math.pow(1 - t, 3)));
+      el.textContent = counter.format(counter.shown);
+      counter.raf = t < 1 ? requestAnimationFrame(step) : null;
+    };
+    counter.raf = requestAnimationFrame(step);
+  }
+
   function initParallax() {
     const layers = $$(".parallax-layer");
     if (!layers.length) return;
@@ -912,6 +1000,8 @@
     initScrollAnimations();
     initParallax();
     initCardTilt();
+    initLiveSections();
+    initCounters();
     pageRevealed.then(
       () => {
         document.documentElement.classList.add("is-revealed");
@@ -1868,23 +1958,29 @@
     const activeCount = state.history.filter((item) => item.isActive !== false).length;
     const totalScans = state.history.reduce((sum, item) => sum + Number(item.scanCount || 0), 0);
     const weeklyScans = state.history.reduce((sum, item) => sum + Number(item.scansWeek || 0), 0);
-    elements.historyCount.textContent = String(count).padStart(2, "0");
+    setCounterValue(elements.historyCount, count);
     elements.libraryMetrics.hidden = !state.user;
-    elements.metricQrCount.textContent = formatCompactNumber(count);
-    elements.metricScanCount.textContent = formatCompactNumber(totalScans);
-    elements.metricWeekCount.textContent = formatCompactNumber(weeklyScans);
+    setCounterValue(elements.metricQrCount, count);
+    setCounterValue(elements.metricScanCount, totalScans);
+    setCounterValue(elements.metricWeekCount, weeklyScans);
     renderEntitlement();
 
     if (!count) {
+      // Motif de QR en attente, dessine en CSS : pas de fichier image, et
+      // l'etat vide ne depend donc d'aucun asset a charger.
+      const art = [1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1, 0]
+        .map((on) => `<i class="${on ? "on" : ""}"></i>`)
+        .join("");
+      const emptyArt = `<span class="empty-art" aria-hidden="true">${art}</span>`;
       elements.historyGrid.innerHTML = state.user
         ? `
           <div class="empty-history">
-            <span class="empty-icon">＋</span>
+            ${emptyArt}
             <div><strong>Votre bibliothèque est encore vide.</strong><p>Enregistrez votre premier QR code pour activer ses statistiques.</p></div>
           </div>`
         : `
           <div class="empty-history auth-empty-history">
-            <span class="empty-icon">↗</span>
+            ${emptyArt}
             <div><strong>Votre bibliothèque vous attend.</strong><p>Connectez-vous ou créez un compte pour sauvegarder vos QR codes et consulter leurs statistiques.</p></div>
             <button class="button button-primary button-small" type="button" data-empty-login>Se connecter</button>
           </div>`;

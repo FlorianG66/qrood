@@ -14,10 +14,10 @@
       // contenu du hero reste lisible immediatement.
       document.documentElement.classList.add("js");
     </script>
-    <link rel="stylesheet" href="styles.css?v=20" />
+    <link rel="stylesheet" href="styles.css?v=21" />
     <script src="qrcode-generator.js" defer></script>
     <script src="cursor.js?v=1" defer></script>
-    <script src="app.js?v=21" defer></script>
+    <script src="app.js?v=22" defer></script>
   </head>
   <body>
     <canvas id="intro-canvas" aria-hidden="true"></canvas>
@@ -395,7 +395,7 @@
           <div class="float-qr float-qr-3" aria-hidden="true"></div>
         </section>
 
-        <section class="creations-section" id="creations" aria-labelledby="creations-title">
+        <section class="creations-section" id="creations" aria-labelledby="creations-title" data-live>
           <div class="section-heading creations-heading">
             <div>
               <span class="section-kicker">02 — BIBLIOTHÈQUE</span>
@@ -443,7 +443,7 @@
         </section>
 
         <section class="guide-section" id="guide" aria-labelledby="guide-title">
-          <div class="guide-card">
+          <div class="guide-card" data-live>
             <div class="guide-number">04</div>
             <div class="guide-content">
               <span class="section-kicker light-kicker">PETIT CONSEIL</span>
