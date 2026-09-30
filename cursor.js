@@ -60,15 +60,6 @@
     }
 
     function onMove(event) {
-      // Sous une modale, le curseur se cache et sa boucle s'arrete. Deux
-      // raisons : un curseur magnetique sur une modale n'a pas de sens, et sa
-      // boucle lit un getBoundingClientRect() par image, animation JavaScript
-      // donc insensible au animation-play-state du CSS. Elle entretenant le
-      // contenu sous le backdrop-filter de la modale en mouvement.
-      if (document.body.classList.contains("modal-open")) {
-        onLeave();
-        return;
-      }
       mouseX = event.clientX;
       mouseY = event.clientY;
       if (!ringX && !ringY) {
@@ -125,11 +116,6 @@
     document.addEventListener("mouseup", () => document.body.classList.remove("is-selecting"));
     document.documentElement.addEventListener("mouseleave", onLeave);
     window.addEventListener("blur", onLeave);
-    // L'ouverture d'une modale doit cacher le curseur immediatement, sans
-    // attendre le prochain deplacement de souris.
-    new MutationObserver(() => {
-      if (document.body.classList.contains("modal-open")) onLeave();
-    }).observe(document.body, { attributes: true, attributeFilter: ["class"] });
   }
 
   if (document.readyState === "loading") {
