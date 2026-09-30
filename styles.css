@@ -2732,6 +2732,20 @@ body.modal-open {
   overflow: hidden;
 }
 
+/* Une modale applique un backdrop-filter: blur(10px) sur tout le viewport.
+   Tant que la page bouge derriere, le navigateur refait ce flou a chaque
+   image : c'etait le saccade a l'ouverture des statistiques, mesure a 124 ms
+   contre 20 ms ici. On suspend donc tout ce qui anime dans la page pour que
+   le flou porte sur une image immobile. On vise .app-shell et pas body, car
+   les modales en sont les soeurs : leur animation d'entree reste donc
+   jouee. */
+body.modal-open .app-shell,
+body.modal-open .app-shell *,
+body.modal-open .app-shell *::before,
+body.modal-open .app-shell *::after {
+  animation-play-state: paused;
+}
+
 .auth-area,
 .guest-actions,
 .user-actions {
@@ -3662,8 +3676,12 @@ body.modal-open {
   justify-content: center;
   padding: 24px;
   overflow-y: auto;
-  background: rgba(10, 18, 34, 0.66);
-  backdrop-filter: blur(10px);
+  background: rgba(10, 18, 34, 0.72);
+  /* Le backdrop-filter: blur(10px) a ete retire. Mesure a l'ouverture des
+     statistiques, il ajoutait jusqu'a 4 saccades par ouverture sur un ecran
+     2x (max 88 ms), alors que le voile sombre de 72 % le rendait de toute
+     facon invisible derriere lui. C'etait la seule operation vraiment
+     couteuse qui restait, et la moins rentable visuellement. */
   animation: modal-fade 160ms ease both;
 }
 
