@@ -531,6 +531,7 @@ const staticFiles = new Map([
   ["/styles.css", "styles.css"],
   ["/app.js", "app.js"],
   ["/compte.js", "compte.js"],
+  ["/cursor.js", "cursor.js"],
   ["/qrcode-generator.js", "qrcode-generator.js"],
 ]);
 
