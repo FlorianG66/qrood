@@ -365,50 +365,70 @@
   }
 
 
+  // Renvoie une promesse resolue quand la page peut reveler son contenu : soit
+  // l'intro n'a pas lieu d'etre jouee, soit elle commence a se dissoudre. La
+  // resolution se fait au debut de la dissolution et non a la fin, pour que
+  // l'entree du hero se joue pendant les 400ms de fondu.
   function initIntro() {
-    const canvas = $("#intro-canvas");
-    const skipBtn = $("#intro-skip");
-    if (!canvas || !skipBtn) return;
+    return new Promise((resolve) => {
+      const canvas = $("#intro-canvas");
+      const skipBtn = $("#intro-skip");
+      if (!canvas || !skipBtn) {
+        resolve();
+        return;
+      }
 
-    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const sessionKey = "qrood-intro-seen";
-    const dismiss = () => {
-      canvas.style.display = "none";
-      skipBtn.style.display = "none";
-    };
-    let introSeen = false;
-    try {
-      introSeen = Boolean(sessionStorage.getItem(sessionKey));
-    } catch (error) {
-      introSeen = false;
-    }
-    if (reduceMotion || introSeen) {
-      dismiss();
-      return;
-    }
+      const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const sessionKey = "qrood-intro-seen";
+      const dismiss = () => {
+        canvas.style.display = "none";
+        skipBtn.style.display = "none";
+      };
+      // Filet de securite : si l'overlay reste bloque (onglet en arriere-plan,
+      // requestAnimationFrame suspendu), la page s'ouvre quand meme.
+      let guard = 0;
+      const reveal = () => {
+        window.clearTimeout(guard);
+        resolve();
+      };
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      dismiss();
-      return;
-    }
+      let introSeen = false;
+      try {
+        introSeen = Boolean(sessionStorage.getItem(sessionKey));
+      } catch (error) {
+        introSeen = false;
+      }
+      if (reduceMotion || introSeen) {
+        dismiss();
+        reveal();
+        return;
+      }
 
-    const isMobile = window.matchMedia("(pointer: coarse)").matches;
-    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-    const particleCount = isMobile ? 420 : 1300;
-    const duration = isMobile ? 1500 : 2500;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        dismiss();
+        reveal();
+        return;
+      }
 
-    let width, height, particles = [], qrGrid = [];
-    let startTime = null;
-    let rafId = null;
-    let skipped = false;
+      guard = window.setTimeout(reveal, 8000);
 
-    // Le logo de reference est mesure dans le DOM plutot que redessine a la
-    // main : l'intro reproduit alors exactement `.brand-mark` (grille 2x2,
-    // rayons, rotation et couleurs), y compris si la marque evolue.
-    function readRadii(el) {
-      const styles = getComputedStyle(el);
-      return [
+      const isMobile = window.matchMedia("(pointer: coarse)").matches;
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+      const particleCount = isMobile ? 420 : 1300;
+      const duration = isMobile ? 1500 : 2500;
+
+      let width, height, particles = [];
+      let startTime = null;
+      let rafId = null;
+      let skipped = false;
+
+      // Le logo de reference est mesure dans le DOM plutot que redessine a la
+      // main : l'intro reproduit alors exactement `.brand-mark` (grille 2x2,
+      // rayons, rotation et couleurs), y compris si la marque evolue.
+      function readRadii(el) {
+        const styles = getComputedStyle(el);
+        return [
         parseFloat(styles.borderTopLeftRadius) || 0,
         parseFloat(styles.borderTopRightRadius) || 0,
         parseFloat(styles.borderBottomRightRadius) || 0,
@@ -632,6 +652,8 @@
       } catch (error) {
         // Le nav private peut refuser la session : on laisse l'intro se rejouer.
       }
+      // On libere la page avant le fondu : l'entree du hero se joue dessous.
+      reveal();
       canvas.style.opacity = "0";
       canvas.style.transition = "opacity 400ms ease";
       skipBtn.classList.remove("visible");
@@ -659,6 +681,7 @@
     canvas.style.display = "block";
     skipBtn.classList.add("visible");
     rafId = requestAnimationFrame(draw);
+    });
   }
 
   function initBackground() {
@@ -779,13 +802,23 @@
   async function init() {
     cacheElements();
     bindEvents();
-    initIntro();
+    // L'intro masque la page : l'entree du hero attend qu'elle se dissolve,
+    // sinon le scramble se joue derriere l'overlay et n'est jamais vu.
+    const pageRevealed = initIntro();
     initBackground();
-    initScramble();
     initWordReveal();
     initHeroParallax();
     initScrollAnimations();
     initParallax();
+    pageRevealed.then(
+      () => {
+        document.documentElement.classList.add("is-revealed");
+        initScramble();
+      },
+      () => {
+        document.documentElement.classList.add("is-revealed");
+      }
+    );
     renderHistory();
     updatePreview();
     renderFooterYear();

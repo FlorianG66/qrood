@@ -482,11 +482,28 @@ a {
   line-height: 1.3;
 }
 
-.eyebrow {
-  gap: 10px;
-  margin-bottom: 24px;
+/* L'intro couvre la page au premier chargement : l'entree du hero attend sa
+   dissolution, sinon le scramble et les fondus se jouent derriere l'overlay.
+   Le marqueur .js garantit que sans JS rien n'est masque. */
+.js .hero-copy .eyebrow,
+.js .hero-copy > p {
   opacity: 0;
+}
+
+.js .hero-copy .eyebrow {
+  margin-bottom: 24px;
   animation: fade-in var(--duration-slow) var(--ease-out) 0.1s forwards;
+}
+
+.js .hero-copy > p {
+  transform: translateY(20px);
+  animation: fade-in var(--duration-slow) var(--ease-out) 0.45s forwards;
+}
+
+/* En pause sur la premiere keyframe : le texte attend l'ouverture de la page. */
+.js:not(.is-revealed) .hero-copy .eyebrow,
+.js:not(.is-revealed) .hero-copy > p {
+  animation-play-state: paused;
 }
 
 .eyebrow-line {
@@ -550,9 +567,6 @@ a {
   color: var(--ink-soft);
   font-size: 15px;
   line-height: 1.75;
-  opacity: 0;
-  transform: translateY(20px);
-  animation: fade-in var(--duration-slow) var(--ease-out) 0.45s forwards;
 }
 
 @keyframes fade-in {
