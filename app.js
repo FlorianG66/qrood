@@ -353,89 +353,28 @@
     sections.forEach((section) => observer.observe(section));
   }
 
-  // Compteurs des bibliotheques. Les valeurs ne s'affichent qu'a l'arrivee dans
-  // le viewport, puis se reaniment a chaque changement reel (enregistrement,
-  // suppression, scans) en partant de la valeur affichee, jamais de zero.
-  const counters = [];
-  let countersRevealed = false;
-
-  // Animation d'un compteur, de sa valeur affichee vers sa cible.
-  function runCounter(counter) {
-    if (counter.raf) cancelAnimationFrame(counter.raf);
-    const from = counter.shown;
-    const to = counter.target;
-    if (from === to) {
-      counter.raf = null;
-      counter.el.textContent = counter.format(to);
-      return;
-    }
-    const duration = 640;
-    const started = performance.now();
-    const step = (now) => {
-      const t = Math.min((now - started) / duration, 1);
-      counter.shown = Math.round(from + (to - from) * (1 - Math.pow(1 - t, 3)));
-      counter.el.textContent = counter.format(counter.shown);
-      counter.raf = t < 1 ? requestAnimationFrame(step) : null;
-    };
-    counter.raf = requestAnimationFrame(step);
-  }
+  // Compteurs des bibliotheques. Ils etaient comptes de zero a leur valeur
+  // cible, en 640 ms, sur requestAnimationFrame : quatre boucles rAF qui se
+  // superposaient au fond anime et saccadaient. La valeur reelle s'ecrit
+  // des qu'elle est connue, sans transition.
+  const counterFormats = new Map();
 
   function initCounters() {
     const specs = [
-      { el: elements.historyCount, format: (n) => String(n).padStart(2, "0") },
-      { el: elements.metricQrCount, format: formatCompactNumber },
-      { el: elements.metricScanCount, format: formatCompactNumber },
-      { el: elements.metricWeekCount, format: formatCompactNumber },
+      [elements.historyCount, (n) => String(n).padStart(2, "0")],
+      [elements.metricQrCount, formatCompactNumber],
+      [elements.metricScanCount, formatCompactNumber],
+      [elements.metricWeekCount, formatCompactNumber],
     ];
-    specs.forEach((spec) => {
-      if (spec.el) counters.push({ el: spec.el, format: spec.format, shown: 0, target: 0, raf: null });
-    });
-    if (!counters.length) return;
-
-    const metrics = elements.libraryMetrics;
-    const observer = new IntersectionObserver((entries) => {
-      if (!entries.some((entry) => entry.isIntersecting)) return;
-      observer.disconnect();
-      countersRevealed = true;
-      // Les compteurs montent de zero a leur valeur reelle : c'est l'effet
-      // recherche. On les remettait directement a la cible, et l'animation
-      // n'avait donc jamais lieu d'etre au premier affichage.
-      counters.forEach((counter) => {
-        if (counter.el.closest("[hidden]")) {
-          counter.shown = counter.target;
-          counter.el.textContent = counter.format(counter.shown);
-          return;
-        }
-        counter.shown = 0;
-        counter.el.textContent = counter.format(0);
-        runCounter(counter);
-      });
-    }, { threshold: 0.25 });
-
-    // On observe les elements eux-memes, pas la section : la bibliotheque peut
-    // etre bien plus haute que la fenetre, et un seuil exprime en pourcentage
-    // de la section serait alors inatteignable.
-    if (elements.historyCount) observer.observe(elements.historyCount);
-    if (metrics) observer.observe(metrics);
+    for (const [el, format] of specs) {
+      if (el) counterFormats.set(el, format);
+    }
   }
 
   function setCounterValue(el, value) {
-    const counter = counters.find((item) => item.el === el);
-    if (!counter) {
-      if (el) el.textContent = String(value);
-      return;
-    }
-    counter.target = Number(value) || 0;
-    // Tant que la section n'a pas ete vue, ou que la metrique est masquee, on
-    // ecrit la valeur finale sans animer : personne ne la verrait de toute facon.
-    if (!countersRevealed || el.closest("[hidden]")) {
-      if (counter.raf) cancelAnimationFrame(counter.raf);
-      counter.raf = null;
-      counter.shown = counter.target;
-      el.textContent = counter.format(counter.shown);
-      return;
-    }
-    runCounter(counter);
+    if (!el) return;
+    const format = counterFormats.get(el);
+    el.textContent = format ? format(Number(value) || 0) : String(value);
   }
 
   function initParallax() {
@@ -2154,7 +2093,11 @@
   }
 
   async function setQrcodeActive(id, isActive) {
-    const result = await api(`/api/qrcodes/${id}/status`, { method: "POST", body: { isActive } });
+    // Le champ s'appelle « active » côté API, pas « isActive » : le serveur
+    // rejette tout ce qui n'est pas un booléen avec un 400, ce qui rendait la
+    // désactivation impossible. « isActive » n'est que le nom de la colonne
+    // en base et de la propriété renvoyée dans la réponse.
+    const result = await api(`/api/qrcodes/${id}/status`, { method: "POST", body: { active: isActive } });
     return result.qrcode;
   }
 
