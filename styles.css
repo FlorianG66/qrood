@@ -484,11 +484,13 @@ a {
 }
 
 .hero-art {
+  --art-x: 0px;
+  --art-y: 0px;
   width: 335px;
   height: 300px;
   justify-self: end;
   position: relative;
-  transform: translate(4px, 4px);
+  transform: translate3d(var(--art-x), var(--art-y), 0) translate(4px, 4px);
 }
 
 .orbit {
@@ -718,7 +720,9 @@ a {
 }
 
 .parallax-layer {
+  --parallax-y: 0px;
   will-change: transform;
+  transform: translate3d(0, var(--parallax-y), 0);
 }
 
 .float-qr {
@@ -3639,7 +3643,7 @@ body.modal-open {
   }
 
   .hero-art {
-    transform: scale(0.86) translate(8px, 2px);
+    transform: translate3d(var(--art-x), var(--art-y), 0) scale(0.86) translate(8px, 2px);
   }
 
   .builder-grid {
@@ -3769,7 +3773,7 @@ body.modal-open {
     width: 270px;
     height: 235px;
     margin: 28px auto -15px;
-    transform: scale(0.75);
+    transform: translate3d(var(--art-x), var(--art-y), 0) scale(0.75);
     transform-origin: center;
   }
 

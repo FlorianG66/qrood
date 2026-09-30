@@ -105,6 +105,8 @@
     let targetY = 0;
     let currentX = 0;
     let currentY = 0;
+    let targetScroll = 0;
+    let currentScroll = 0;
 
     function onMouseMove(event) {
       const rect = hero.getBoundingClientRect();
@@ -115,15 +117,32 @@
       if (!rafId) rafId = requestAnimationFrame(update);
     }
 
+    // Le scroll est gere ici plutot que par initParallax : une seule fonction
+    // ecrit le transform du motif, donc plus de fight entre deux loops.
+    function onScroll() {
+      const rect = hero.getBoundingClientRect();
+      const progress = (window.innerHeight - rect.top) / (window.innerHeight + rect.height);
+      targetScroll = Math.max(-1, Math.min(1, (progress - 0.5) * 2));
+      if (!rafId) rafId = requestAnimationFrame(update);
+    }
+
     function update() {
       currentX += (targetX - currentX) * 0.08;
       currentY += (targetY - currentY) * 0.08;
-      art.style.transform = `translate(${currentX * 12}px, ${currentY * 12}px)`;
+      currentScroll += (targetScroll - currentScroll) * 0.1;
+      // On ecrit les variables, pas `transform` : les `scale` responsives
+      // definis en CSS restent composes au lieu d'etre ecrases.
+      art.style.setProperty("--art-x", `${currentX * 12}px`);
+      art.style.setProperty("--art-y", `${currentY * 12 + currentScroll * 22}px`);
       orbits[0].style.transform = `rotate(-22deg) translate(${currentX * -8}px, ${currentY * -8}px)`;
       orbits[1].style.transform = `rotate(31deg) translate(${currentX * -12}px, ${currentY * -12}px)`;
       cards[0].style.transform = `rotate(13deg) translate(${currentX * 6}px, ${currentY * 6}px)`;
       cards[1].style.transform = `rotate(-8deg) translate(${currentX * 10}px, ${currentY * 10}px)`;
-      if (Math.abs(targetX - currentX) > 0.001 || Math.abs(targetY - currentY) > 0.001) {
+      const settled =
+        Math.abs(targetX - currentX) < 0.001 &&
+        Math.abs(targetY - currentY) < 0.001 &&
+        Math.abs(targetScroll - currentScroll) < 0.001;
+      if (!settled) {
         rafId = requestAnimationFrame(update);
       } else {
         rafId = null;
@@ -136,6 +155,8 @@
       targetY = 0;
       if (!rafId) rafId = requestAnimationFrame(update);
     });
+    window.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
   }
 
   const SCRAMBLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$%&*+<>/\\";
@@ -322,12 +343,13 @@
     let ticking = false;
 
     function update() {
-      const scrollY = window.scrollY;
       layers.forEach((layer) => {
         const speed = parseFloat(layer.dataset.speed || "0.1");
         const rect = layer.getBoundingClientRect();
         const offset = (rect.top + rect.height / 2 - window.innerHeight / 2) * speed;
-        layer.style.transform = `translateY(${offset}px)`;
+        // Variable CSS et non `transform` : un transform definit en CSS sur la
+        // couche reste compose au lieu d'etre remplace.
+        layer.style.setProperty("--parallax-y", `${offset}px`);
       });
       ticking = false;
     }
@@ -411,7 +433,7 @@
 
     const isMobile = window.matchMedia("(pointer: coarse)").matches;
     const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-    const particleCount = isMobile ? 300 : 800;
+    const particleCount = isMobile ? 420 : 1300;
     const duration = isMobile ? 1500 : 2500;
 
     let width, height, particles = [], qrGrid = [];
@@ -419,19 +441,121 @@
     let rafId = null;
     let skipped = false;
 
-    const LOGO_SIZE = 2;
-    const CELL_SIZE = 60;
-    const LOGO_PIXEL_COUNT = LOGO_SIZE * LOGO_SIZE;
+    // Le logo de reference est mesure dans le DOM plutot que redessine a la
+    // main : l'intro reproduit alors exactement `.brand-mark` (grille 2x2,
+    // rayons, rotation et couleurs), y compris si la marque evolue.
+    function readRadii(el) {
+      const styles = getComputedStyle(el);
+      return [
+        parseFloat(styles.borderTopLeftRadius) || 0,
+        parseFloat(styles.borderTopRightRadius) || 0,
+        parseFloat(styles.borderBottomRightRadius) || 0,
+        parseFloat(styles.borderBottomLeftRadius) || 0,
+      ];
+    }
 
-    function generateLogoGrid() {
-      const grid = [];
-      for (let i = 0; i < LOGO_PIXEL_COUNT; i++) {
-        const row = Math.floor(i / LOGO_SIZE);
-        const col = i % LOGO_SIZE;
-        const isCoral = (row === 0 && col === 1) || (row === 1 && col === 0);
-        grid.push({ index: i, isCoral });
+    // Les rayons CSS se reduisent s'ils se chevauchent : on applique la meme regle.
+    function clampRadii(cell) {
+      const [tl, tr, br, bl] = cell.radii;
+      const factor = Math.min(
+        cell.w / (tl + tr),
+        cell.w / (bl + br),
+        cell.h / (tl + bl),
+        cell.h / (tr + br)
+      );
+      if (!Number.isFinite(factor) || factor >= 1) return cell.radii;
+      return [tl * factor, tr * factor, br * factor, bl * factor];
+    }
+
+    function measureLogo() {
+      const source = document.querySelector(".brand-mark");
+      if (!source) return null;
+
+      const base = source.offsetWidth || 25;
+      const box = Math.min(210, Math.max(120, Math.round(Math.min(width, height) * 0.26)));
+      const scale = box / base;
+      const sourceStyles = getComputedStyle(source);
+      const gap = parseFloat(sourceStyles.columnGap) || 0;
+      const transform = sourceStyles.transform;
+      const matrix = transform && transform !== "none" ? new DOMMatrixReadOnly(transform) : null;
+      const angle = matrix ? Math.atan2(matrix.b, matrix.a) : 0;
+
+      const probe = document.createElement("span");
+      probe.className = source.className;
+      probe.setAttribute("aria-hidden", "true");
+      Array.from(source.children).forEach((child) => {
+        const clone = child.cloneNode(true);
+        clone.style.borderRadius = readRadii(child).map((r) => `${r * scale}px`).join(" ");
+        probe.appendChild(clone);
+      });
+
+      probe.style.position = "fixed";
+      probe.style.left = "0px";
+      probe.style.top = "0px";
+      probe.style.width = `${box}px`;
+      probe.style.height = `${box}px`;
+      probe.style.gap = `${gap * scale}px`;
+      probe.style.transform = "none";
+      probe.style.visibility = "hidden";
+      probe.style.pointerEvents = "none";
+      probe.style.zIndex = "-1";
+      (source.parentElement || document.body).appendChild(probe);
+
+      const cells = Array.from(probe.children)
+        .map((child) => {
+          const rect = child.getBoundingClientRect();
+          const cell = {
+            x: rect.left,
+            y: rect.top,
+            w: rect.width,
+            h: rect.height,
+            color: getComputedStyle(child).backgroundColor,
+            // Le clone porte deja les rayons mis a l'echelle : pas de second
+            // passage par `scale`, sinon les formes deviennent des pastilles.
+            radii: readRadii(child),
+          };
+          cell.radii = clampRadii(cell);
+          return cell;
+        })
+        .filter((cell) => cell.w > 0.5 && cell.h > 0.5);
+
+      probe.remove();
+      if (!cells.length) return null;
+
+      const minX = Math.min(...cells.map((cell) => cell.x));
+      const maxX = Math.max(...cells.map((cell) => cell.x + cell.w));
+      const minY = Math.min(...cells.map((cell) => cell.y));
+      const maxY = Math.max(...cells.map((cell) => cell.y + cell.h));
+
+      return { cells, angle, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
+    }
+
+    // Echantillonnage dans un rectangle a coins arrondis, pour que le logo
+    // conserve ses rayons au lieu d former un pave.
+    function sampleInCell(cell) {
+      const [tl, tr, br, bl] = cell.radii;
+      const right = cell.x + cell.w;
+      const bottom = cell.y + cell.h;
+
+      for (let attempt = 0; attempt < 14; attempt++) {
+        const x = cell.x + Math.random() * cell.w;
+        const y = cell.y + Math.random() * cell.h;
+        let inside = true;
+
+        if (x < cell.x + tl && y < cell.y + tl) {
+          inside = (x - (cell.x + tl)) ** 2 + (y - (cell.y + tl)) ** 2 <= tl ** 2;
+        } else if (x > right - tr && y < cell.y + tr) {
+          inside = (x - (right - tr)) ** 2 + (y - (cell.y + tr)) ** 2 <= tr ** 2;
+        } else if (x > right - br && y > bottom - br) {
+          inside = (x - (right - br)) ** 2 + (y - (bottom - br)) ** 2 <= br ** 2;
+        } else if (x < cell.x + bl && y > bottom - bl) {
+          inside = (x - (cell.x + bl)) ** 2 + (y - (bottom - bl)) ** 2 <= bl ** 2;
+        }
+
+        if (inside) return { x, y };
       }
-      return grid;
+
+      return { x: cell.x + cell.w / 2, y: cell.y + cell.h / 2 };
     }
 
     function resize() {
@@ -441,40 +565,40 @@
       canvas.height = Math.round(height * dpr);
       canvas.style.width = `${width}px`;
       canvas.style.height = `${height}px`;
-      // Le contexte est réinitialisé à chaque resize : on remet l'échelle DPR.
+      // Le contexte est reinitialise a chaque resize : on remet l'echelle DPR.
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
     function createParticles() {
-      const logoWidth = LOGO_SIZE * CELL_SIZE;
-      const logoHeight = LOGO_SIZE * CELL_SIZE;
-      const startX = (width - logoWidth) / 2;
-      const startY = (height - logoHeight) / 2;
-      const logoGrid = generateLogoGrid();
-      const perTarget = Math.ceil(particleCount / logoGrid.length);
+      const logo = measureLogo();
+      if (!logo) {
+        // Sans logo mesurable, on laisse passer la page plutot que bloquer.
+        finish();
+        return;
+      }
+
+      const { cells, angle, cx, cy } = logo;
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      const perCell = Math.max(1, Math.floor(particleCount / cells.length));
       const targetSize = isMobile ? 4 : 5;
 
       particles = [];
       for (let i = 0; i < particleCount; i++) {
-        const target = logoGrid[Math.floor(i / perTarget) % logoGrid.length];
-        const targetRow = Math.floor(target.index / LOGO_SIZE);
-        const targetCol = target.index % LOGO_SIZE;
-        const tx = startX + targetCol * CELL_SIZE + CELL_SIZE / 2;
-        const ty = startY + targetRow * CELL_SIZE + CELL_SIZE / 2;
+        const cell = cells[Math.min(cells.length - 1, Math.floor(i / perCell))];
+        const point = sampleInCell(cell);
+        const dx = point.x - cx;
+        const dy = point.y - cy;
 
-        // Variation autour de la cellule cible pour dessiner des formes pleines.
-        const jitterX = (Math.random() - 0.5) * (CELL_SIZE - targetSize);
-        const jitterY = (Math.random() - 0.5) * (CELL_SIZE - targetSize);
-
+        // La rotation de la marque est reappliquee autour de son centre, puis
+        // le logo est recentre au milieu de l'ecran.
         particles.push({
           x: Math.random() * width,
           y: -Math.random() * height * 0.5,
-          tx: tx + jitterX,
-          ty: ty + jitterY,
-          vx: 0,
-          vy: 0,
+          tx: width / 2 + dx * cos - dy * sin,
+          ty: height / 2 + dx * sin + dy * cos,
           size: targetSize,
-          color: target.isCoral ? "#bd3c34" : "#101b33",
+          color: cell.color,
           delay: Math.random() * 0.3,
           alpha: 0,
         });
@@ -556,9 +680,16 @@
 
     resize();
     createParticles();
+
+    // La mesure du logo lit le DOM : on regroupe les resize plutot que de
+    // recalculer 1300 particules a chaque evenement.
+    let resizeTimer = null;
     window.addEventListener("resize", () => {
-      resize();
-      createParticles();
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        resize();
+        createParticles();
+      }, 160);
     });
 
     // Le canvas est masqué par défaut en CSS : on ne l'affiche qu'ici, une fois
