@@ -364,6 +364,107 @@
     update();
   }
 
+  // Inclinaison 3D + reflet qui suit le pointeur sur les cartes de formules.
+  // Les cartes sont recreees a chaque changement d'offre : les ecouteurs sont
+  // donc delegates aux grilles, qui elles restent en place.
+  function initCardTilt() {
+    const grids = [elements.pricingGrid, elements.offersGrid].filter(Boolean);
+    if (!grids.length) return;
+
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    // Sur tactile l'inclinaison n'a rien a raconter : le pointeur n'a pas de
+    // position continue, le resultat serait un simple tremblement au tap.
+    const finePointer = window.matchMedia("(hover: hover) and (pointer: fine)").matches;
+    if (reduceMotion || !finePointer) return;
+
+    const MAX_TILT = 6;
+    const SELECTOR = ".pricing-card, .offer-card";
+
+    let activeCard = null;
+    let activeRect = null;
+    let pending = null;
+    let ticking = false;
+    let lastX = 0;
+    let lastY = 0;
+
+    function reset() {
+      if (!activeCard) return;
+      activeCard.classList.remove("is-tilting");
+      // On retire les variables : les valeurs par defaut du CSS (0deg) reprennent
+      // la main, et le transform se reanime jusqu'a la position plate.
+      activeCard.style.removeProperty("--tilt-x");
+      activeCard.style.removeProperty("--tilt-y");
+      activeCard.style.removeProperty("--glare-x");
+      activeCard.style.removeProperty("--glare-y");
+      activeCard = null;
+      activeRect = null;
+    }
+
+    function apply(card, clientX, clientY) {
+      // Le rectangle est mesure une fois par carte overtakee, pas a chaque
+      // mouvement : la lecture repetee provoquerait un reflow par evenement.
+      if (!activeRect) activeRect = card.getBoundingClientRect();
+      const relX = (clientX - activeRect.left) / activeRect.width;
+      const relY = (clientY - activeRect.top) / activeRect.height;
+      card.style.setProperty("--tilt-x", `${(0.5 - relY) * 2 * MAX_TILT}deg`);
+      card.style.setProperty("--tilt-y", `${(relX - 0.5) * 2 * MAX_TILT}deg`);
+      card.style.setProperty("--glare-x", `${relX * 100}%`);
+      card.style.setProperty("--glare-y", `${relY * 100}%`);
+    }
+
+    function flush() {
+      ticking = false;
+      if (!pending) return;
+      const { card, clientX, clientY } = pending;
+      pending = null;
+      if (!card) {
+        reset();
+        return;
+      }
+      if (card !== activeCard) {
+        reset();
+        activeCard = card;
+        activeCard.classList.add("is-tilting");
+      }
+      apply(activeCard, clientX, clientY);
+    }
+
+    function onPointerMove(event) {
+      // Delegation : la carte survolee se deduit de la cible, donc les
+      // nouvelles cartes sont prises en charge sans rebrancher d'ecouteur.
+      const card = event.target.closest(SELECTOR);
+      lastX = event.clientX;
+      lastY = event.clientY;
+      pending = card ? { card, clientX: lastX, clientY: lastY } : null;
+      if (!ticking) {
+        requestAnimationFrame(flush);
+        ticking = true;
+      }
+    }
+
+    grids.forEach((grid) => {
+      grid.addEventListener("pointermove", onPointerMove, { passive: true });
+      grid.addEventListener("pointerleave", () => {
+        pending = null;
+        reset();
+      });
+    });
+
+    // Defilement et redimensionnement rendent le rectangle memorise faux. On
+    // le relit et on reapplique plutot que de tout remettre a plat : sans cela,
+    // l'inclinaison resterait figee jusqu'au prochain mouvement de souris.
+    // `capture: true` est necessaire car un evenement scroll ne remonte pas :
+    // la carte des offres Defile dans .modal-card (overflow-y: auto), pas dans
+    // la fenetre, et sans capture ce scroll passerait inapercu.
+    const refresh = () => {
+      if (!activeCard) return;
+      activeRect = null;
+      apply(activeCard, lastX, lastY);
+    };
+    window.addEventListener("scroll", refresh, { passive: true, capture: true });
+    window.addEventListener("resize", refresh, { passive: true });
+  }
+
 
   // Renvoie une promesse resolue quand la page peut reveler son contenu : soit
   // l'intro n'a pas lieu d'etre jouee, soit elle commence a se dissoudre. La
@@ -810,6 +911,7 @@
     initHeroParallax();
     initScrollAnimations();
     initParallax();
+    initCardTilt();
     pageRevealed.then(
       () => {
         document.documentElement.classList.add("is-revealed");

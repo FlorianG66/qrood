@@ -2407,6 +2407,13 @@ input.invalid {
     animation: none;
   }
 
+  /* Filet de securite : initCardTilt() n'ecoute rien en reduced motion, mais si
+     un --tilt-* restait ecrit la carte doit rester plate. */
+  .pricing-card,
+  .offer-card {
+    transform: none !important;
+  }
+
   *,
   *::before,
   *::after {
@@ -2963,6 +2970,11 @@ body.modal-open {
 }
 
 .pricing-card {
+  --tilt-x: 0deg;
+  --tilt-y: 0deg;
+  --lift: 0px;
+  --glare-x: 50%;
+  --glare-y: 0%;
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -2973,11 +2985,17 @@ body.modal-open {
   background: var(--white);
   box-shadow: 0 8px 22px rgba(23, 34, 57, 0.04);
   position: relative;
+  /* Le reflexe est positionne en z-index -1 : `isolation` ouvre un contexte
+     d'empilement pour qu'il passe sous le texte mais au-dessus du fond. */
+  isolation: isolate;
+  transform: perspective(900px) translateY(var(--lift)) rotateX(var(--tilt-x)) rotateY(var(--tilt-y));
   transition: transform var(--duration-med) var(--ease-out), box-shadow var(--duration-med) var(--ease-out), border-color var(--duration-med) var(--ease-out);
 }
 
+/* Le soulèvement passe par --lift plutot que par un `transform` sur :hover :
+   ecrit ici, il ecraserait l'inclinaison 3D de la carte. */
 .pricing-card:hover {
-  transform: translateY(-6px);
+  --lift: -6px;
   box-shadow: 0 20px 40px rgba(23, 34, 57, 0.1), var(--glow-ink);
   border-color: rgba(16, 27, 51, 0.15);
 }
@@ -3147,13 +3165,72 @@ body.modal-open {
 }
 
 .offer-card {
+  --tilt-x: 0deg;
+  --tilt-y: 0deg;
+  --lift: 0px;
+  --glare-x: 50%;
+  --glare-y: 0%;
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
+  /* Fond explicite : sans lui le reflet n'a aucune surface a eclairer, et la
+     carte flottait sur le blanc du modal. */
+  background: var(--white);
+  box-shadow: 0 8px 22px rgba(23, 34, 57, 0.04);
   display: flex;
   flex-direction: column;
   gap: 14px;
   padding: 20px 18px 22px;
   position: relative;
+  isolation: isolate;
+  transform: perspective(900px) translateY(var(--lift)) rotateX(var(--tilt-x)) rotateY(var(--tilt-y));
+  transition: transform var(--duration-med) var(--ease-out), box-shadow var(--duration-med) var(--ease-out), border-color var(--duration-med) var(--ease-out);
+}
+
+.offer-card:hover {
+  --lift: -6px;
+  box-shadow: 0 20px 40px rgba(23, 34, 57, 0.1), var(--glow-ink);
+  border-color: rgba(16, 27, 51, 0.15);
+}
+
+/* -- Reflet sur les cartes ---------------------------------------------------
+   Deux nappes radiales positionnees sur --glare-x/--glare-y (ecrites en JS) :
+   un bloom indigo tres dilue pour qu'il se voie sur fond blanc, et un coeur
+   blanc pour l'effet verre. `background` ne declenche ni layout ni paint de
+   texte, uniquement une repaint de la carte. */
+.pricing-card::after,
+.offer-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    radial-gradient(150px circle at var(--glare-x) var(--glare-y), rgba(255, 255, 255, 0.9), rgba(255, 255, 255, 0) 60%),
+    radial-gradient(280px circle at var(--glare-x) var(--glare-y), rgba(16, 27, 51, 0.1), rgba(16, 27, 51, 0) 62%);
+  transition: opacity var(--duration-med) var(--ease-out);
+}
+
+.pricing-card:hover::after,
+.offer-card:hover::after {
+  opacity: 1;
+}
+
+/* Sur la carte sombre, la nappe indigo ne se verrait pas : on inverse en un
+   reflet blanc, plus present. */
+.pricing-card.is-featured::after,
+.offer-card.is-featured::after {
+  background: radial-gradient(300px circle at var(--glare-x) var(--glare-y), rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0) 65%);
+}
+
+/* Pendant que le pointeur suit la carte, on supprime la transition du
+   transform : animee, elle trailera le curseur. Le retour au repos, lui, reste
+   fluide car la classe est retirees au `pointerleave`. */
+.pricing-card.is-tilting,
+.offer-card.is-tilting {
+  will-change: transform;
+  transition: box-shadow var(--duration-med) var(--ease-out), border-color var(--duration-med) var(--ease-out);
 }
 
 .offer-card.is-current {
