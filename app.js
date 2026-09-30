@@ -2006,21 +2006,37 @@
       return;
     }
 
+    // Pictogrammes en SVG inline. Les glyphes de police utilises avant
+    // (⌁ ↗ ⏸ ×) etaient trop petits et sans signification lisible : ↗ pour
+    // « charger » evoquait meme un lien externe. currentColor suit la couleur
+    // du bouton, et le libelle visible porte maintenant le sens.
+    const icon = (body, filled) =>
+      `<svg viewBox="0 0 24 24" width="15" height="15" ${filled ? 'fill="currentColor"' : 'fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"'} aria-hidden="true" focusable="false">${body}</svg>`;
+    const icons = {
+      stats: icon('<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>'),
+      edit: icon('<path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>'),
+      pause: icon('<rect x="6" y="4" width="4" height="16" rx="1.2"/><rect x="14" y="4" width="4" height="16" rx="1.2"/>', true),
+      play: icon('<path d="M7 4.5v15l13-7.5z"/>', true),
+      trash: icon('<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>'),
+    };
+
     elements.historyGrid.innerHTML = state.history.map((item) => {
       const isActive = item.isActive !== false;
       return `
       <article class="history-card${isActive ? "" : " is-inactive"}" data-history-id="${escapeHtml(item.id)}">
-        <div class="history-thumbnail"><canvas width="120" height="120" aria-hidden="true"></canvas></div>
-        <div class="history-info">
-          <span class="history-type">${item.mode === "contact" ? "Coordonnées" : "Lien"}${isActive ? "" : `<span class="history-state">Désactivé</span>`}</span>
-          <strong class="history-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong>
-          <span class="history-date">${formatDate(item.createdAt)} · <b>${formatScanCount(item.scanCount)}</b></span>
+        <div class="history-main">
+          <div class="history-thumbnail"><canvas width="120" height="120" aria-hidden="true"></canvas></div>
+          <div class="history-info">
+            <span class="history-type">${item.mode === "contact" ? "Coordonnées" : "Lien"}${isActive ? "" : `<span class="history-state">Désactivé</span>`}</span>
+            <strong class="history-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong>
+            <span class="history-date">${formatDate(item.createdAt)} · <b>${formatScanCount(item.scanCount)}</b></span>
+          </div>
         </div>
         <div class="history-actions">
-          <button class="history-menu stats-action" type="button" data-history-action="stats" aria-label="Voir les statistiques" title="Statistiques">⌁</button>
-          <button class="history-menu" type="button" data-history-action="load" aria-label="Charger ce QR code" title="Modifier">↗</button>
-          <button class="history-menu ${isActive ? "deactivate-action" : "activate-action"}" type="button" data-history-action="toggle" aria-label="${isActive ? "Désactiver" : "Réactiver"} ce QR code" title="${isActive ? "Désactiver" : "Réactiver"}">${isActive ? "⏸" : "▶"}</button>
-          <button class="history-menu delete-action" type="button" data-history-action="delete" aria-label="Supprimer ce QR code" title="Supprimer">×</button>
+          <button class="history-action" type="button" data-history-action="load">${icons.edit}<span>Modifier</span></button>
+          <button class="history-action stats-action" type="button" data-history-action="stats">${icons.stats}<span>Statistiques</span></button>
+          <button class="history-action ${isActive ? "deactivate-action" : "activate-action"}" type="button" data-history-action="toggle">${isActive ? icons.pause : icons.play}<span>${isActive ? "Désactiver" : "Réactiver"}</span></button>
+          <button class="history-action delete-action" type="button" data-history-action="delete">${icons.trash}<span>Supprimer</span></button>
         </div>
       </article>
     `;

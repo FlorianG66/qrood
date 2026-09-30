@@ -2132,14 +2132,21 @@ input.invalid {
 .history-card {
   min-width: 0;
   display: flex;
-  align-items: center;
-  gap: 14px;
+  flex-direction: column;
+  gap: 13px;
   padding: 14px;
   border: 1px solid rgba(16, 27, 51, 0.08);
   border-radius: var(--radius-lg);
   background: var(--white);
   box-shadow: 0 8px 22px rgba(23, 34, 57, 0.04);
   transition: box-shadow 180ms ease, transform 180ms ease;
+}
+
+.history-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 14px;
 }
 
 .history-card:hover {
@@ -2208,24 +2215,6 @@ input.invalid {
   margin-top: 5px;
   color: var(--muted);
   font-size: 8px;
-}
-
-.history-menu {
-  align-self: flex-start;
-  width: 24px;
-  height: 24px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 6px;
-  color: var(--muted);
-  background: transparent;
-  font-size: 15px;
-}
-
-.history-menu:hover {
-  color: var(--ink);
-  background: #f2f4f7;
 }
 
 .guide-section {
@@ -3588,12 +3577,51 @@ body.modal-open {
   vertical-align: 1px;
 }
 
+/* -- Actions d'un QR enregistre ---------------------------------------------
+   Remplace une colonne de quatre boutons de 24 px carrees ornes de glyphes de
+   police. Les cibles passent a 34 px de haut avec un libelle visible : c'est le
+   libelle, et non l'icone, qui porte le sens, donc il reste lisible sans
+   survol et pour qui ne distingue pas les pictogrammes. */
 .history-actions {
-  align-self: stretch;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(16, 27, 51, 0.07);
+}
+
+.history-action {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
   justify-content: center;
-  gap: 1px;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid rgba(16, 27, 51, 0.1);
+  border-radius: 9px;
+  color: var(--ink-soft);
+  background: #fbfcfd;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  transition: color 150ms ease, background 150ms ease, border-color 150ms ease, transform 150ms ease;
+}
+
+.history-action svg {
+  flex: none;
+}
+
+.history-action:hover {
+  color: var(--ink);
+  border-color: rgba(16, 27, 51, 0.2);
+  background: var(--white);
+  transform: translateY(-1px);
+}
+
+.history-action:focus-visible {
+  outline: 2px solid var(--coral);
+  outline-offset: 2px;
 }
 
 .history-date b {
@@ -3601,14 +3629,22 @@ body.modal-open {
   font-weight: 800;
 }
 
-.history-menu.stats-action {
+.history-action.stats-action {
   color: var(--coral-deep);
-  font-size: 17px;
 }
 
-.history-menu.delete-action:hover {
+/* Seule action destructrice : elle reste neutre au repos pour ne pas crier
+   sur chaque carte, et ne s'allume en rouge plein qu'au survol ou au focus. */
+.history-action.delete-action:hover {
+  color: var(--white);
+  background: #c53f37;
+  border-color: #c53f37;
+}
+
+.history-action.delete-action:focus-visible {
   color: #c53f37;
-  background: #fff1ef;
+  border-color: #c53f37;
+  outline-color: #c53f37;
 }
 
 .modal-backdrop {
