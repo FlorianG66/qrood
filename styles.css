@@ -2325,10 +2325,7 @@ input.invalid {
   position: absolute;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 50%;
-  /* La rotation de depart passe en variable : une keyframe qui repartirait de
-     rotate(0) remettrait l'anneau droit et casserait sa pose. */
-  --spin: 35deg;
-  transform: rotate(var(--spin));
+  transform: rotate(35deg);
 }
 
 .ring-a {
@@ -2344,11 +2341,10 @@ input.invalid {
   width: 240px;
   height: 210px;
   border-color: rgba(189, 60, 52, 0.45);
-  --spin: -30deg;
+  transform: rotate(-30deg);
 }
 
 .guide-mini-qr {
-  --tilt: 13deg;
   width: 130px;
   height: 130px;
   position: absolute;
@@ -2362,9 +2358,7 @@ input.invalid {
   border-radius: 9px;
   background: var(--coral);
   box-shadow: 0 19px 29px rgba(0, 0, 0, 0.28);
-  /* La ligne de lecture doit rester dans le QR, pas deborder sur le fond. */
-  overflow: hidden;
-  transform: rotate(var(--tilt));
+  transform: rotate(13deg);
 }
 
 .guide-mini-qr i {
@@ -2388,35 +2382,45 @@ input.invalid {
 }
 
 /* -- Mise en scene de la section 04 ------------------------------------------
-   Les deux anneaux tournent en sens opposes, le mini-QR flotte et une ligne de
-   lecture le traverse, l'eclat pulse. Tout est declenche par .is-live, pose
-   par IntersectionObserver : hors ecran, aucune de ces animations infinies ne
-   tourne. */
+   Les deux anneaux tournent en sens opposes, le mini-QR flotte, l'eclat pulse.
+
+   Trois choix de performance, appris a la dure :
+   - aucune valeur de keyframe n'utilise var() : le navigateur ne resout pas une
+     custom property une seule fois pour interpoler, il la reevalue a chaque
+     image sur le main thread
+   - la ligne de lecture qui traversait le mini-QR est supprimee : un degrade
+     qui bouge dans un bloc overflow:hidden + border-radius + box-shadow force
+     Chrome a re-rasteriser toute la grille a chaque image
+   - will-change:transform monte les anneaux sur leur propre couche, sinon le
+     scroll les invalide et les rastérise a nouveau
+
+   .is-live est pose ET retire par IntersectionObserver : une fois la section
+   dépassée, plus aucune animation ne tourne. */
 @keyframes ring-turn {
   from {
-    transform: rotate(var(--spin));
+    transform: rotate(35deg);
   }
   to {
-    transform: rotate(calc(var(--spin) + 360deg));
+    transform: rotate(395deg);
   }
 }
 
 @keyframes ring-turn-back {
   from {
-    transform: rotate(var(--spin));
+    transform: rotate(-30deg);
   }
   to {
-    transform: rotate(calc(var(--spin) - 360deg));
+    transform: rotate(-390deg);
   }
 }
 
 @keyframes qr-float {
   0%,
   100% {
-    transform: rotate(var(--tilt)) translateY(0);
+    transform: rotate(13deg) translateY(0);
   }
   50% {
-    transform: rotate(var(--tilt)) translateY(-8px);
+    transform: rotate(13deg) translateY(-8px);
   }
 }
 
@@ -2433,10 +2437,12 @@ input.invalid {
 }
 
 .is-live .ring-a {
+  will-change: transform;
   animation: ring-turn 26s linear infinite;
 }
 
 .is-live .ring-b {
+  will-change: transform;
   animation: ring-turn-back 34s linear infinite;
 }
 
@@ -2446,41 +2452,6 @@ input.invalid {
 
 .is-live .guide-spark {
   animation: spark-pulse 3.2s ease-in-out infinite;
-}
-
-/* Ligne de lecture : un degrade qui descend sur le mini-QR, comme un scanneur.
-   Le deplacement se fait en transform et non en `top` : animer `top`
-   provoquerait un reflow a chaque image. */
-.guide-mini-qr::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  height: 34%;
-  pointer-events: none;
-  background: linear-gradient(to bottom, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0));
-}
-
-.is-live .guide-mini-qr::after {
-  animation: qr-scan 2.9s var(--ease-out) infinite;
-}
-
-@keyframes qr-scan {
-  0% {
-    transform: translateY(-100%);
-    opacity: 0;
-  }
-  18% {
-    opacity: 1;
-  }
-  82% {
-    opacity: 1;
-  }
-  100% {
-    /* 294 % de sa propre hauteur, soit 34 % x 2,94 = 100 % de la carte. */
-    transform: translateY(294%);
-    opacity: 0;
-  }
 }
 
 .footer {

@@ -334,20 +334,19 @@
   }
 
   // Une seule observatrice pour toutes les animations declenchees a
-  // l'arrivee dans le viewport : hors ecran, une animation CSS infinie continue
-  // de consommer du compositeur pour rien.
+  // l'arrivee dans le viewport. La classe est posee ET retiree : une fois la
+  // section depassee, ses animations infinies s'arretent au lieu de tourner
+  // pour rien jusqu'a la fermeture de l'onglet.
   function initLiveSections() {
     const sections = $$("[data-live]");
     if (!sections.length) return;
 
     // Seuil 0 : on demarre des le premier pixel visible. Un seuil en pourcentage
-    // du_ELEMENT_ serait inatteignable pour une section plus de 4x la hauteur de
-    // la fenetre, et l'animation ne demarrerait jamais.
+    // de l'ELEMENT serait inatteignable pour une section de plus de 4x la
+    // hauteur de la fenetre, et l'animation ne demarrerait jamais.
     const observer = new IntersectionObserver((entries) => {
       entries.forEach((entry) => {
-        if (!entry.isIntersecting) return;
-        entry.target.classList.add("is-live");
-        observer.unobserve(entry.target);
+        entry.target.classList.toggle("is-live", entry.isIntersecting);
       });
     }, { threshold: 0 });
 
@@ -359,6 +358,27 @@
   // suppression, scans) en partant de la valeur affichee, jamais de zero.
   const counters = [];
   let countersRevealed = false;
+
+  // Animation d'un compteur, de sa valeur affichee vers sa cible.
+  function runCounter(counter) {
+    if (counter.raf) cancelAnimationFrame(counter.raf);
+    const from = counter.shown;
+    const to = counter.target;
+    if (from === to) {
+      counter.raf = null;
+      counter.el.textContent = counter.format(to);
+      return;
+    }
+    const duration = 640;
+    const started = performance.now();
+    const step = (now) => {
+      const t = Math.min((now - started) / duration, 1);
+      counter.shown = Math.round(from + (to - from) * (1 - Math.pow(1 - t, 3)));
+      counter.el.textContent = counter.format(counter.shown);
+      counter.raf = t < 1 ? requestAnimationFrame(step) : null;
+    };
+    counter.raf = requestAnimationFrame(step);
+  }
 
   function initCounters() {
     const specs = [
@@ -375,11 +395,20 @@
     const metrics = elements.libraryMetrics;
     const observer = new IntersectionObserver((entries) => {
       if (!entries.some((entry) => entry.isIntersecting)) return;
-      countersRevealed = true;
       observer.disconnect();
+      countersRevealed = true;
+      // Les compteurs montent de zero a leur valeur reelle : c'est l'effet
+      // recherche. On les remettait directement a la cible, et l'animation
+      // n'avait donc jamais lieu d'etre au premier affichage.
       counters.forEach((counter) => {
-        counter.shown = counter.target;
-        counter.el.textContent = counter.format(counter.shown);
+        if (counter.el.closest("[hidden]")) {
+          counter.shown = counter.target;
+          counter.el.textContent = counter.format(counter.shown);
+          return;
+        }
+        counter.shown = 0;
+        counter.el.textContent = counter.format(0);
+        runCounter(counter);
       });
     }, { threshold: 0.25 });
 
@@ -406,19 +435,7 @@
       el.textContent = counter.format(counter.shown);
       return;
     }
-    if (counter.raf) cancelAnimationFrame(counter.raf);
-    const from = counter.shown;
-    const to = counter.target;
-    if (from === to) return;
-    const duration = 640;
-    const started = performance.now();
-    const step = (now) => {
-      const t = Math.min((now - started) / duration, 1);
-      counter.shown = Math.round(from + (to - from) * (1 - Math.pow(1 - t, 3)));
-      el.textContent = counter.format(counter.shown);
-      counter.raf = t < 1 ? requestAnimationFrame(step) : null;
-    };
-    counter.raf = requestAnimationFrame(step);
+    runCounter(counter);
   }
 
   function initParallax() {
@@ -3500,8 +3517,17 @@
     }
   }
 
+  // Les formateurs sont construits une fois pour toutes. Construire un
+  // Intl.NumberFormat coute tres cher, et l'appeler a chaque image d'une
+  // animation de compteur suffisait a faire ramer la page.
+  const numberFormatters = {
+    standard: new Intl.NumberFormat("fr-FR", { notation: "standard" }),
+    compact: new Intl.NumberFormat("fr-FR", { notation: "compact" }),
+  };
+
   function formatCompactNumber(value) {
-    return new Intl.NumberFormat("fr-FR", { notation: value >= 10_000 ? "compact" : "standard" }).format(Number(value) || 0);
+    const count = Number(value) || 0;
+    return (count >= 10_000 ? numberFormatters.compact : numberFormatters.standard).format(count);
   }
 
   function formatScanCount(value) {
