@@ -1798,6 +1798,144 @@ input.invalid {
   right: 33%;
 }
 
+/* -- Cube decoratif derriere la carte QR -------------------------------------
+   Purement decoratif : il n'affiche jamais le QR en creation (une face vivante
+   multipliee par six aurait impose de reconstruire l'apercu six fois a chaque
+   frappe dans l'URL), ne recoit aucun evenement, et n'est pas lu par les
+   lecteurs d'ecran.
+
+   Trois choix deliberes pour le cout de rendu :
+   - les faces sont OPAQUES, pas translucides. Six faces translucides en
+     preserve-3d obligent le navigateur a les trier entre elles a chaque image ;
+     des aplats pre-echantillones evitent ce tri et rendent mieux le volume
+   - le centrage se fait en marge, pas en transform, pour laisser la property
+     transform libre pour l'animation
+   - aucune valeur de keyframe n'utilise var(), reevalue a chaque image */
+.qr-cube {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 250px;
+  height: 250px;
+  margin: -125px 0 0 -125px;
+  transform-style: preserve-3d;
+  pointer-events: none;
+  user-select: none;
+  will-change: transform;
+  animation: cube-turn 26s linear infinite;
+}
+
+.cube-face {
+  position: absolute;
+  inset: 0;
+  border: 1px solid rgba(16, 27, 51, 0.09);
+  border-radius: 14px;
+}
+
+/* Aplats du meme bleu que la scene, mais claircies et assombries pour simuler
+   l'eclairage : le degrade de la face du haut se lit comme une face exposee. */
+.cube-front {
+  background: #e8edf3;
+  transform: translateZ(125px);
+}
+
+.cube-back {
+  background: #d2d9e2;
+  transform: rotateY(180deg) translateZ(125px);
+}
+
+.cube-right {
+  background: #dce3ec;
+  transform: rotateY(90deg) translateZ(125px);
+}
+
+.cube-left {
+  background: #cbd4de;
+  transform: rotateY(-90deg) translateZ(125px);
+}
+
+.cube-top {
+  background: #f1f5f9;
+  transform: rotateX(90deg) translateZ(125px);
+}
+
+.cube-bottom {
+  background: #c2cbd6;
+  transform: rotateX(-90deg) translateZ(125px);
+}
+
+.cube-qr {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 112px;
+  height: 112px;
+  margin: -56px 0 0 -56px;
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 5px;
+  padding: 10px;
+  border-radius: 10px;
+  background: #dfe6ee;
+}
+
+.cube-qr i {
+  border-radius: 1.5px;
+  background: rgba(16, 27, 51, 0.06);
+}
+
+/* Meme motif 5x5 que l'etat vide de la bibliotheque : des modules evoquent le
+   QR sans jamais pretendre etre le QR reellement encode. */
+.cube-qr i:nth-child(1),
+.cube-qr i:nth-child(2),
+.cube-qr i:nth-child(3),
+.cube-qr i:nth-child(5),
+.cube-qr i:nth-child(6),
+.cube-qr i:nth-child(8),
+.cube-qr i:nth-child(9),
+.cube-qr i:nth-child(10),
+.cube-qr i:nth-child(11),
+.cube-qr i:nth-child(13),
+.cube-qr i:nth-child(14),
+.cube-qr i:nth-child(15),
+.cube-qr i:nth-child(19),
+.cube-qr i:nth-child(20),
+.cube-qr i:nth-child(22) {
+  background: rgba(16, 27, 51, 0.26);
+}
+
+.cube-mark {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 76px;
+  height: 76px;
+  margin: -38px 0 0 -38px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  transform: rotate(12deg);
+}
+
+.cube-mark i {
+  border-radius: 5px;
+  background: rgba(16, 27, 51, 0.16);
+}
+
+.cube-mark i:first-child,
+.cube-mark i:last-child {
+  background: rgba(189, 60, 52, 0.3);
+}
+
+@keyframes cube-turn {
+  from {
+    transform: rotateX(-18deg) rotateY(0deg);
+  }
+  to {
+    transform: rotateX(-18deg) rotateY(360deg);
+  }
+}
+
 .stage-glow {
   position: absolute;
   top: -120px;
@@ -2521,6 +2659,13 @@ input.invalid {
   .pricing-card,
   .offer-card {
     transform: none !important;
+  }
+
+  /* Sans animation, le cube se retrouverait a plat, face au camera : on lui
+     garde un angle fige, ce qui reste du volume mais ne bouge plus. */
+  .qr-cube {
+    animation: none;
+    transform: rotateX(-18deg) rotateY(34deg);
   }
 
   *,
@@ -3954,6 +4099,13 @@ body.modal-open {
 }
 
 @media (max-width: 760px) {
+  /* Le cube est de la decoration : sur petit ecran, la scene est etroite, la
+     carte occupe presque toute la largeur, et six faces en preserve-3d
+     costing six couches GPU pour un fond que personne ne voit. */
+  .qr-cube {
+    display: none;
+  }
+
   .topbar,
   .hero,
   .builder-section,
