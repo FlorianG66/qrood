@@ -111,17 +111,97 @@ body::before {
   border-color: var(--coral);
 }
 
-.cursor-halo {
+/* Curseur personnalise : uniquement pose si le JS l'ajoute, le curseur systeme
+   reste la valeur par defaut. */
+body.has-custom-cursor,
+body.has-custom-cursor a,
+body.has-custom-cursor button:not(:disabled),
+body.has-custom-cursor [role="button"],
+body.has-custom-cursor summary {
+  cursor: none;
+}
+
+body.has-custom-cursor input,
+body.has-custom-cursor textarea {
+  cursor: text;
+}
+
+body.has-custom-cursor select,
+body.has-custom-cursor label {
+  cursor: pointer;
+}
+
+/* Selection de texte : on rend la main au curseur systeme pendant le geste. */
+body.has-custom-cursor.is-selecting,
+body.has-custom-cursor.is-selecting a,
+body.has-custom-cursor.is-selecting button:not(:disabled) {
+  cursor: text;
+}
+
+.cursor-dot,
+.cursor-ring {
   position: fixed;
   top: 0;
   left: 0;
-  width: 300px;
-  height: 300px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(189, 60, 52, 0.06) 0%, transparent 70%);
+  /* Au-dessus de l'overlay d'intro (10000) et de son bouton (10001) : le
+     curseur systeme etant masque, le curseur custom doit rester visible. */
+  z-index: 10002;
+  opacity: 0;
   pointer-events: none;
-  z-index: 9999;
   will-change: transform;
+  transition: opacity var(--duration-fast) var(--ease-out);
+}
+
+.cursor-dot {
+  width: 6px;
+  height: 6px;
+  margin: -3px 0 0 -3px;
+  border-radius: 50%;
+  background: var(--ink);
+}
+
+.cursor-ring {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  margin: -19px 0 0 -19px;
+  border: 1px solid rgba(16, 27, 51, 0.32);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.3);
+  transition: opacity var(--duration-fast) var(--ease-out), border-color var(--duration-med) var(--ease-out), background-color var(--duration-med) var(--ease-out);
+}
+
+.cursor-ring.is-magnet {
+  border-color: var(--coral);
+  background: rgba(189, 60, 52, 0.08);
+}
+
+.cursor-ring-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink);
+  opacity: 0;
+  transform: scale(0.7);
+  transition: opacity var(--duration-fast) var(--ease-out), transform var(--duration-fast) var(--ease-out);
+}
+
+.cursor-ring.is-magnet .cursor-ring-label {
+  opacity: 1;
+  transform: scale(1);
+}
+
+/* Avec un libelle, l'anneau devient une pastille pleine pour rester lisible. */
+.cursor-ring.is-magnet.has-label {
+  border-color: var(--ink);
+  background: var(--ink);
+}
+
+.cursor-ring.is-magnet.has-label .cursor-ring-label {
+  color: var(--white);
 }
 
 button,
