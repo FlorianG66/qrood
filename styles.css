@@ -3591,16 +3591,18 @@ body.modal-open {
 }
 
 .history-action {
+  --action: var(--ink-soft);
+  --action-bg: #f1f4f8;
   min-height: 34px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
+  gap: 7px;
   padding: 0 10px;
   border: 1px solid rgba(16, 27, 51, 0.1);
   border-radius: 9px;
-  color: var(--ink-soft);
-  background: #fbfcfd;
+  color: var(--action);
+  background: var(--action-bg);
   font-size: 10.5px;
   font-weight: 600;
   line-height: 1;
@@ -3613,38 +3615,42 @@ body.modal-open {
 }
 
 .history-action:hover {
-  color: var(--ink);
-  border-color: rgba(16, 27, 51, 0.2);
-  background: var(--white);
+  color: var(--white);
+  background: var(--action);
+  border-color: var(--action);
   transform: translateY(-1px);
 }
 
 .history-action:focus-visible {
-  outline: 2px solid var(--coral);
+  outline: 2px solid var(--action);
   outline-offset: 2px;
+}
+
+/* Une teinte et une couleur par action : la couleur donne le sens avant même
+   que le libellé soit lu, ce qui rend le balayage des quatre boutons direct. */
+.history-action.stats-action {
+  --action: var(--coral-deep);
+  --action-bg: #fdeceb;
+}
+
+.history-action.deactivate-action {
+  --action: #8a5514;
+  --action-bg: #fbf1e0;
+}
+
+.history-action.activate-action {
+  --action: #16704f;
+  --action-bg: #e2f4ec;
+}
+
+.history-action.delete-action {
+  --action: #a5302a;
+  --action-bg: #fdeceb;
 }
 
 .history-date b {
   color: var(--coral-deep);
   font-weight: 800;
-}
-
-.history-action.stats-action {
-  color: var(--coral-deep);
-}
-
-/* Seule action destructrice : elle reste neutre au repos pour ne pas crier
-   sur chaque carte, et ne s'allume en rouge plein qu'au survol ou au focus. */
-.history-action.delete-action:hover {
-  color: var(--white);
-  background: #c53f37;
-  border-color: #c53f37;
-}
-
-.history-action.delete-action:focus-visible {
-  color: #c53f37;
-  border-color: #c53f37;
-  outline-color: #c53f37;
 }
 
 .modal-backdrop {

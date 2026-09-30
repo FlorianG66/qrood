@@ -912,6 +912,34 @@
     let mouseY = -1000;
     let scrollY = 0;
     let rafId = null;
+    let lastFrame = 0;
+    let paused = false;
+
+    // Le fond est un canvas plein ecran qui redessine ~1300 fillRect par
+    // image, en boucle, depuis le chargement de la page. Le laisser tourner
+    // sous une modale est couteux : celle-ci applique un backdrop-filter:
+    // blur(10px) sur tout le viewport, donc chaque image du canvas oblige le
+    // navigateur a recalculer le flou de la modale. C'est ce qui saccadait a
+    // l'ouverture des statistiques. On suspend donc la boucle des qu'une
+    // modale est ouverte ou que l'onglet passe en arriere-plan, et on la
+    // relance a la fermeture.
+    function start() {
+      if (paused || rafId) return;
+      lastFrame = 0;
+      rafId = requestAnimationFrame(draw);
+    }
+
+    function stop() {
+      if (!rafId) return;
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+
+    function sync() {
+      paused = document.hidden || document.body.classList.contains("modal-open");
+      if (paused) stop();
+      else start();
+    }
 
     function resize() {
       width = window.innerWidth;
@@ -945,7 +973,7 @@
     function onMouseMove(event) {
       mouseX = event.clientX;
       mouseY = event.clientY;
-      if (!rafId) rafId = requestAnimationFrame(draw);
+      start();
     }
 
     function onMouseLeave() {
@@ -955,10 +983,16 @@
 
     function onScroll() {
       scrollY = window.scrollY;
-      if (!rafId) rafId = requestAnimationFrame(draw);
+      start();
     }
 
-    function draw() {
+    function draw(now) {
+      rafId = requestAnimationFrame(draw);
+      // Le fond est purement decoratif : 30 img/s sont indiscernables a
+      // l'ecran mais divisent le cout par deux.
+      if (now - lastFrame < 32) return;
+      lastFrame = now;
+
       ctx.clearRect(0, 0, width, height);
 
       const time = Date.now() * 0.001;
@@ -992,8 +1026,6 @@
       }
 
       ctx.globalAlpha = 1;
-
-      rafId = requestAnimationFrame(draw);
     }
 
     resize();
@@ -1001,8 +1033,12 @@
     window.addEventListener("mousemove", onMouseMove, { passive: true });
     document.addEventListener("mouseleave", onMouseLeave);
     window.addEventListener("scroll", onScroll, { passive: true });
+    document.addEventListener("visibilitychange", sync);
+    // openModal et closeModal ajoutent puis retirent body.modal-open. On
+    // observe l'attribut plutot que d'aller modifier les cinq appelants.
+    new MutationObserver(sync).observe(document.body, { attributes: true, attributeFilter: ["class"] });
 
-    rafId = requestAnimationFrame(draw);
+    start();
   }
 
   async function init() {
@@ -2006,18 +2042,20 @@
       return;
     }
 
-    // Pictogrammes en SVG inline. Les glyphes de police utilises avant
-    // (⌁ ↗ ⏸ ×) etaient trop petits et sans signification lisible : ↗ pour
-    // « charger » evoquait meme un lien externe. currentColor suit la couleur
-    // du bouton, et le libelle visible porte maintenant le sens.
-    const icon = (body, filled) =>
-      `<svg viewBox="0 0 24 24" width="15" height="15" ${filled ? 'fill="currentColor"' : 'fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"'} aria-hidden="true" focusable="false">${body}</svg>`;
+    // Pictogrammes en SVG inline, tous en forme pleine. La premiere version
+    // utilisait des traits de 1.8 px : a 16 px sur fond clair ils s'effacaient,
+    // et la silhouette d'une forme pleine reste nette. Les trois hauteurs de
+    // barres distinguent le graphique d'une simple grille, et le corps du
+    // crayon comme de la poubelle est filled d'un seul tenant, sans fente a
+    // dessiner. currentColor suit la couleur d'accent du bouton.
+    const solid = (body) =>
+      `<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true" focusable="false">${body}</svg>`;
     const icons = {
-      stats: icon('<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>'),
-      edit: icon('<path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>'),
-      pause: icon('<rect x="6" y="4" width="4" height="16" rx="1.2"/><rect x="14" y="4" width="4" height="16" rx="1.2"/>', true),
-      play: icon('<path d="M7 4.5v15l13-7.5z"/>', true),
-      trash: icon('<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>'),
+      stats: solid('<rect x="3.4" y="12.6" width="4.6" height="8" rx="1.5"/><rect x="9.7" y="4.4" width="4.6" height="16.2" rx="1.5"/><rect x="16" y="9" width="4.6" height="11.6" rx="1.5"/>'),
+      edit: solid('<path d="M16.9 2.6a2.5 2.5 0 0 1 3.54 0l.96.96a2.5 2.5 0 0 1 0 3.54L10.6 18.9a2.5 2.5 0 0 1-1.13.62l-4.9 1.53a.9.9 0 0 1-1.12-1.12l1.53-4.9a2.5 2.5 0 0 1 .62-1.13z"/>'),
+      pause: solid('<rect x="5.4" y="3.8" width="4.7" height="16.4" rx="1.7"/><rect x="13.9" y="3.8" width="4.7" height="16.4" rx="1.7"/>'),
+      play: solid('<path d="M8 5.14v13.72a1 1 0 0 0 1.54.84l10.79-6.86a1 1 0 0 0 0-1.68L9.54 4.3A1 1 0 0 0 8 5.14z"/>'),
+      trash: solid('<path d="M2.6 5.6h18.8a1.2 1.2 0 0 1 0 2.4H2.6a1.2 1.2 0 0 1 0-2.4z"/><path d="M8.9 1.9h6.2a1.6 1.6 0 0 1 1.6 1.6v.9H7.3v-.9a1.6 1.6 0 0 1 1.6-1.6z"/><path d="M5.5 9.6h13l-.8 11.1a2.7 2.7 0 0 1-2.7 2.5H9a2.7 2.7 0 0 1-2.7-2.5z"/>'),
     };
 
     elements.historyGrid.innerHTML = state.history.map((item) => {
