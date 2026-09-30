@@ -79,9 +79,11 @@ body::before {
   width: 100%;
   height: 100%;
   background: var(--paper);
+  display: none;
 }
 
 #intro-skip {
+  display: none;
   position: fixed;
   bottom: 32px;
   right: 32px;
@@ -100,6 +102,7 @@ body::before {
 }
 
 #intro-skip.visible {
+  display: block;
   opacity: 1;
 }
 
@@ -417,15 +420,45 @@ a {
   font-weight: 800;
   letter-spacing: -0.095em;
   line-height: 0.93;
-  opacity: 0;
-  transform: translateY(30px);
-  animation: hero-title-in var(--duration-slow) var(--ease-out) 0.25s forwards;
 }
 
 .hero h1 em,
 .guide-content h2 em {
   color: var(--coral);
   font-style: normal;
+}
+
+.scramble-char {
+  display: inline-block;
+  will-change: opacity;
+  color: inherit;
+}
+
+.word-reveal-word {
+  display: inline-block;
+  opacity: 1;
+  transform: translateY(0) rotate(0deg);
+  transition: opacity var(--duration-slow) var(--ease-out), transform var(--duration-slow) var(--ease-out);
+}
+
+.word-reveal.is-prepared .word-reveal-word {
+  opacity: 0;
+  transform: translateY(0.4em) rotate(1.5deg);
+}
+
+.word-reveal.is-visible .word-reveal-word {
+  opacity: 1;
+  transform: translateY(0) rotate(0deg);
+}
+
+.hero h1.is-scrambling .scramble-char {
+  opacity: 0.9;
+  text-shadow: 0 0 18px rgba(189, 60, 52, 0.12);
+}
+
+.hero h1.is-scrambling .scramble-char.is-settled {
+  opacity: 1;
+  text-shadow: none;
 }
 
 .hero-copy p {
@@ -437,19 +470,6 @@ a {
   opacity: 0;
   transform: translateY(20px);
   animation: fade-in var(--duration-slow) var(--ease-out) 0.45s forwards;
-}
-
-@keyframes hero-title-in {
-  from {
-    opacity: 0;
-    transform: translateY(30px);
-    clip-path: inset(0 0 100% 0);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-    clip-path: inset(0 0 0% 0);
-  }
 }
 
 @keyframes fade-in {

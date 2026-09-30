@@ -138,6 +138,95 @@
     });
   }
 
+  const SCRAMBLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$%&*+<>/\\";
+
+  function initScramble() {
+    const title = $("#hero-title");
+    if (!title) return;
+
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    // On fige le texte de reference pour les lecteurs d'ecran : le scramble ne
+    // doit jamais etre annonce comme du charabia.
+    const label = (title.textContent || "").replace(/\s+/g, " ").trim();
+    if (label) title.setAttribute("aria-label", label);
+
+    // En mouvement reduit, le titre reste tel quel dans le HTML : rien a animer.
+    if (reduceMotion) return;
+
+    // On parcourt les noeuds plutot que innerHTML pour conserver <em> et <br>.
+    const letters = [];
+
+    function walk(node) {
+      Array.from(node.childNodes).forEach((child) => {
+        if (child.nodeType === Node.TEXT_NODE) {
+          const fragment = document.createDocumentFragment();
+          Array.from(child.textContent).forEach((letter) => {
+            if (letter === " ") {
+              fragment.appendChild(document.createTextNode(" "));
+              return;
+            }
+            const span = document.createElement("span");
+            span.className = "scramble-char";
+            span.textContent = letter;
+            span.dataset.final = letter;
+            fragment.appendChild(span);
+            letters.push(span);
+          });
+          child.replaceWith(fragment);
+          return;
+        }
+        if (child.nodeType !== Node.ELEMENT_NODE) return;
+        if (child.nodeName === "BR") return;
+        walk(child);
+      });
+    }
+
+    walk(title);
+    // Sans lettres a animer, on laisse le HTML d'origine intact.
+    if (!letters.length) return;
+
+    title.classList.add("is-scrambling");
+    const stepDelay = 32;
+    const settleDuration = 380;
+    let startedAt = 0;
+
+    const randomGlyph = () => SCRAMBLE_CHARS.charAt((Math.random() * SCRAMBLE_CHARS.length) | 0);
+
+    const frame = (now) => {
+      if (!startedAt) startedAt = now;
+      const elapsed = now - startedAt;
+      let pending = false;
+
+      letters.forEach((span, index) => {
+        const delay = index * stepDelay;
+        if (elapsed < delay) {
+          span.textContent = randomGlyph();
+          pending = true;
+          return;
+        }
+        const progress = Math.min((elapsed - delay) / settleDuration, 1);
+        if (progress < 1) {
+          // La lettre finale apparait de plus en plus souvent avant fixation.
+          span.textContent = Math.random() < progress * 0.75 ? span.dataset.final : randomGlyph();
+          pending = true;
+          return;
+        }
+        span.textContent = span.dataset.final;
+        span.classList.add("is-settled");
+      });
+
+      if (pending) {
+        requestAnimationFrame(frame);
+        return;
+      }
+      title.classList.remove("is-scrambling");
+      title.classList.add("is-scrambled");
+    };
+
+    requestAnimationFrame(frame);
+  }
+
   function initScrollAnimations() {
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     if (reduceMotion) {
@@ -158,6 +247,69 @@
     );
 
     $$(".reveal").forEach((el) => observer.observe(el));
+  }
+
+  function initWordReveal() {
+    const headings = $$(".word-reveal");
+    if (!headings.length) return;
+
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    headings.forEach((heading) => {
+      const label = (heading.textContent || "").replace(/\s+/g, " ").trim();
+      if (label) heading.setAttribute("aria-label", label);
+
+      // Chaque mot devient un bloc pour que l'apparition mot a mot reste nette.
+      const words = [];
+
+      function walk(node) {
+        Array.from(node.childNodes).forEach((child) => {
+          if (child.nodeType === Node.TEXT_NODE) {
+            const fragment = document.createDocumentFragment();
+            const parts = child.textContent.split(/\s+/).filter(Boolean);
+            parts.forEach((word, index) => {
+              const span = document.createElement("span");
+              span.className = "word-reveal-word";
+              span.textContent = word;
+              fragment.appendChild(span);
+              words.push(span);
+              if (index < parts.length - 1) fragment.appendChild(document.createTextNode(" "));
+            });
+            child.replaceWith(fragment);
+            return;
+          }
+          if (child.nodeType !== Node.ELEMENT_NODE) return;
+          if (child.nodeName === "BR") return;
+          walk(child);
+        });
+      }
+
+      walk(heading);
+      if (!words.length) return;
+      heading.classList.add("is-prepared");
+    });
+
+    if (reduceMotion) {
+      headings.forEach((heading) => heading.classList.add("is-visible"));
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+          const words = $$(".word-reveal-word", entry.target);
+          words.forEach((word, index) => {
+            word.style.transitionDelay = `${Math.min(index, 8) * 55}ms`;
+          });
+          entry.target.classList.add("is-visible");
+          observer.unobserve(entry.target);
+        });
+      },
+      { threshold: 0.2, rootMargin: "0px 0px -60px 0px" }
+    );
+
+    headings.forEach((heading) => observer.observe(heading));
   }
 
   function initParallax() {
@@ -236,16 +388,24 @@
 
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const sessionKey = "qrood-intro-seen";
-    if (reduceMotion || sessionStorage.getItem(sessionKey)) {
+    const dismiss = () => {
       canvas.style.display = "none";
       skipBtn.style.display = "none";
+    };
+    let introSeen = false;
+    try {
+      introSeen = Boolean(sessionStorage.getItem(sessionKey));
+    } catch (error) {
+      introSeen = false;
+    }
+    if (reduceMotion || introSeen) {
+      dismiss();
       return;
     }
 
     const ctx = canvas.getContext("2d");
     if (!ctx) {
-      canvas.style.display = "none";
-      skipBtn.style.display = "none";
+      dismiss();
       return;
     }
 
@@ -259,7 +419,7 @@
     let rafId = null;
     let skipped = false;
 
-    const LOGO_SIZE = 4;
+    const LOGO_SIZE = 2;
     const CELL_SIZE = 60;
     const LOGO_PIXEL_COUNT = LOGO_SIZE * LOGO_SIZE;
 
@@ -277,11 +437,12 @@
     function resize() {
       width = window.innerWidth;
       height = window.innerHeight;
-      canvas.width = width * dpr;
-      canvas.height = height * dpr;
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
       canvas.style.width = `${width}px`;
       canvas.style.height = `${height}px`;
-      ctx.scale(dpr, dpr);
+      // Le contexte est réinitialisé à chaque resize : on remet l'échelle DPR.
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
     function createParticles() {
@@ -290,23 +451,29 @@
       const startX = (width - logoWidth) / 2;
       const startY = (height - logoHeight) / 2;
       const logoGrid = generateLogoGrid();
+      const perTarget = Math.ceil(particleCount / logoGrid.length);
+      const targetSize = isMobile ? 4 : 5;
 
       particles = [];
       for (let i = 0; i < particleCount; i++) {
-        const target = logoGrid[i % logoGrid.length];
+        const target = logoGrid[Math.floor(i / perTarget) % logoGrid.length];
         const targetRow = Math.floor(target.index / LOGO_SIZE);
         const targetCol = target.index % LOGO_SIZE;
         const tx = startX + targetCol * CELL_SIZE + CELL_SIZE / 2;
         const ty = startY + targetRow * CELL_SIZE + CELL_SIZE / 2;
 
+        // Variation autour de la cellule cible pour dessiner des formes pleines.
+        const jitterX = (Math.random() - 0.5) * (CELL_SIZE - targetSize);
+        const jitterY = (Math.random() - 0.5) * (CELL_SIZE - targetSize);
+
         particles.push({
           x: Math.random() * width,
           y: -Math.random() * height * 0.5,
-          tx,
-          ty,
+          tx: tx + jitterX,
+          ty: ty + jitterY,
           vx: 0,
           vy: 0,
-          size: 3,
+          size: targetSize,
           color: target.isCoral ? "#bd3c34" : "#101b33",
           delay: Math.random() * 0.3,
           alpha: 0,
@@ -372,18 +539,20 @@
     function finish() {
       if (skipped) return;
       skipped = true;
-      sessionStorage.setItem(sessionKey, "1");
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = null;
+      try {
+        sessionStorage.setItem(sessionKey, "1");
+      } catch (error) {
+        // Le nav private peut refuser la session : on laisse l'intro se rejouer.
+      }
       canvas.style.opacity = "0";
       canvas.style.transition = "opacity 400ms ease";
       skipBtn.classList.remove("visible");
-      setTimeout(() => {
-        canvas.style.display = "none";
-        skipBtn.style.display = "none";
-      }, 400);
+      setTimeout(dismiss, 400);
     }
 
     skipBtn.addEventListener("click", finish);
-    skipBtn.classList.add("visible");
 
     resize();
     createParticles();
@@ -392,6 +561,10 @@
       createParticles();
     });
 
+    // Le canvas est masqué par défaut en CSS : on ne l'affiche qu'ici, une fois
+    // l'initialisation validée, pour qu'une erreur JS ne bloque jamais la page.
+    canvas.style.display = "block";
+    skipBtn.classList.add("visible");
     rafId = requestAnimationFrame(draw);
   }
 
@@ -515,6 +688,8 @@
     bindEvents();
     initIntro();
     initBackground();
+    initScramble();
+    initWordReveal();
     initHeroParallax();
     initScrollAnimations();
     initParallax();
