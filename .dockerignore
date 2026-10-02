@@ -9,7 +9,13 @@ data
 *.sqlite-wal
 test
 deploy
+deploy.*
+*.ps1
+.opencode
 Dockerfile
 docker-compose.yml
 Caddyfile
 .dockerignore
+.gitleaks.toml
+TODO.md
+*.report.html

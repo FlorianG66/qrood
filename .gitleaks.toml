@@ -1,0 +1,37 @@
+title = "qraft gitleaks config"
+
+[extend]
+useDefault = true
+
+# Chaque entrée est une exception nominative : les motifs sont ancrés (^...$)
+# pour n'ouvrir que la valeur exacte. Aucun motif large n'est accepté ici,
+# sinon une vraie fuite future pourrait être masquée par une règle trop permissive.
+# Ne jamais elargir ces motifs sans avoir verifie la valeur exacte.
+
+[[allowlists]]
+description = "Jetons de test factices (prefixe 'SONDE') utilises pour tester redactSecrets() et le masquage Stripe. Aucune cle reelle, aucun appel reseau."
+regexTarget = "secret"
+regexes = [
+  '''^sk_live_51H8xQraCdefGHIjklMNOpq\.7890$''',
+  '''^sk_test_qrood_SONDE_1234567890$''',
+  '''^sk_test_qraft_SONDE_1234567890$''',
+]
+
+[[allowlists]]
+description = "Mots de passe factices de comptes de test, sur des domaines reserves *.example.test (RFC 2606), dans des bases ecretees a chaque execution."
+regexTarget = "secret"
+regexes = [
+  '''^MotDePassePlan789$''',
+  '''^MotDePasseVerif789$''',
+  '''^AncienMotDePasse789$''',
+  '''^NouveauMotDePasse456$''',
+  '''^AutreMotDePasse456$''',
+  '''^MotDePasseComplet789$''',
+]
+
+[[allowlists]]
+description = "Valeur de test auto-descriptive d'un scenario de retrocompatibilite (cle legacy factice)."
+regexTarget = "secret"
+regexes = [
+  '''^legacy-integration-test-20260925$''',
+]
