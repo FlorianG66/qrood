@@ -175,6 +175,29 @@ Le secret affiché par la commande (`whsec_…`) va dans `QROOD_STRIPE_WEBHOOK_S
 - Limitation du nombre de domaines de provenance par QR code pour que les agrégats ne puissent pas croître sans borne
 - Fichiers SQL et code serveur exclus du service de fichiers statiques
 
+## Back-office super-admin
+
+`/back-office` est servi sans session — la page elle-même ne contient aucune donnée — et refuse d'afficher quoi que ce soit à un compte sans rôle. Toutes les écritures passent par l'API `/api/admin/*`, jamais par une session usurpée.
+
+Le rôle tient dans une colonne, `users.is_super_admin`, et il est unique par construction : à chaque démarrage, le serveur accorde le rôle à `florian.guichard66@gmail.com` et le retire à tous les autres. Un rôle super-admin surveyant par erreur est donc corrigé au démarrage suivant, pas seulement ignoré.
+
+Conséquences assumées :
+
+- **Ultra sans abonnement.** Le super-admin dispose de l'offre Ultra de droit ; son quota est illimité sans passer par Stripe. `/compte` affiche cette origine explicitement, pour ne pas laisser croire à un abonnement payant.
+- **Protection symétrique.** Un compte super-admin n'accepte aucune intervention depuis le back-office, pas même la sienne : ses QR codes et ses statistiques passent par les mêmes endpoints que les autres, et sont refusés. La page annonce la règle et retire les boutons au lieu de renvoyer une erreur après coup.
+- **Écritures justifiées et journalisées.** Toute intervention exige un rôle, un jeton CSRF, une raison d'au moins 8 caractères, et le journal (`admin_actions`) est écrit avant la réponse : une intervention non journalisée n'a pas eu lieu. Le journal survit à la suppression du compte visé.
+- **Aucune donnée personnelle exposée.** Les listes et les détails renvoient l'identifiant, le pseudo et les compteurs d'activité ; ni secret de QR code, ni adresse e-mail complète, ni destination privée.
+
+### Double authentification du rôle
+
+Tant que la double authentification n'est pas activée, chaque intervention demande le **mot de passe** du compte super-admin. Une fois activée, elle demande un **code TOTP** de 6 chiffres (RFC 6238, HMAC-SHA1, 30 s, tolérance d'une fenêtre) **ou** un code de récupération à usage unique ; le mot de passe seul ne suffit plus.
+
+- L'activation passe par `/back-office` : mot de passe + raison, puis scan du QR code (`otpauth://`) ou saisie manuelle du secret, puis validation d'un code. Tant que ce code n'est pas validé, le secret présenté n'est pas actif — un secret jeté au hasard ne peut pas bloquer le compte.
+- Les codes de récupération sont affichés une seule fois et stockés hachés (SHA-256) ; les régénérer invalide les précédents.
+- Chaque code est consommé au premier usage : le serveur mémorise le dernier compteur accepté, si bien qu'un code rejoué dans la fenêtre de tolérance est refusé.
+- Le journal note le facteur réellement utilisé (`password`, `totp`, `recovery`), ce qui distingue une intervention validée par le propriétaire d'une intervention validée par un mot de passe volé.
+- Les tentatives sont limitées par période, activation et désactivation comprises.
+
 ## Configuration
 
 Les variables d’environnement sont utiles pour une installation derrière un proxy HTTPS :
@@ -215,6 +238,16 @@ Le test d’intégration démarre un serveur isolé sur un port libre et une bas
 - la déduplication des scans, l’absence d’adresse IP dans les statistiques, la réconciliation des agrégats au redémarrage, l’idempotence de cette réconciliation et la purge des événements bruts de plus de 365 jours ;
 - les quotas d’offres (enregistrés et actifs), le refus `402`, la désactivation avec page `410` et sa réactivation, la non-régression des options premium et la grâce de 48 h ;
 - la facturation refusée sans configuration Stripe, le refus du double abonnement, ainsi que le rejet des webhooks non signés, forgés ou rejoués.
+
+Le back-office est couvert par `test/admin.test.mjs` (huit scénarios sur un serveur et une base temporaires) :
+
+- la page servie sans session et l'absence de toute donnée avant authentification ;
+- la politique de rôle au démarrage : un seul super-admin, jamais deux après une élévation accidentelle ;
+- Ultra de droit sans abonnement ;
+- l'absence de secret et de donnée personnelle dans les listes et les détails ;
+- le refus des écritures sans rôle, sans jeton CSRF, sans raison ou visant un compte super-admin ;
+- l'application effective des actions, avec un journal qui survit à la suppression du compte visé ;
+- la double authentification : repli par mot de passe, activation par code confirmé, rejet d'un code rejoué, code de récupération à usage unique, et mention du facteur utilisé au journal.
 
 ## Passage en production
 

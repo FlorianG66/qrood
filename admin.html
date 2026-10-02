@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Back-office - QROOD</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body class="account-body admin-body">
+<div class="app-shell">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="QROOD, accueil">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">QROOD<span class="brand-dot">.</span></span>
+    </a>
+    <nav class="account-nav" aria-label="Navigation du back-office">
+      <a class="nav-link" href="/compte">Mon compte</a>
+      <a class="nav-link" href="/">Retour à l'atelier</a>
+      <button class="button button-dark button-small" id="logoutButton" type="button">Se déconnecter</button>
+    </nav>
+  </header>
+
+  <main class="account-main" id="adminLoading">
+    <div class="account-intro">
+      <span class="section-kicker">SUPER-ADMIN</span>
+      <h1>Back-office</h1>
+      <p>Maintenance des comptes. Chaque intervention demande une raison et laisse une trace.</p>
+    </div>
+    <p class="field-hint">Chargement.</p>
+  </main>
+
+  <main class="account-main" id="deniedMain" hidden>
+    <div class="account-intro">
+      <span class="section-kicker">ACCÈS REFUSÉ</span>
+      <h1>Ce compte n'est pas super-admin</h1>
+    </div>
+    <section class="account-card">
+      <p class="account-note" id="deniedNote">Le back-office est réservé au rôle super-admin.</p>
+      <a class="button button-light button-small" href="/compte">Aller à mon compte</a>
+    </section>
+  </main>
+
+  <main class="account-main" id="adminMain" hidden>
+    <div class="account-intro">
+      <span class="section-kicker">SUPER-ADMIN</span>
+      <h1>Back-office</h1>
+      <p>Maintenance des comptes. Chaque intervention demande une raison et laisse une trace.</p>
+    </div>
+
+    <section class="account-card" aria-labelledby="usersTitle">
+      <h2 id="usersTitle">Comptes</h2>
+      <div class="field-group">
+        <label for="searchInput">Rechercher</label>
+        <input id="searchInput" type="search" autocomplete="off" placeholder="Nom ou adresse e-mail">
+      </div>
+      <p class="field-hint" id="usersCount">—</p>
+      <div class="admin-list" id="userList"></div>
+      <div class="admin-pagination">
+        <button class="button button-light button-small" id="usersPrev" type="button">Précédent</button>
+        <button class="button button-light button-small" id="usersNext" type="button">Suivant</button>
+      </div>
+    </section>
+
+    <section class="account-card" id="detailCard" aria-labelledby="detailTitle" hidden>
+      <h2 id="detailTitle">—</h2>
+      <p class="account-note" id="detailProtected" hidden>
+        Ce compte porte le rôle super-admin : il est protégé et n'accepte aucune intervention depuis cette page.
+      </p>
+      <dl class="account-facts" id="detailFacts"></dl>
+      <div class="admin-list" id="qrcodeList"></div>
+      <div class="admin-actions" id="detailActions"></div>
+    </section>
+
+    <section class="account-card" aria-labelledby="twoFactorTitle">
+      <h2 id="twoFactorTitle">Double authentification</h2>
+      <p class="field-hint" id="twoFactorStatus">Chargement.</p>
+      <div class="admin-actions" id="twoFactorActions"></div>
+    </section>
+
+    <section class="account-card" aria-labelledby="auditTitle">
+      <h2 id="auditTitle">Journal des interventions</h2>
+      <p class="field-hint">Chaque ligne est écrite avant la réponse : une intervention non journalisée n'a pas eu lieu.</p>
+      <div class="admin-list" id="auditList"></div>
+    </section>
+  </main>
+</div>
+
+<div class="modal-backdrop" id="actionModal" hidden>
+  <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="actionTitle">
+    <button class="modal-close" type="button" data-close-modal="actionModal" aria-label="Fermer">×</button>
+    <span class="section-kicker">INTERVENTION</span>
+    <h2 id="actionTitle">—</h2>
+    <p class="modal-intro" id="actionDescription">—</p>
+    <form id="actionForm">
+      <div id="actionFields"></div>
+      <div class="field-group">
+        <label for="actionFactor" id="actionFactorLabel">Mot de passe actuel</label>
+        <input id="actionFactor" name="factor" type="password" autocomplete="current-password" required>
+        <p class="field-hint" id="actionFactorHint">Sans double authentification, le mot de passe prouve que c'est bien toi.</p>
+      </div>
+      <div class="field-group">
+        <label for="action-reason">Raison de l'intervention</label>
+        <textarea id="action-reason" name="reason" rows="3" minlength="8" maxlength="300" required></textarea>
+        <p class="field-hint">8 caractères minimum. Elle est écrite au journal avec ton nom, l'heure et le compte visé.</p>
+      </div>
+      <p class="account-note" id="actionError" hidden></p>
+      <div class="modal-actions">
+        <button class="button button-light" type="button" data-close-modal="actionModal">Annuler</button>
+        <button class="button button-dark" type="submit" id="actionConfirm">Confirmer</button>
+      </div>
+    </form>
+  </section>
+</div>
+
+<div class="modal-backdrop" id="twoFactorModal" hidden>
+  <section class="modal-card modal-card-wide" role="dialog" aria-modal="true" aria-labelledby="twoFactorModalTitle">
+    <button class="modal-close" type="button" data-close-modal="twoFactorModal" aria-label="Fermer">×</button>
+    <span class="section-kicker">SÉCURITÉ DU RÔLE</span>
+    <h2 id="twoFactorModalTitle">Double authentification</h2>
+
+    <div id="twoFactorSetupBody">
+      <p class="modal-intro" id="twoFactorIntro">Un code de 6 chiffres demandé à chaque intervention, en plus de la session.</p>
+      <div id="twoFactorQr" class="admin-qr" hidden></div>
+      <p class="field-hint" id="twoFactorSecret" hidden></p>
+      <form id="twoFactorForm">
+        <div class="field-group" id="twoFactorPasswordGroup">
+          <label for="twoFactorPassword">Mot de passe actuel</label>
+          <input id="twoFactorPassword" name="currentPassword" type="password" autocomplete="current-password" required>
+          <p class="field-hint">Poser un code sur une session volée reviendrait à protéger le compte de celui qui l'a volé.</p>
+        </div>
+        <div class="field-group" id="twoFactorReasonGroup">
+          <label for="twoFactorReason">Raison de l'activation</label>
+          <textarea id="twoFactorReason" name="reason" rows="2" minlength="8" maxlength="300" required></textarea>
+          <p class="field-hint">Écrite au journal avant toute écriture.</p>
+        </div>
+        <div class="field-group" id="twoFactorCodeGroup" hidden>
+          <label for="twoFactorCode">Code de l'application</label>
+          <input id="twoFactorCode" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6">
+          <p class="field-hint">Le code affiché par l'application d'authentification. Tant qu'il n'est pas validé, la double authentification reste inactive.</p>
+        </div>
+        <div class="field-group" id="twoFactorConfirmCodeGroup" hidden>
+          <label for="twoFactorConfirmCode">Code demandé à chaque intervention</label>
+          <input id="twoFactorConfirmCode" name="code" type="text" autocomplete="one-time-code">
+          <p class="field-hint">Code de 6 chiffres ou code de récupération. Un code ne sert qu'une fois.</p>
+        </div>
+        <p class="account-note" id="twoFactorError" hidden></p>
+        <div class="modal-actions">
+          <button class="button button-light" type="button" data-close-modal="twoFactorModal">Annuler</button>
+          <button class="button button-dark" type="submit" id="twoFactorSubmit">Afficher le QR code</button>
+        </div>
+      </form>
+    </div>
+
+    <div id="twoFactorCodesBody" hidden>
+      <p class="modal-intro">Codes de récupération : affichés une seule fois, jamais stockés en clair.</p>
+      <ul class="recovery-list" id="twoFactorCodes"></ul>
+      <p class="field-hint">Garde-les hors de l'application. Chacun sert une fois, si le téléphone est perdu.</p>
+      <div class="modal-actions">
+        <button class="button button-dark" type="button" data-close-modal="twoFactorModal">J'ai noté les codes</button>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"><span class="toast-icon">V</span><span id="toastMessage"></span></div>
+
+<script src="qrcode-generator.js" defer></script>
+<script src="admin.js?v=1" defer></script>
+</body>
+</html>

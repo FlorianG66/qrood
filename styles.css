@@ -2621,6 +2621,13 @@ input.invalid {
   text-transform: capitalize;
 }
 
+/* `.button` impose `display: inline-flex`, qui l'emporte sur le `[hidden]` du
+   navigateur : sans cette règle, masquer le bouton facturation par propriété
+   ne le masquerait pas. */
+#portalButton[hidden] {
+  display: none;
+}
+
 .button-danger {
   color: var(--white);
   background: var(--coral);
@@ -4350,5 +4357,142 @@ body.modal-open .app-shell *::after {
 
   .modal-card h2 {
     font-size: 25px;
+  }
+}
+
+/* ── Back-office super-admin ───────────────────────────────────────────────── */
+
+.admin-body .account-main {
+  max-width: 1180px;
+}
+
+.admin-list {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0 0;
+}
+
+/* Une ligne de compte est un bouton : elle est donc cliquable, focalisable et
+   annoncée comme telle par le navigateur, sans attribut à recopier à la main. */
+.admin-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.4fr) auto auto;
+  gap: 14px;
+  align-items: center;
+  width: 100%;
+  padding: 13px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--white);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 160ms ease, transform 160ms ease;
+}
+
+.admin-row:hover {
+  border-color: var(--ink);
+  transform: translateY(-1px);
+}
+
+.admin-row-selected {
+  border-color: var(--coral);
+  box-shadow: var(--glow-coral-soft);
+}
+
+/* La variante statique n'est pas cliquable : elle sert au journal et aux QR
+   codes d'un compte, où la ligne entière est un conteneur et non une cible. */
+.admin-row-static {
+  cursor: default;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) auto auto auto;
+}
+
+.admin-row-static:hover {
+  transform: none;
+  border-color: var(--line);
+}
+
+.admin-cell {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-soft);
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-cell:first-child {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.admin-pagination,
+.admin-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.admin-actions {
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.admin-body .modal-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  margin-top: 20px;
+}
+
+/* La modale d'activation est plus large : le QR doit rester lisible sans être
+   agrandi par le navigateur, et les codes de récupération se lisent ligne par
+   ligne. */
+.admin-body .modal-card-wide {
+  max-width: 560px;
+}
+
+.admin-qr {
+  display: flex;
+  justify-content: center;
+  margin: 18px 0 8px;
+}
+
+.admin-qr canvas {
+  width: 224px;
+  height: 224px;
+  image-rendering: pixelated;
+}
+
+.recovery-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 16px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.recovery-item {
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  font-family: var(--mono);
+  font-size: 15px;
+  letter-spacing: 0.08em;
+  text-align: center;
+}
+
+@media (max-width: 720px) {
+  .admin-row,
+  .admin-row-static {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+
+  .admin-row .button {
+    justify-self: start;
   }
 }

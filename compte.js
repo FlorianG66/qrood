@@ -10,6 +10,7 @@
   const state = {
     csrfToken: null,
     user: null,
+    entitlement: null,
     subscription: null,
     emailToken: null,
     toastTimer: null,
@@ -33,6 +34,7 @@
       }
       state.csrfToken = result.csrfToken;
       state.user = result.user;
+      state.entitlement = result.entitlement;
       state.subscription = result.subscription;
       render();
       elements.accountMain.hidden = false;
@@ -169,23 +171,40 @@
     renderPlan();
   }
 
-  function renderPlan() {
+  // L'offre nommée ici est l'offre effective, celle qui décide des quotas, et non
+// celle stockée dans `subscriptions` : le rôle super-admin accorde Ultra sans
+// qu'aucun abonnement existe, et afficher « Découverte » sous des quotas
+// illimités serait un mensonge de la page.
+function renderPlan() {
     const summary = state.subscription;
-    if (!summary) {
+    const entitlement = state.entitlement;
+    const roleGrantsPlan = Boolean(state.user.isSuperAdmin) && entitlement?.plan === "ultra";
+    if (!summary && !entitlement) {
       elements.planName.textContent = "—";
       elements.planStatus.textContent = "—";
       elements.planRenewal.textContent = "—";
       elements.planHint.textContent = "";
       return;
     }
-    elements.planName.textContent = summary.plan;
-    elements.planStatus.textContent = summary.status || "Aucun abonnement actif";
-    elements.planRenewal.textContent = summary.currentPeriodEnd
+    elements.planName.textContent = entitlement?.label || planLabelFor(entitlement?.plan);
+    elements.planStatus.textContent = roleGrantsPlan
+      ? "Avantage de rôle, aucun abonnement"
+      : summary.status || "Aucun abonnement actif";
+    elements.planRenewal.textContent = summary?.currentPeriodEnd
       ? new Date(summary.currentPeriodEnd).toLocaleDateString("fr-FR")
       : "—";
-    elements.planHint.textContent = summary.cancelAtPeriodEnd
+    elements.planHint.textContent = summary?.cancelAtPeriodEnd
       ? "Ton abonnement se termine à cette date et ne sera pas renouvelé."
-      : "";
+      : roleGrantsPlan
+        ? "Ton rôle super-admin accorde l'offre Ultra : elle s'applique sans abonnement et sans facturation."
+        : "";
+    // Sans compte de facturation, le portail n'existerait pas : le bouton ne
+    // mènerait qu'à une erreur.
+    $("#portalButton").hidden = !summary?.hasBillingAccount;
+  }
+
+  function planLabelFor(plan) {
+    return String(plan || "decouverte").replace(/^./, (letter) => letter.toUpperCase());
   }
 
   function showPendingEmail(email) {

@@ -1,5 +1,5 @@
 import http from "node:http";
-import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 import { mkdirSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
@@ -199,7 +199,7 @@ if (DB_PATH !== ":memory:") {
 }
 
 const db = new DatabaseSync(DB_PATH);
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 6;
 // La version est lue avant toute écriture : c'est elle qui distingue une base
 // existante d'une base neuve, et donc une migration d'un simple rattrapage.
 const previousSchemaVersion = Number(db.prepare("PRAGMA user_version").get()?.user_version || 0);
@@ -213,7 +213,12 @@ db.exec(`
     email TEXT NOT NULL COLLATE NOCASE UNIQUE,
     password_hash TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    pending_email TEXT
+    pending_email TEXT,
+    -- Le rôle n'existe que par défaut faux, et aucune route ne l'écrit : il se
+    -- promeut par une commande SQL explicite. Cette valeur par défaut n'est pas
+    -- une précaution de migration, c'est la garantie structurelle qu'un compte
+    -- créé par une route publique ne puisse pas en hériter.
+    is_super_admin INTEGER NOT NULL DEFAULT 0 CHECK(is_super_admin IN (0,1))
   ) STRICT;
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -325,6 +330,43 @@ db.exec(`
     type TEXT NOT NULL,
     received_at INTEGER NOT NULL
   ) STRICT;
+
+  -- Journal des interventions du super-admin. Les adresses sont dénormalisées :
+  -- la ligne doit survivre à la suppression du compte qu'elle décrit, sinon
+  -- l'histoire s'écrit avec les comptes qu'elle a effacés.
+  CREATE TABLE IF NOT EXISTS admin_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    actor_email TEXT NOT NULL,
+    target_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    target_email TEXT NOT NULL,
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    metadata TEXT,
+    created_at INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_admin_actions_created ON admin_actions(created_at DESC);
+
+  -- Double authentification du rôle. Le secret actif n'est écrit qu'après
+  -- confirmation d'un code : pending_secret permet de présenter le QR code avant
+  -- que l'opérateur l'ait scanné, sans qu'un secret jamais vérifié devienne actif.
+  -- last_counter empêche le rejeu d'un code déjà consommé dans la fenêtre de
+  -- tolérance. Les codes de récupération ne sont stockés que hachés, comme les
+  -- jetons, et retirés de la liste au premier usage.
+  CREATE TABLE IF NOT EXISTS admin_two_factor (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    secret TEXT,
+    confirmed_at INTEGER,
+    pending_secret TEXT,
+    pending_expires_at INTEGER,
+    last_counter INTEGER,
+    recovery_codes TEXT NOT NULL DEFAULT '[]',
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_admin_two_factor_pending
+    ON admin_two_factor(pending_expires_at);
 
   -- Jeton à usage unique, jamais stocké en clair : seul son SHA-256 est
   -- conservé, comme pour les sessions. La colonne used_at rend la
@@ -470,13 +512,50 @@ function migrateAuthTokenPurposes() {
   `);
 }
 
+// Le rôle super-admin est ajouté par `ALTER TABLE` et non dans le `CREATE TABLE`
+// ci-dessus, qui ne s'applique qu'aux bases neuves. `NOT NULL DEFAULT 0` rend la
+// colonne valide pour toutes les lignes existantes sans les parcourir : personne
+// ne devient administrateur par le simple fait d'ouvrir la base après mise à jour.
+function ensureSuperAdminColumn() {
+  const names = new Set(db.prepare("PRAGMA table_info(users)").all().map((column) => column.name));
+  if (!names.has("is_super_admin")) {
+    db.exec("ALTER TABLE users ADD COLUMN is_super_admin INTEGER NOT NULL DEFAULT 0 CHECK(is_super_admin IN (0,1))");
+  }
+}
+
 ensureQrcodeLegacyKey();
 ensureQrcodeStyleColumns();
 ensureQrcodeActivityColumns();
 ensureEmailVerificationColumns();
 ensurePendingEmailColumn();
+ensureSuperAdminColumn();
 migrateEntreprisePlanRemoval();
 migrateAuthTokenPurposes();
+
+// Politique de super-admin unique : seul florian.guichard66@gmail.com peut l'être.
+function enforceUniqueSuperAdmin() {
+  const canonicalEmail = "florian.guichard66@gmail.com";
+  const canonical = db.prepare("SELECT id, is_super_admin, email FROM users WHERE LOWER(email) = ?").get(
+    canonicalEmail.toLowerCase(),
+  );
+  if (canonical) {
+    if (canonical.is_super_admin !== 1) {
+      db.prepare("UPDATE users SET is_super_admin = 1 WHERE id = ?").run(canonical.id);
+    }
+  }
+  const others = db.prepare(`
+    SELECT id, email FROM users
+    WHERE is_super_admin = 1 AND LOWER(email) <> ?
+  `).all(canonicalEmail.toLowerCase());
+  if (others.length > 0) {
+    db.prepare(`
+      UPDATE users SET is_super_admin = 0
+      WHERE is_super_admin = 1 AND LOWER(email) <> ?
+    `).run(canonicalEmail.toLowerCase());
+  }
+}
+
+enforceUniqueSuperAdmin();
 
 function backfillScanRollups() {
   // Réconciliation plutôt qu’un test « table vide » : le calcul est rejoué à
@@ -528,9 +607,16 @@ const staticFiles = new Map([
   ["/index.html", "index.html"],
   ["/compte", "compte.html"],
   ["/compte.html", "compte.html"],
+  // Le back-office est servi sans condition : la page elle-même ne rend aucune
+  // donnée, tout passe par `/api/admin/*`, qui vérifie le rôle à chaque requête.
+  // La masquer ici ne sécuriserait rien et ferait dépendre l'affichage d'une
+  // variable d'environnement.
+  ["/back-office", "admin.html"],
+  ["/back-office.html", "admin.html"],
   ["/styles.css", "styles.css"],
   ["/app.js", "app.js"],
   ["/compte.js", "compte.js"],
+  ["/admin.js", "admin.js"],
   ["/cursor.js", "cursor.js"],
   ["/qrcode-generator.js", "qrcode-generator.js"],
 ]);
@@ -675,7 +761,8 @@ function getSession(request) {
   if (!token || !/^[A-Za-z0-9_-]{32,128}$/.test(token)) return null;
   const session = db.prepare(`
     SELECT s.id, s.user_id, s.csrf_token, s.last_seen_at, s.expires_at,
-           u.id AS user_id_value, u.display_name, u.email, u.email_verified_at, u.pending_email
+           u.id AS user_id_value, u.display_name, u.email, u.email_verified_at, u.pending_email,
+           u.is_super_admin
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ? AND s.expires_at > ?
@@ -693,6 +780,7 @@ function getSession(request) {
     email: session.email,
     emailVerifiedAt: session.email_verified_at,
     pendingEmail: session.pending_email,
+    isSuperAdmin: Boolean(session.is_super_admin),
   };
 }
 
@@ -700,6 +788,23 @@ function requireSession(request) {
   const session = getSession(request);
   if (!session) throw new HttpError(401, "Authentification requise.", "authentication_required");
   return session;
+}
+
+// Le rôle est relu depuis la base à chaque requête plutôt que mis en cache dans la
+// session : c'est la seule façon qu'une révocation prenne effet sans attendre
+// l'expiration du jeton. Le coût est un index sur une colonne, en regard du
+// risque qu'un accès retiré reste ouvert plusieurs heures.
+function requireSuperAdmin(request) {
+  const session = requireSession(request);
+  if (!isSuperAdmin(session.userId)) {
+    throw new HttpError(403, "Ce compte n’a pas accès au back-office.", "super_admin_required");
+  }
+  return session;
+}
+
+function isSuperAdmin(userId) {
+  const row = db.prepare("SELECT is_super_admin FROM users WHERE id = ?").get(userId);
+  return Boolean(row?.is_super_admin);
 }
 
 function verifyBrowserOrigin(request) {
@@ -1339,10 +1444,31 @@ function countActiveQrcodes(userId) {
 // fichier SQLite local, soit moins d'une milliseconde, alors qu'un cache
 // rendrait l'offre affichée fausse pendant plusieurs secondes après un paiement
 // ou une désinscription — le moment exact où l'utilisateur regarde.
-function resolvePlanKey(userId) {
-  const row = db.prepare("SELECT plan, status, grace_until FROM subscriptions WHERE user_id = ?").get(userId);
-  if (!row || !PLAN_CATALOG[row.plan] || !isEntitled(row, now())) return DEFAULT_PLAN;
+// Règle unique de l'offre effective, volontairement isolée et pure : elle est
+// appelée par `resolvePlanKey` (page du compte, contrôles de quota) comme par les
+// listes du back-office, qui doivent afficher exactement la même offre. Dupliquée
+// ailleurs, elle divergerait à la première évolution du catalogue, et le
+// super-admin verrait une offre dans un écran et une autre dans l'autre.
+function effectivePlanKey(row, timestamp) {
+  // Le rôle est consulté avant toute logique d'abonnement parce que c'est le seul
+  // endroit du code où une offre est servie sans paiement. Il doit donc primer sur
+  // la grâce et sur le statut Stripe : sans cette lecture en tête, un super-admin
+  // dont l'abonnement a expiré retomberait sur Découverte, et l'avantage serait
+  // perdu au pire moment — en pleine maintenance.
+  if (row.is_super_admin) return "ultra";
+  if (!PLAN_CATALOG[row.plan] || !isEntitled(row, timestamp)) return DEFAULT_PLAN;
   return row.plan;
+}
+
+function resolvePlanKey(userId) {
+  const row = db.prepare(`
+    SELECT u.is_super_admin, s.plan, s.status, s.grace_until
+      FROM users u
+      LEFT JOIN subscriptions s ON s.user_id = u.id
+     WHERE u.id = ?
+  `).get(userId);
+  if (!row) return DEFAULT_PLAN;
+  return effectivePlanKey(row, now());
 }
 
 // `grace_until` porte la grâce de 48 h décidée en cas de perte d'accès : elle se
@@ -2107,6 +2233,10 @@ function publicUser(row) {
     // changement est en cours : sans cela, il disparaîtrait à chaque rechargement
     // alors que le changement, lui, attend toujours son lien.
     pendingEmail: row.pendingEmail ?? row.pending_email ?? null,
+    // Lu sur la session du seul appelant : cette valeur ne décrit que « moi », et
+    // sert à l'interface pour proposer le back-office. Elle ne dit rien des autres
+    // comptes, dont le rôle n'est exposé que dans les routes d'administration.
+    isSuperAdmin: Boolean(row.isSuperAdmin ?? row.is_super_admin),
   };
 }
 
@@ -2759,6 +2889,703 @@ async function handleQrApi(request, response, url, session) {
   throw new HttpError(404, "Ressource introuvable.", "not_found");
 }
 
+// ── Back-office du super-admin ───────────────────────────────────────────────
+// Toutes les routes ci-dessous exigent le rôle, sont réservées à l'écriture sur
+// un autre compte, et journalisent leur intervention. Aucune ne modifie le rôle :
+// `is_super_admin` n'est écrit par aucun `INSERT` ni `UPDATE` de l'application,
+// seulement par une commande SQL Volontaire. C'est ce qui rend le rôle
+// inexploitable depuis une faille : il n'y a pas de route où l'obtenir.
+
+const ADMIN_REASON_MIN = 8;
+const ADMIN_REASON_MAX = 300;
+
+// Une raison courte ne prouve rien : « test » ou « urgent » ne disent ni qui a
+// décidé, ni pourquoi. Le seuil est bas mais il exclut les motifs vides.
+function validateAdminReason(value) {
+  const reason = cleanText(value, ADMIN_REASON_MAX);
+  if (reason.length < ADMIN_REASON_MIN) {
+    throw new HttpError(
+      400,
+      `Indique la raison de l'intervention (${ADMIN_REASON_MIN} caractères minimum).`,
+      "reason_required",
+    );
+  }
+  return reason;
+}
+
+// Les adresses sont dénormalisées : la ligne doit survivre à la suppression du
+// compte qu'elle décrit, sinon le journal s'écrit avec les comptes qu'il a effacés.
+function recordAdminAction(actor, target, action, reason, metadata = null) {
+  // La cible a pu être supprimée par l'action elle-même, et une clé étrangère ne
+  // peut pas désigner une ligne disparue : la ligne est alors journalisée sans
+  // identifiant, l'adresse dénormalisée suffit à la désigner. C'est aussi
+  // pourquoi la suppression du compte est écrite *après* son effacement.
+  const targetId =
+    target?.id != null && db.prepare("SELECT 1 FROM users WHERE id = ?").get(target.id) ? target.id : null;
+  db.prepare(`
+    INSERT INTO admin_actions (
+      actor_user_id, actor_email, target_user_id, target_email, action, reason, metadata, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    actor.userId,
+    String(actor.email || "").toLowerCase(),
+    targetId,
+    String(target?.email || "").toLowerCase(),
+    action,
+    reason,
+    metadata ? JSON.stringify(metadata) : null,
+    now(),
+  );
+}
+
+function adminTargetUser(id) {
+  const user = db.prepare(`
+    SELECT id, display_name, email, email_verified_at, pending_email, created_at, is_super_admin
+    FROM users WHERE id = ?
+  `).get(id);
+  if (!user) throw new HttpError(404, "Compte introuvable.", "user_not_found");
+  return user;
+}
+
+// Un super-admin ne s'attaque ni à lui-même ni à un autre super-admin, et le
+// back-office ne touche pas du tout un compte porteur du rôle. La règle est plus
+// large que la simple suppression parce qu'aucune maintenance légitime ne justifie
+// d'avoir pour cible le seul compte qui peut administrer : si ce compte doit
+// changer, son propriétaire décide, hors de l'application.
+function requireAdminTarget(actor, target) {
+  if (target.id === actor.userId) {
+    throw new HttpError(400, "Utilise les pages de ton compte pour cette action.", "admin_self_action");
+  }
+  if (target.is_super_admin) {
+    throw new HttpError(
+      403,
+      "Ce compte est super-admin : il est protégé et ne peut être ni modifié ni supprimé d'ici.",
+      "super_admin_protected",
+    );
+  }
+}
+
+function adminSearchPattern(search) {
+  const value = String(search || "").trim();
+  if (!value) return null;
+  // `ESCAPE` neutralise les jokers `%` et `_` : une recherche de « 100% » doit
+  // chercher cette chaîne, pas « n'importe quoi ».
+  return `%${value.replace(/[\\%_]/g, (character) => `\\${character}`)}%`;
+}
+
+function listAdminUsers(search, limit, offset) {
+  const pattern = adminSearchPattern(search);
+  const timestamp = now();
+  const where = pattern ? "WHERE u.email LIKE ? ESCAPE '\\' OR u.display_name LIKE ? ESCAPE '\\'" : "";
+  const params = pattern ? [...patternParams(pattern), limit, offset] : [limit, offset];
+  const rows = db.prepare(`
+    SELECT u.id, u.display_name, u.email, u.email_verified_at, u.created_at, u.is_super_admin,
+           (SELECT COUNT(*) FROM qrcodes q WHERE q.user_id = u.id) AS qrcode_count,
+           (SELECT COUNT(*) FROM qrcodes q WHERE q.user_id = u.id AND q.is_active = 1) AS active_count,
+           (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > ${timestamp}) AS session_count,
+           (SELECT plan FROM subscriptions WHERE user_id = u.id ORDER BY updated_at DESC LIMIT 1) AS plan,
+           (SELECT status FROM subscriptions WHERE user_id = u.id ORDER BY updated_at DESC LIMIT 1) AS status,
+           (SELECT grace_until FROM subscriptions WHERE user_id = u.id ORDER BY updated_at DESC LIMIT 1) AS grace_until
+    FROM users u
+    ${where}
+    ORDER BY u.id DESC
+    LIMIT ? OFFSET ?
+  `).all(...params);
+  const total = db
+    .prepare(`SELECT COUNT(*) AS total FROM users u ${where}`)
+    .get(...(pattern ? patternParams(pattern) : [])).total;
+  return { rows, total };
+}
+
+// Les jokers du motif sont introduits une seule fois ici, pour que `LIKE` et le
+// `COUNT` portent exactement le même filtrage.
+function patternParams(pattern) {
+  return [pattern, pattern];
+}
+
+// Colonnes nommées une à une, jamais `SELECT *` : `contact_data` et `vcard` sont
+// des données personnelles qu'aucune raison de maintenance ne justifie, et les
+// lister ici les exposerait par simple oubli d'une colonne dans un `*`.
+function adminQrcodeRows(userId) {
+  return db.prepare(`
+    SELECT q.id, q.name, q.mode, q.destination, q.is_active, q.created_at,
+           (SELECT COALESCE(SUM(r.scan_count), 0) FROM scan_rollups r WHERE r.qrcode_id = q.id) AS scan_count
+    FROM qrcodes q
+    WHERE q.user_id = ?
+    ORDER BY q.id DESC
+  `).all(userId);
+}
+
+function listAdminActions(limit, offset) {
+  const rows = db.prepare(`
+    SELECT id, actor_email, target_email, action, reason, metadata, created_at
+    FROM admin_actions
+    ORDER BY id DESC
+    LIMIT ? OFFSET ?
+  `).all(limit, offset);
+  const total = db.prepare("SELECT COUNT(*) AS total FROM admin_actions").get().total;
+  return { rows, total };
+}
+
+// ── Double authentification du rôle ───────────────────────────────────────────
+//
+// RFC 6238 sur HMAC-SHA1, 6 chiffres, pas de 30 s. La fenêtre ±1 absorbe l'écart
+// d'horloge entre le téléphone et le serveur ; le compteur consommé est mémorisé,
+// sinon un code sniffé resterait rejouable pendant toute sa fenêtre.
+const TOTP_STEP_SECONDS = 30;
+const TOTP_DIGITS = 6;
+const TOTP_WINDOW = 1;
+const TOTP_SETUP_TTL_MS = 10 * 60 * 1_000;
+const TOTP_SECRET_BYTES = 20;
+const RECOVERY_CODE_COUNT = 8;
+// 24 lettres (sans I ni O) et 8 chiffres (sans 0 ni 1) : 32 symboles, donc un
+// tirage sans biais sur un octet, et rien qui se confonde à la lecture.
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+const RECOVERY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+function base32Encode(bytes) {
+  let value = 0;
+  let bits = 0;
+  let output = "";
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) output += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  return output;
+}
+
+function base32Decode(text) {
+  const cleaned = String(text || "").toUpperCase().replace(/[\s=]+/g, "");
+  let value = 0;
+  let bits = 0;
+  const bytes = [];
+  for (const character of cleaned) {
+    const index = BASE32_ALPHABET.indexOf(character);
+    if (index === -1) throw new HttpError(400, "Secret d'authentification illisible.", "invalid_two_factor_setup");
+    value = (value << 5) | index;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 255);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+function totpAtCounter(secret, counter) {
+  const message = Buffer.alloc(8);
+  message.writeBigUInt64BE(BigInt(counter));
+  const digest = createHmac("sha1", base32Decode(secret)).update(message).digest();
+  const offset = digest[digest.length - 1] & 0x0f;
+  const binary =
+    ((digest[offset] & 0x7f) << 24) |
+    (digest[offset + 1] << 16) |
+    (digest[offset + 2] << 8) |
+    digest[offset + 3];
+  return String(binary % 10 ** TOTP_DIGITS).padStart(TOTP_DIGITS, "0");
+}
+
+// Renvoie le compteur accepté, ou `null`. Le compteur est mémorisé pour qu'un
+// code réutilisé dans la fenêtre soit refusé comme un rejeu.
+function consumeTotpCode(userId, secret, code, at = now()) {
+  const candidate = Buffer.from(String(code || "").trim());
+  if (candidate.length !== TOTP_DIGITS || !/^\d+$/.test(candidate.toString())) return null;
+  const record = twoFactorRecord(userId);
+  const counter = Math.floor(at / 1_000 / TOTP_STEP_SECONDS);
+  for (let drift = -TOTP_WINDOW; drift <= TOTP_WINDOW; drift += 1) {
+    const candidateCounter = counter + drift;
+    if (record?.last_counter != null && candidateCounter <= record.last_counter) continue;
+    const expected = Buffer.from(totpAtCounter(secret, candidateCounter));
+    if (timingSafeEqual(expected, candidate)) {
+      db.prepare("UPDATE admin_two_factor SET last_counter = ? WHERE user_id = ?").run(candidateCounter, userId);
+      return candidateCounter;
+    }
+  }
+  return null;
+}
+
+function normalizeRecoveryCode(code) {
+  return String(code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function recoveryCodeHash(code) {
+  return createHash("sha256").update(normalizeRecoveryCode(code)).digest("hex");
+}
+
+function generateRecoveryCodes(count = RECOVERY_CODE_COUNT) {
+  const codes = [];
+  for (let index = 0; index < count; index += 1) {
+    let raw = "";
+    for (const byte of randomBytes(10)) raw += RECOVERY_ALPHABET[byte % 32];
+    codes.push(`${raw.slice(0, 5)}-${raw.slice(5)}`);
+  }
+  return codes;
+}
+
+function storedRecoveryCodes(record) {
+  try {
+    const parsed = JSON.parse(record?.recovery_codes || "[]");
+    return Array.isArray(parsed) ? parsed.filter((entry) => typeof entry === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function twoFactorRecord(userId) {
+  return db.prepare("SELECT * FROM admin_two_factor WHERE user_id = ?").get(userId) || null;
+}
+
+function isTwoFactorEnrolled(record) {
+  return Boolean(record?.secret && record?.confirmed_at);
+}
+
+function twoFactorStatus(userId) {
+  const record = twoFactorRecord(userId);
+  const enrolled = isTwoFactorEnrolled(record);
+  return {
+    enrolled,
+    confirmedAt: record?.confirmed_at ? isoDate(record.confirmed_at) : null,
+    recoveryCodesRemaining: enrolled ? storedRecoveryCodes(record).length : 0,
+    setupPending: Boolean(record?.pending_secret && record.pending_expires_at > now()),
+  };
+}
+
+// Second facteur exigé sur chaque écriture d'exploitation. Tant que la double
+// authentification n'est pas activée, le mot de passe tient lieu de seconde
+// preuve : c'est une étape de plus, pas un facteur supplémentaire, et le journal
+// dit lequel des deux a réellement servi.
+async function requireAdminTwoFactor(session, body) {
+  const record = twoFactorRecord(session.userId);
+  if (!isTwoFactorEnrolled(record)) {
+    await requireCurrentPassword(session, body);
+    return "password";
+  }
+  const code = typeof body.twoFactorCode === "string" ? body.twoFactorCode.trim() : "";
+  if (!code) {
+    throw new HttpError(
+      403,
+      "Saisis le code de ton application d'authentification, ou un code de récupération.",
+      "two_factor_required",
+    );
+  }
+  // 10 essais par 5 minutes : un code à 6 chiffres s'énumère en 10^6 essais, la
+  // fenêtre de 30 s ne suffit donc pas à le deviner de but en blanc.
+  checkRateLimit(`admin-2fa:${session.userId}`, 10, 5 * 60 * 1_000);
+  if (consumeTotpCode(session.userId, record.secret, code) !== null) return "totp";
+  const consumed = consumeRecoveryCode(session.userId, record, code);
+  if (consumed) return "recovery";
+  throw new HttpError(403, "Code d'authentification invalide.", "invalid_two_factor_code");
+}
+
+function consumeRecoveryCode(userId, record, code) {
+  const normalized = normalizeRecoveryCode(code);
+  if (!normalized) return false;
+  const candidate = Buffer.from(recoveryCodeHash(normalized));
+  const codes = storedRecoveryCodes(record);
+  const index = codes.findIndex((hash) => {
+    const stored = Buffer.from(hash);
+    return stored.length === candidate.length && timingSafeEqual(stored, candidate);
+  });
+  if (index === -1) return false;
+  codes.splice(index, 1);
+  db.prepare("UPDATE admin_two_factor SET recovery_codes = ?, updated_at = ? WHERE user_id = ?").run(
+    JSON.stringify(codes),
+    now(),
+    userId,
+  );
+  return true;
+}
+
+function adminSubscriptionRow(userId) {
+  return db.prepare(`
+    SELECT plan, status, current_period_end, cancel_at_period_end, grace_until, stripe_subscription_id
+    FROM subscriptions WHERE user_id = ?
+    ORDER BY updated_at DESC LIMIT 1
+  `).get(userId) || null;
+}
+
+async function handleAdminApi(request, response, url) {
+  // Une seule garde, posée avant toute route : il n'existe aucune lecture publique
+  // sous `/api/admin/`, pas même la liste vide.
+  const session = requireSuperAdmin(request);
+
+  if (request.method === "GET" && url.pathname === "/api/admin/users") {
+    checkRateLimit(`admin-read:${session.userId}`, 240, 60 * 1_000);
+    const { limit, offset } = parsePagination(url);
+    const search = cleanText(url.searchParams.get("search") || "", 120);
+    const { rows, total } = listAdminUsers(search, limit, offset);
+    sendJson(response, 200, {
+      users: rows.map((row) => ({
+        id: row.id,
+        displayName: row.display_name,
+        email: row.email,
+        emailVerified: Boolean(row.email_verified_at),
+        isSuperAdmin: Boolean(row.is_super_admin),
+        createdAt: isoDate(row.created_at),
+        qrcodeCount: row.qrcode_count,
+        activeCount: row.active_count,
+        sessionCount: row.session_count,
+        plan: effectivePlanKey(row, now()),
+        status: row.status || null,
+      })),
+      total,
+      limit,
+      offset,
+    });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/admin/audit") {
+    checkRateLimit(`admin-read:${session.userId}`, 240, 60 * 1_000);
+    const { limit, offset } = parsePagination(url);
+    const { rows, total } = listAdminActions(limit, offset);
+    sendJson(response, 200, {
+      actions: rows.map((row) => ({
+        id: row.id,
+        actorEmail: row.actor_email,
+        targetEmail: row.target_email,
+        action: row.action,
+        reason: row.reason,
+        createdAt: isoDate(row.created_at),
+      })),
+      total,
+      limit,
+      offset,
+    });
+    return;
+  }
+
+  // ── Double authentification ─────────────────────────────────────────────────
+  if (request.method === "GET" && url.pathname === "/api/admin/2fa") {
+    checkRateLimit(`admin-read:${session.userId}`, 240, 60 * 1_000);
+    sendJson(response, 200, twoFactorStatus(session.userId));
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/2fa/setup") {
+    verifyCsrf(request, session);
+    checkRateLimit(`admin-2fa-setup:${session.userId}`, 5, 10 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    const reason = validateAdminReason(body.reason);
+    // Un secret d'authentification n'est jamais posé sur une session volée : le
+    // mot de passe est exigé ici, car c'est le seul facteur encore connu.
+    await requireCurrentPassword(session, body);
+    const secret = base32Encode(randomBytes(TOTP_SECRET_BYTES));
+    const expiresAt = now() + TOTP_SETUP_TTL_MS;
+    db.prepare(`
+      INSERT INTO admin_two_factor (user_id, pending_secret, pending_expires_at, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        pending_secret = excluded.pending_secret,
+        pending_expires_at = excluded.pending_expires_at,
+        updated_at = excluded.updated_at
+    `).run(session.userId, secret, expiresAt, now());
+    recordAdminAction(session, adminTargetUser(session.userId), "two_factor_setup", reason);
+    sendJson(response, 200, {
+      secret,
+      uri: `otpauth://totp/${encodeURIComponent(`QROOD:${session.email}`)}?secret=${secret}&issuer=QROOD&algorithm=SHA1&digits=${TOTP_DIGITS}&period=${TOTP_STEP_SECONDS}`,
+      expiresAt: isoDate(expiresAt),
+    });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/2fa/confirm") {
+    verifyCsrf(request, session);
+    checkRateLimit(`admin-2fa-confirm:${session.userId}`, 10, 5 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    const reason = validateAdminReason(body.reason);
+    const record = twoFactorRecord(session.userId);
+    if (!record?.pending_secret || record.pending_expires_at <= now()) {
+      throw new HttpError(409, "L'activation a expiré : relance-la pour obtenir un nouveau QR code.", "two_factor_setup_expired");
+    }
+    if (consumeTotpCode(session.userId, record.pending_secret, body.code) === null) {
+      throw new HttpError(403, "Ce code ne correspond pas au QR code affiché.", "invalid_two_factor_code");
+    }
+    const codes = generateRecoveryCodes();
+    db.prepare(`
+      UPDATE admin_two_factor
+      SET secret = pending_secret,
+          pending_secret = NULL,
+          pending_expires_at = NULL,
+          last_counter = NULL,
+          confirmed_at = ?,
+          recovery_codes = ?,
+          updated_at = ?
+      WHERE user_id = ?
+    `).run(now(), JSON.stringify(codes.map(recoveryCodeHash)), now(), session.userId);
+    recordAdminAction(session, adminTargetUser(session.userId), "two_factor_enabled", reason, {
+      recoveryCodes: codes.length,
+    });
+    // Les codes ne sont renvoyés qu'ici, qu'une fois : la base n'en garde que les
+    // empreintes. Les perdre est définitif, d'où le avertissement côté interface.
+    sendJson(response, 200, { recoveryCodes: codes });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/2fa/recovery-codes") {
+    verifyCsrf(request, session);
+    checkRateLimit(`admin-2fa-recovery:${session.userId}`, 5, 10 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    const reason = validateAdminReason(body.reason);
+    const record = twoFactorRecord(session.userId);
+    if (!isTwoFactorEnrolled(record)) {
+      throw new HttpError(409, "La double authentification n'est pas active.", "two_factor_not_enrolled");
+    }
+    await requireCurrentPassword(session, body);
+    // Une session volée ne doit pas pouvoir remplacer les codes de récupération :
+    // le mot de passe ne suffit pas, il faut le second facteur.
+    await requireAdminTwoFactor(session, body);
+    const codes = generateRecoveryCodes();
+    db.prepare("UPDATE admin_two_factor SET recovery_codes = ?, updated_at = ? WHERE user_id = ?").run(
+      JSON.stringify(codes.map(recoveryCodeHash)),
+      now(),
+      session.userId,
+    );
+    recordAdminAction(session, adminTargetUser(session.userId), "two_factor_recovery_regenerated", reason, {
+      recoveryCodes: codes.length,
+    });
+    sendJson(response, 200, { recoveryCodes: codes });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/admin/2fa/disable") {
+    verifyCsrf(request, session);
+    checkRateLimit(`admin-2fa-disable:${session.userId}`, 5, 10 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    const reason = validateAdminReason(body.reason);
+    const record = twoFactorRecord(session.userId);
+    if (!isTwoFactorEnrolled(record)) {
+      throw new HttpError(409, "La double authentification n'est pas active.", "two_factor_not_enrolled");
+    }
+    await requireCurrentPassword(session, body);
+    await requireAdminTwoFactor(session, body);
+    db.prepare("DELETE FROM admin_two_factor WHERE user_id = ?").run(session.userId);
+    recordAdminAction(session, adminTargetUser(session.userId), "two_factor_disabled", reason);
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  const userMatch = url.pathname.match(/^\/api\/admin\/users\/(\d{1,12})(\/[\w/-]+)?$/);
+  if (userMatch && !userMatch[2] && request.method === "GET") {
+    checkRateLimit(`admin-read:${session.userId}`, 240, 60 * 1_000);
+    const target = adminTargetUser(Number(userMatch[1]));
+    const subscription = adminSubscriptionRow(target.id);
+    sendJson(response, 200, {
+      user: {
+        id: target.id,
+        displayName: target.display_name,
+        email: target.email,
+        emailVerified: Boolean(target.email_verified_at),
+        pendingEmail: target.pending_email,
+        isSuperAdmin: Boolean(target.is_super_admin),
+        createdAt: isoDate(target.created_at),
+      },
+      subscription: subscription
+        ? {
+            plan: subscription.plan,
+            status: subscription.status,
+            currentPeriodEnd: isoDate(subscription.current_period_end),
+            cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
+            graceUntil: isoDate(subscription.grace_until),
+          }
+        : null,
+      entitlement: resolveEntitlement(target.id),
+      sessionCount: db
+        .prepare("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND expires_at > ?")
+        .get(target.id, now()).n,
+      qrcodes: adminQrcodeRows(target.id),
+    });
+    return;
+  }
+
+  // ── Actions ────────────────────────────────────────────────────────────────
+  if (request.method === "POST" && userMatch && userMatch[2]) {
+    verifyCsrf(request, session);
+    checkRateLimit(`admin-write:${session.userId}`, 120, 60 * 1_000);
+    const target = adminTargetUser(Number(userMatch[1]));
+    requireAdminTarget(session, target);
+    const body = requireObject(await readJson(request));
+    const reason = validateAdminReason(body.reason);
+    const factor = await requireAdminTwoFactor(session, body);
+    const audit = (action, target, metadata = null) =>
+      recordAdminAction(session, target, action, reason, { factor, ...(metadata || {}) });
+    const action = userMatch[2];
+
+    if (action === "/password") {
+      const password = validatePassword(body.newPassword);
+      const passwordHash = await hashPassword(password);
+      db.exec("BEGIN");
+      try {
+        db.prepare("UPDATE users SET password_hash = ?, email_verified_at = NULL WHERE id = ?").run(
+          passwordHash,
+          target.id,
+        );
+        // Les sessions tombent avec le mot de passe : un accès obtenu avec
+        // l'ancien ne doit pas survivre à son remplacement. L'adresse repart à
+        // zéro aussi, car elle ne prouve plus que qui que ce soit.
+        db.prepare("DELETE FROM sessions WHERE user_id = ?").run(target.id);
+        db.prepare("DELETE FROM auth_tokens WHERE user_id = ?").run(target.id);
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+      audit("password_reset", target);
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+
+    if (action === "/verify-email") {
+      db.prepare("UPDATE users SET email_verified_at = ? WHERE id = ?").run(now(), target.id);
+      db.prepare("DELETE FROM auth_tokens WHERE user_id = ? AND purpose = 'email_verification'").run(target.id);
+      audit("email_verified", target);
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+
+    if (action === "/sessions/revoke") {
+      const result = db.prepare("DELETE FROM sessions WHERE user_id = ?").run(target.id);
+      audit("sessions_revoked", target, { count: result.changes });
+      sendJson(response, 200, { ok: true, count: result.changes });
+      return;
+    }
+
+    if (action === "/delete") {
+      if (cleanText(body.confirmation, 32) !== "SUPPRIMER") {
+        throw new HttpError(400, "Confirme la suppression en écrivant SUPPRIMER.", "confirmation_required");
+      }
+      if (hasLiveSubscription(target.id)) {
+        throw new HttpError(
+          409,
+          "Résilie d'abord l'abonnement de ce compte, puis supprime-le.",
+          "subscription_active",
+        );
+      }
+      // users porte les clés étrangères en cascade : QR codes, scans, sessions et
+      // abonnements partent avec le compte, en une transaction.
+      db.exec("BEGIN");
+      try {
+        db.prepare("DELETE FROM users WHERE id = ?").run(target.id);
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+      audit("account_deleted", target);
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+
+    if (action === "/subscription/cancel") {
+      const subscription = adminSubscriptionRow(target.id);
+      if (!subscription) {
+        throw new HttpError(404, "Aucun abonnement sur ce compte.", "no_subscription");
+      }
+      if (!subscription.stripe_subscription_id) {
+        throw new HttpError(
+          409,
+          "Cet abonnement n'a pas d'identifiant Stripe : résilie-le depuis le portail, puis supprime le compte.",
+          "no_stripe_subscription",
+        );
+      }
+      // La résiliation passe par Stripe avant d'être écrite en base. Écrire d'abord
+      // laisserait un compte sans abonnement ici mais toujours débité là, et le
+      // webhook de résiliation ne réparerait rien : il arrive une fois, au moment
+      // de l'action, pas à la demande suivante.
+      const stripe = await getStripe();
+      const atPeriodEnd = body.atPeriodEnd !== false;
+      const updated = atPeriodEnd
+        ? await stripe.subscriptions.update(subscription.stripe_subscription_id, {
+            cancel_at_period_end: true,
+          })
+        : await stripe.subscriptions.cancel(subscription.stripe_subscription_id);
+      const synced = syncSubscriptionFromStripe(updated);
+      audit("subscription_canceled", target, {
+        atPeriodEnd,
+        status: synced?.status || null,
+      });
+      sendJson(response, 200, { ok: true, status: synced?.status || null });
+      return;
+    }
+
+    if (action === "/subscription/grace") {
+      const hours = Number(body.hours);
+      if (!Number.isInteger(hours) || hours < 1 || hours > 720) {
+        throw new HttpError(400, "Indique un nombre d'heures entre 1 et 720.", "invalid_hours");
+      }
+      const subscription = adminSubscriptionRow(target.id);
+      if (!subscription) {
+        throw new HttpError(404, "Aucun abonnement sur ce compte.", "no_subscription");
+      }
+      // La grâce ne compte que pour un abonnement résilié ou en pause. Sur un
+      // abonnement actif elle ne servirait à rien, et l'écrire quand même
+      // donnerait l'illusion d'avoir accordé quelque chose.
+      const effective = subscription.status === "canceled" || subscription.status === "paused";
+      let graceUntil = subscription.grace_until;
+      if (effective) {
+        const from = Math.max(now(), subscription.grace_until || 0);
+        graceUntil = from + hours * 60 * 60 * 1_000;
+        db.prepare("UPDATE subscriptions SET grace_until = ?, updated_at = ? WHERE user_id = ?").run(
+          graceUntil,
+          now(),
+          target.id,
+        );
+      }
+      audit("subscription_grace", target, { hours, effective });
+      sendJson(response, 200, {
+        ok: true,
+        effective,
+        graceUntil: isoDate(graceUntil),
+        message: effective
+          ? `Grâce prolongée jusqu'au ${isoDate(graceUntil)}.`
+          : "La grâce n'a pas été prolongée : elle ne s'applique qu'à un abonnement résilié ou en pause.",
+      });
+      return;
+    }
+
+    throw new HttpError(404, "Intervention inconnue.", "not_found");
+  }
+
+  // ── Modération d'un QR code ───────────────────────────────────────────────
+  const qrcodeMatch = url.pathname.match(/^\/api\/admin\/qrcodes\/(\d{1,12})\/activity$/);
+  if (request.method === "POST" && qrcodeMatch) {
+    verifyCsrf(request, session);
+    checkRateLimit(`admin-write:${session.userId}`, 120, 60 * 1_000);
+    const id = Number(qrcodeMatch[1]);
+    const qrcode = db.prepare("SELECT id, user_id, name FROM qrcodes WHERE id = ?").get(id);
+    if (!qrcode) throw new HttpError(404, "QR code introuvable.", "not_found");
+    const owner = db.prepare("SELECT id, email, is_super_admin FROM users WHERE id = ?").get(qrcode.user_id);
+    if (owner?.is_super_admin) {
+      throw new HttpError(403, "Ce QR code appartient à un compte super-admin.", "super_admin_protected");
+    }
+    const body = requireObject(await readJson(request));
+    const reason = validateAdminReason(body.reason);
+    const factor = await requireAdminTwoFactor(session, body);
+    if (typeof body.active !== "boolean") {
+      throw new HttpError(400, "Indique si le QR code doit être actif.", "invalid_active");
+    }
+    db.prepare("UPDATE qrcodes SET is_active = ?, updated_at = ? WHERE id = ?").run(
+      body.active ? 1 : 0,
+      now(),
+      id,
+    );
+    recordAdminAction(session, owner, body.active ? "qrcode_activated" : "qrcode_deactivated", reason, {
+      factor,
+      qrcodeId: id,
+      qrcodeName: qrcode.name,
+    });
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  throw new HttpError(404, "Ressource introuvable.", "not_found");
+}
+
 async function handleApi(request, response, url) {
   if (url.pathname.startsWith("/api/auth/")) {
     await handleAuthApi(request, response, url);
@@ -2772,6 +3599,13 @@ async function handleApi(request, response, url) {
   if (url.pathname.startsWith("/api/account/")) {
     const session = requireSession(request);
     await handleAccountApi(request, response, url, session);
+    return;
+  }
+  if (url.pathname.startsWith("/api/admin/")) {
+    // La garde de rôle est dans le handler : elle s'applique donc aussi aux
+    // routes inconnies sous ce préfixe, qui rendent 403 avant même le 404. Un
+    // compte sans rôle ne peut pas énumérer les routes du back-office.
+    await handleAdminApi(request, response, url);
     return;
   }
   if (url.pathname === "/api/billing/stripe/webhook") {
