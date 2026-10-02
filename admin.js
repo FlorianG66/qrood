@@ -215,7 +215,7 @@
     return `${subscription.status}${subscription.cancelAtPeriodEnd ? " · fin programmée" : ""}`;
   }
 
-  async function selectUser(userId) {
+  async function selectUser(userId, { silent = false } = {}) {
     state.selected = { id: userId };
     renderUsers();
     try {
@@ -223,8 +223,12 @@
       state.detail = detail;
       elements.detailCard.hidden = false;
       renderDetail(detail);
-      elements.detailCard.scrollIntoView({ behavior: "smooth", block: "start" });
+      // Le défilement n'a lieu qu'à un vrai clic : après une intervention, il
+      // remonterait la fiche sous les yeux au moment où l'utilisateur venait
+      // de cliquer « Confirmer » dans la modale.
+      if (!silent) elements.detailCard.scrollIntoView({ behavior: "smooth", block: "start" });
     } catch (error) {
+      if (silent) return;
       showToast(error.message || "Cette fiche est indisponible.");
     }
   }
@@ -492,13 +496,33 @@
       elements.actionModal.hidden = true;
       state.dialogAction = null;
       form.reset();
-      await Promise.all([selectUser(state.selected.id), loadAudit()]);
+      await refreshAfterAction(action);
     } catch (error) {
       elements.actionError.textContent = error.message || "L'intervention a échoué.";
       elements.actionError.hidden = false;
     } finally {
       elements.actionConfirm.disabled = false;
     }
+  }
+
+  // Après une intervention, la page se remet à jour sans rechargement : la liste
+  // des comptes, la fiche ouverte et le journal. Ce sont trois requêtes
+  // distinctes parce qu'elles ont trois périmètres distincts — et il faut les
+  // faire toutes, sinon l'écran ment sur l'état qu'il montre.
+  async function refreshAfterAction(action) {
+    const deleted = action.id === "delete";
+    if (deleted) {
+      // Le compte n'existe plus : le garder sélectionné ferait échouer la
+      // recharge de sa fiche et afficherait « Compte introuvable » par-dessus
+      // le succès de la suppression.
+      state.selected = null;
+      state.detail = null;
+      elements.detailCard.hidden = true;
+      renderUsers();
+    }
+    const refreshes = [loadUsers(), loadAudit()];
+    if (!deleted && state.selected) refreshes.push(selectUser(state.selected.id, { silent: true }));
+    await Promise.all(refreshes);
   }
 
   // Une intervention qui n'a rien changé ne doit pas être annoncée comme réussie :
@@ -512,6 +536,15 @@
     }
     if (action.id === "subscription/plan" && result?.message) {
       return result.message;
+    }
+    if (action.id === "delete") {
+      return "Compte supprimé.";
+    }
+    if (action.id === "password") {
+      return "Mot de passe réinitialisé : les sessions sont fermées et l'adresse doit être reconfirmée.";
+    }
+    if (action.id === "verify-email") {
+      return "Adresse confirmée.";
     }
     return "Intervention enregistrée.";
   }
