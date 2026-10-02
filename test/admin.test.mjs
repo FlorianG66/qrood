@@ -194,6 +194,17 @@ function readSubscription(databasePath, email) {
   }
 }
 
+function countSubscriptions(databasePath, email) {
+  const database = new DatabaseSync(databasePath);
+  try {
+    return database.prepare(
+      "SELECT COUNT(*) AS n FROM subscriptions WHERE user_id = (SELECT id FROM users WHERE email = ?)",
+    ).get(email).n;
+  } finally {
+    database.close();
+  }
+}
+
 function countSessions(databasePath, email) {
   const database = new DatabaseSync(databasePath);
   try {
@@ -903,6 +914,112 @@ function readTwoFactor(databasePath, email) {
     database.close();
   }
 }
+
+test("l'administration peut offrir une offre, et seulement à un compte sans abonnement Stripe", async () => {
+  const harness = await bootBackOffice();
+  const { owner, client, databasePath, logSink } = harness;
+  const reason = "offre offerte pour la démonstration du 14 octobre";
+
+  try {
+    const clientId = readUser(databasePath, client.email).id;
+    const gift = (body) =>
+      request(`/api/admin/users/${clientId}/subscription/plan`, {
+        method: "POST",
+        cookie: owner.cookie,
+        csrf: owner.csrf,
+        body: { currentPassword: PASSWORD, reason, ...body },
+      });
+
+    const before = await (await request(`/api/admin/users/${clientId}`, { cookie: owner.cookie })).json();
+    assert.equal(before.subscription.status, null, "le compte part sans abonnement");
+    assert.equal(before.entitlement.plan, "decouverte");
+    assert.equal(before.entitlement.maxQrcodes, 5);
+
+    // Une durée hors bornes ou une offre inconnue n'écrit rien : une erreur de
+    // saisie ne doit pas accorder un accès sans limite.
+    for (const body of [{ plan: "inconnu", days: 30 }, { plan: "pro", days: 0 }, { plan: "pro", days: 4000 }]) {
+      const refused = await gift(body);
+      assert.equal(refused.status, 400, logSink.value);
+    }
+    const untouched = await (await request(`/api/admin/users/${clientId}`, { cookie: owner.cookie })).json();
+    assert.equal(untouched.subscription.status, null, "un refus ne doit laisser aucune ligne derrière lui");
+    assert.equal(countSubscriptions(databasePath, client.email), 0);
+
+    const granted = await gift({ plan: "pro", days: 30 });
+    assert.equal(granted.status, 200, logSink.value);
+    const result = await granted.json();
+    assert.equal(result.plan, "pro");
+    assert.match(result.message, /sans facturation/);
+
+    const after = await (await request(`/api/admin/users/${clientId}`, { cookie: owner.cookie })).json();
+    assert.equal(after.subscription.plan, "pro");
+    assert.equal(after.subscription.status, "active");
+    assert.equal(after.subscription.manual, true, "sans identifiant Stripe, l'offre n'est pas un abonnement");
+    assert.equal(after.subscription.cancelAtPeriodEnd, true, "elle s'éteint seule, sans renouvellement");
+    assert.equal(after.entitlement.plan, "pro");
+    assert.equal(after.entitlement.maxQrcodes, 25);
+
+    // La période est bien celle demandée, à la minute près près.
+    const requested = Date.now() + 30 * 24 * 3_600 * 1_000;
+    assert.ok(
+      Math.abs(new Date(after.subscription.currentPeriodEnd).getTime() - requested) < 60_000,
+      `échéance inattendue : ${after.subscription.currentPeriodEnd}`,
+    );
+
+    // Offrir par-dessus un accès existant le remplace, au lieu d'accumuler des
+    // lignes concurrentes dont personne ne saurait laquelle fait foi.
+    const upgraded = await gift({ plan: "ultra", days: 90 });
+    assert.equal(upgraded.status, 200, logSink.value);
+    const afterUpgrade = await (await request(`/api/admin/users/${clientId}`, { cookie: owner.cookie })).json();
+    assert.equal(afterUpgrade.subscription.plan, "ultra");
+    assert.equal(afterUpgrade.entitlement.plan, "ultra");
+    assert.equal(afterUpgrade.entitlement.maxQrcodes, null);
+    assert.equal(countSubscriptions(databasePath, client.email), 1, "une seule ligne d'abonnement par compte");
+
+    // Un vrai abonnement Stripe reste maître : écrire par-dessus créerait un
+    // écart que le prochain webhook refermerait sans prévenir personne.
+    const subscriber = await register("abonne@example.test");
+    grantSubscription(databasePath, subscriber.email, { plan: "pro" });
+    const subscriberId = readUser(databasePath, subscriber.email).id;
+    const conflict = await request(`/api/admin/users/${subscriberId}/subscription/plan`, {
+      method: "POST",
+      cookie: owner.cookie,
+      csrf: owner.csrf,
+      body: { currentPassword: PASSWORD, reason, plan: "ultra", days: 30 },
+    });
+    assert.equal(conflict.status, 409, logSink.value);
+    assert.equal(await errorCode(conflict), "stripe_subscription_active");
+    const kept = await (await request(`/api/admin/users/${subscriberId}`, { cookie: owner.cookie })).json();
+    assert.equal(kept.subscription.plan, "pro", "l'abonnement Stripe est resté intact");
+
+    // Le compte du super-admin reste hors d'atteinte : s'attribuer une offre n'a
+    // rien à faire du rôle, qui accorde déjà Ultra sans abonnement.
+    const ownerId = readUser(databasePath, SUPER_ADMIN_EMAIL).id;
+    const onOwner = await request(`/api/admin/users/${ownerId}/subscription/plan`, {
+      method: "POST",
+      cookie: owner.cookie,
+      csrf: owner.csrf,
+      body: { currentPassword: PASSWORD, reason, plan: "pro", days: 30 },
+    });
+    assert.equal(onOwner.status, 400, logSink.value);
+    assert.equal(await errorCode(onOwner), "admin_self_action");
+    assert.equal(countSubscriptions(databasePath, SUPER_ADMIN_EMAIL), 0);
+
+    const rows = readAuditRows(databasePath, "metadata");
+    const grants = rows.filter((row) => row.action === "subscription_granted");
+    assert.equal(grants.length, 2, "les deux offres accordées, et rien d'autre");
+    assert.equal(grants[0].actor_email, SUPER_ADMIN_EMAIL);
+    assert.equal(grants[0].target_email, client.email);
+    assert.equal(grants[0].reason, reason);
+    const meta = JSON.parse(grants[1].metadata);
+    assert.equal(meta.plan, "ultra");
+    assert.equal(meta.days, 90);
+    assert.equal(meta.previousPlan, "pro");
+    assert.equal(meta.factor, "password");
+  } finally {
+    await harness.stop();
+  }
+});
 
 test("la double authentification devient la condition de chaque écriture", async () => {
   const harness = await bootBackOffice();

@@ -1696,7 +1696,7 @@ function syncSubscriptionFromStripe(subscription) {
 // Résumé destiné au client : aucun identifiant Stripe n'est exposé.
 function getSubscriptionSummary(userId) {
   const row = db.prepare(`
-    SELECT plan, status, current_period_end, cancel_at_period_end, grace_until
+    SELECT plan, status, current_period_end, cancel_at_period_end, grace_until, stripe_subscription_id
     FROM subscriptions
     WHERE user_id = ?
     ORDER BY updated_at DESC
@@ -1711,6 +1711,7 @@ function getSubscriptionSummary(userId) {
       cancelAtPeriodEnd: false,
       currentPeriodEnd: null,
       graceUntil: null,
+      manual: false,
     };
   }
   return {
@@ -1720,6 +1721,9 @@ function getSubscriptionSummary(userId) {
     cancelAtPeriodEnd: Boolean(row.cancel_at_period_end),
     currentPeriodEnd: row.current_period_end,
     graceUntil: row.grace_until,
+    // Sans identifiant d'abonnement Stripe, la ligne décrit un accès accordé par
+    // l'administration : l'afficher comme un renouvellement à venir serait faux.
+    manual: !row.stripe_subscription_id,
   };
 }
 
@@ -3374,7 +3378,6 @@ async function handleAdminApi(request, response, url) {
   if (userMatch && !userMatch[2] && request.method === "GET") {
     checkRateLimit(`admin-read:${session.userId}`, 240, 60 * 1_000);
     const target = adminTargetUser(Number(userMatch[1]));
-    const subscription = adminSubscriptionRow(target.id);
     sendJson(response, 200, {
       user: {
         id: target.id,
@@ -3385,15 +3388,10 @@ async function handleAdminApi(request, response, url) {
         isSuperAdmin: Boolean(target.is_super_admin),
         createdAt: isoDate(target.created_at),
       },
-      subscription: subscription
-        ? {
-            plan: subscription.plan,
-            status: subscription.status,
-            currentPeriodEnd: isoDate(subscription.current_period_end),
-            cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
-            graceUntil: isoDate(subscription.grace_until),
-          }
-        : null,
+      // Même résumé que sur /compte : deux Assembleurs d'abonnement divergent
+      // au premier champ oublié, et le back-office montrerait alors un accès
+      // offert comme s'il était facturé.
+      subscription: getSubscriptionSummary(target.id),
       entitlement: resolveEntitlement(target.id),
       sessionCount: db
         .prepare("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ? AND expires_at > ?")
@@ -3544,6 +3542,61 @@ async function handleAdminApi(request, response, url) {
         message: effective
           ? `Grâce prolongée jusqu'au ${isoDate(graceUntil)}.`
           : "La grâce n'a pas été prolongée : elle ne s'applique qu'à un abonnement résilié ou en pause.",
+      });
+      return;
+    }
+
+    if (action === "/subscription/plan") {
+      const plan = typeof body.plan === "string" ? body.plan : "";
+      if (!PLAN_CATALOG[plan]) {
+        throw new HttpError(400, "Choisis une offre existante.", "invalid_plan");
+      }
+      const days = body.days === undefined ? 365 : Number(body.days);
+      if (!Number.isInteger(days) || days < 1 || days > 3650) {
+        throw new HttpError(400, "Indique une durée en jours entre 1 et 3650.", "invalid_days");
+      }
+      const subscription = adminSubscriptionRow(target.id);
+      // Un abonnement réel reste maître : sans cette refus, l'offre écrite ici
+      // serait écrasée par le prochain webhook, et l'écart passerait inaperçu.
+      if (subscription?.stripe_subscription_id) {
+        throw new HttpError(
+          409,
+          "Ce compte a un abonnement Stripe actif : résilie-le d'abord, sinon Stripe réécrira l'offre.",
+          "stripe_subscription_active",
+        );
+      }
+      const timestamp = now();
+      const periodEnd = timestamp + days * 24 * 60 * 60 * 1_000;
+      // Aucun identifiant Stripe : la ligne décrit un accès accordé par
+      // l'administration, pas un paiement. `cancel_at_period_end` garantit
+      // qu'il s'éteint seul, sans facturation ni action de nettoyage.
+      if (subscription) {
+        db.prepare(`
+          UPDATE subscriptions
+          SET plan = ?, status = 'active', current_period_end = ?, cancel_at_period_end = 1,
+              grace_until = NULL, updated_at = ?
+          WHERE user_id = ?
+        `).run(plan, periodEnd, timestamp, target.id);
+      } else {
+        db.prepare(`
+          INSERT INTO subscriptions (
+            user_id, plan, status, stripe_customer_id, stripe_subscription_id, stripe_price_id,
+            current_period_end, cancel_at_period_end, grace_until, created_at, updated_at
+          ) VALUES (?, ?, 'active', '', NULL, '', ?, 1, NULL, ?, ?)
+        `).run(target.id, plan, periodEnd, timestamp, timestamp);
+      }
+      audit("subscription_granted", target, {
+        factor,
+        plan,
+        days,
+        currentPeriodEnd: isoDate(periodEnd),
+        previousPlan: subscription?.plan || null,
+      });
+      sendJson(response, 200, {
+        ok: true,
+        plan,
+        currentPeriodEnd: isoDate(periodEnd),
+        message: `Accès ${PLAN_CATALOG[plan].label} offert jusqu'au ${isoDate(periodEnd)}, sans facturation.`,
       });
       return;
     }

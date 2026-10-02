@@ -186,6 +186,7 @@ Conséquences assumées :
 - **Ultra sans abonnement.** Le super-admin dispose de l'offre Ultra de droit ; son quota est illimité sans passer par Stripe. `/compte` affiche cette origine explicitement, pour ne pas laisser croire à un abonnement payant.
 - **Protection symétrique.** Un compte super-admin n'accepte aucune intervention depuis le back-office, pas même la sienne : ses QR codes et ses statistiques passent par les mêmes endpoints que les autres, et sont refusés. La page annonce la règle et retire les boutons au lieu de renvoyer une erreur après coup.
 - **Écritures justifiées et journalisées.** Toute intervention exige un rôle, un jeton CSRF, une raison d'au moins 8 caractères, et le journal (`admin_actions`) est écrit avant la réponse : une intervention non journalisée n'a pas eu lieu. Le journal survit à la suppression du compte visé.
+- **Offrir une offre.** L'action « Offrir une offre » écrit l'offre choisie (Découverte, Pro ou Ultra) et sa durée directement en base, sans passer par Stripe et sans rien facturer. Elle est refusée sur un compte qui a un abonnement Stripe actif : Stripe est alors maître, et l'offre écrite ici serait écrasée au prochain webhook sans que personne ne soit prévenu. L'accès offert s'éteint seul à sa date d'expiration (`cancel_at_period_end`), et `/compte` l'affiche comme « Offert, aucun abonnement » plutôt que comme un renouvellement.
 - **Aucune donnée personnelle exposée.** Les listes et les détails renvoient l'identifiant, le pseudo et les compteurs d'activité ; ni secret de QR code, ni adresse e-mail complète, ni destination privée.
 
 ### Double authentification du rôle
@@ -247,6 +248,7 @@ Le back-office est couvert par `test/admin.test.mjs` (huit scénarios sur un ser
 - l'absence de secret et de donnée personnelle dans les listes et les détails ;
 - le refus des écritures sans rôle, sans jeton CSRF, sans raison ou visant un compte super-admin ;
 - l'application effective des actions, avec un journal qui survit à la suppression du compte visé ;
+- l'offre offerte : refus des offres inexistantes et des durées hors bornes, échéance conforme à la durée demandée, remplacement d'un accès précédent sans accumuler de lignes, refus sur un compte porteur d'un abonnement Stripe, et mention au journal de l'offre, de la durée et de l'offre précédente ;
 - la double authentification : repli par mot de passe, activation par code confirmé, rejet d'un code rejoué, code de récupération à usage unique, et mention du facteur utilisé au journal.
 
 ## Passage en production

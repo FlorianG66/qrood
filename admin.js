@@ -201,6 +201,20 @@
     return span;
   }
 
+  const PLAN_LABELS = { decouverte: "Découverte", pro: "Pro", ultra: "Ultra" };
+
+  function planLabel(key) {
+    return PLAN_LABELS[key] || key;
+  }
+
+  // Une ligne sans identifiant Stripe n'est pas un abonnement payé : la nommer
+  // comme tel éviterait de chercher une résiliation qui n'existe pas.
+  function subscriptionLabel(subscription) {
+    if (!subscription?.status) return "aucun";
+    if (subscription.manual) return `offert (${planLabel(subscription.plan)}) · ${subscription.status}`;
+    return `${subscription.status}${subscription.cancelAtPeriodEnd ? " · fin programmée" : ""}`;
+  }
+
   async function selectUser(userId) {
     state.selected = { id: userId };
     renderUsers();
@@ -227,7 +241,7 @@
       fact("Inscrit le", formatDate(user.createdAt)),
       fact("Rôle", user.isSuperAdmin ? "super-admin (Ultra de droit)" : "utilisateur"),
       fact("Offre effective", `${entitlement.plan} (${entitlement.used}/${entitlement.maxQrcodes ?? "∞"} QR, ${entitlement.usedActive}/${entitlement.maxActive ?? "∞"} actifs)`),
-      fact("Abonnement", subscription?.status ? `${subscription.status}${subscription.cancelAtPeriodEnd ? " · fin programmée" : ""}` : "aucun"),
+      fact("Abonnement", subscriptionLabel(subscription)),
       fact("Échéance", formatDate(subscription?.currentPeriodEnd)),
       fact("Grâce jusqu'au", formatDate(subscription?.graceUntil)),
       fact("Sessions ouvertes", String(detail.sessionCount)),
@@ -313,6 +327,16 @@
       title: "Fermer les sessions",
       description: "Déconnecte le compte partout, y compris les navigateurs qui n'ont pas encore expiré.",
       fields: [],
+    },
+    {
+      id: "subscription/plan",
+      label: "Offrir une offre",
+      title: "Offrir une offre",
+      description: "Écrit l'offre en base, sans passer par Stripe et sans facturation. Un abonnement Stripe actif doit être résilié d'abord, sinon Stripe réécrirait l'offre.",
+      fields: [
+        { name: "plan", label: "Offre", type: "select", options: ["decouverte", "pro", "ultra"], defaultValue: "pro", required: true },
+        { name: "days", label: "Durée en jours", type: "number", value: "365", required: true },
+      ],
     },
     {
       id: "subscription/cancel",
@@ -408,6 +432,15 @@
       input = document.createElement("input");
       input.type = "checkbox";
       if (field.defaultChecked) input.checked = true;
+    } else if (field.type === "select") {
+      input = document.createElement("select");
+      for (const value of field.options) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = planLabel(value);
+        input.append(option);
+      }
+      input.value = field.defaultValue || field.options[0];
     } else {
       input = document.createElement("input");
       input.type = field.type;
@@ -476,6 +509,9 @@
     }
     if (action.id === "sessions/revoke") {
       return `${result?.count ?? 0} session(s) fermée(s).`;
+    }
+    if (action.id === "subscription/plan" && result?.message) {
+      return result.message;
     }
     return "Intervention enregistrée.";
   }

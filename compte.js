@@ -90,8 +90,10 @@
     elements.planName = $("#planName");
     elements.planStatus = $("#planStatus");
     elements.planRenewal = $("#planRenewal");
+    elements.planRenewalLabel = $("#planRenewalLabel");
     elements.planHint = $("#planHint");
     elements.exportButton = $("#exportButton");
+    elements.backOfficeLink = $("#backOfficeLink");
     elements.toast = $("#toast");
     elements.toastMessage = $("#toastMessage");
   }
@@ -167,15 +169,19 @@
       ? "Adresse confirmée."
       : "Adresse non confirmée : la création de QR codes reste bloquée tant que tu ne l'as pas confirmée.";
 
+    // Le lien n'apparaît que pour le rôle concerné : l'afficher à tous
+    // emperors d'arriver sur une page qui refuse l'accès n'aide personne.
+    elements.backOfficeLink.hidden = !state.user.isSuperAdmin;
+
     showPendingEmail(state.user.pendingEmail);
     renderPlan();
   }
 
   // L'offre nommée ici est l'offre effective, celle qui décide des quotas, et non
-// celle stockée dans `subscriptions` : le rôle super-admin accorde Ultra sans
-// qu'aucun abonnement existe, et afficher « Découverte » sous des quotas
-// illimités serait un mensonge de la page.
-function renderPlan() {
+  // celle stockée dans `subscriptions` : le rôle super-admin accorde Ultra sans
+  // qu'aucun abonnement existe, et afficher « Découverte » sous des quotas
+  // illimités serait un mensonge de la page.
+  function renderPlan() {
     const summary = state.subscription;
     const entitlement = state.entitlement;
     const roleGrantsPlan = Boolean(state.user.isSuperAdmin) && entitlement?.plan === "ultra";
@@ -183,17 +189,23 @@ function renderPlan() {
       elements.planName.textContent = "—";
       elements.planStatus.textContent = "—";
       elements.planRenewal.textContent = "—";
+      elements.planRenewalLabel.textContent = "Renouvellement";
       elements.planHint.textContent = "";
       return;
     }
     elements.planName.textContent = entitlement?.label || planLabelFor(entitlement?.plan);
     elements.planStatus.textContent = roleGrantsPlan
       ? "Avantage de rôle, aucun abonnement"
-      : summary.status || "Aucun abonnement actif";
+      : summary?.manual
+        ? "Offert, aucun abonnement"
+        : summary.status || "Aucun abonnement actif";
     elements.planRenewal.textContent = summary?.currentPeriodEnd
       ? new Date(summary.currentPeriodEnd).toLocaleDateString("fr-FR")
       : "—";
-    elements.planHint.textContent = summary?.cancelAtPeriodEnd
+    elements.planRenewalLabel.textContent = summary?.manual ? "Jusqu'au" : "Renouvellement";
+    elements.planHint.textContent = summary?.manual
+      ? "Cet accès a été accordé par l'administration : il ne sera pas renouvelé et rien ne sera facturé."
+      : summary?.cancelAtPeriodEnd
       ? "Ton abonnement se termine à cette date et ne sera pas renouvelé."
       : roleGrantsPlan
         ? "Ton rôle super-admin accorde l'offre Ultra : elle s'applique sans abonnement et sans facturation."

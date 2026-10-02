@@ -25,6 +25,7 @@
           <span class="brand-name">QROOD<span class="brand-dot">.</span></span>
         </a>
         <nav class="account-nav" aria-label="Navigation du compte">
+          <a class="nav-link" id="backOfficeLink" href="/back-office" hidden>Back-office</a>
           <a class="nav-link" href="/">Retour à l'atelier</a>
           <button class="button button-dark button-small" id="logoutButton" type="button">Se déconnecter</button>
         </nav>
@@ -99,7 +100,7 @@
           <dl class="account-facts" id="planFacts">
             <div><dt>Offre</dt><dd id="planName">—</dd></div>
             <div><dt>Statut</dt><dd id="planStatus">—</dd></div>
-            <div><dt>Renouvellement</dt><dd id="planRenewal">—</dd></div>
+            <div><dt id="planRenewalLabel">Renouvellement</dt><dd id="planRenewal">—</dd></div>
           </dl>
           <button class="button button-light button-small" id="portalButton" type="button">Gérer mon abonnement</button>
           <p class="field-hint" id="planHint"></p>
