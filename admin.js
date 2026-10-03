@@ -208,10 +208,15 @@
   }
 
   // Une ligne sans identifiant Stripe n'est pas un abonnement payé : la nommer
-  // comme tel éviterait de chercher une résiliation qui n'existe pas.
+  // comme tel éviterait de chercher une résiliation qui n'existe pas. Elle précise
+  // en plus si elle se prolonge seule, car c'est ce qui distingue une offre durable
+  // d'une échéance qui approached.
   function subscriptionLabel(subscription) {
     if (!subscription?.status) return "aucun";
-    if (subscription.manual) return `offert (${planLabel(subscription.plan)}) · ${subscription.status}`;
+    if (subscription.manual) {
+      const suite = subscription.autoRenew ? " · renouvelée chaque année" : " · fin à l'échéance";
+      return `offert (${planLabel(subscription.plan)}) · ${subscription.status}${suite}`;
+    }
     return `${subscription.status}${subscription.cancelAtPeriodEnd ? " · fin programmée" : ""}`;
   }
 

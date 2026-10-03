@@ -204,7 +204,9 @@
       : "—";
     elements.planRenewalLabel.textContent = summary?.manual ? "Jusqu'au" : "Renouvellement";
     elements.planHint.textContent = summary?.manual
-      ? "Cet accès a été accordé par l'administration : il ne sera pas renouvelé et rien ne sera facturé."
+      ? summary.autoRenew
+        ? "Cet accès a été accordé par l'administration : il est renouvelé d'un an automatiquement, et rien n'est facturé."
+        : "Cet accès a été accordé par l'administration : il s'arrête à cette date, et rien n'est facturé."
       : summary?.cancelAtPeriodEnd
       ? "Ton abonnement se termine à cette date et ne sera pas renouvelé."
       : roleGrantsPlan

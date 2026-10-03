@@ -1462,13 +1462,55 @@ function effectivePlanKey(row, timestamp) {
 
 function resolvePlanKey(userId) {
   const row = db.prepare(`
-    SELECT u.is_super_admin, s.plan, s.status, s.grace_until
+    SELECT u.is_super_admin, s.id AS subscription_id, s.plan, s.status, s.grace_until,
+           s.current_period_end, s.stripe_subscription_id, s.cancel_at_period_end
       FROM users u
       LEFT JOIN subscriptions s ON s.user_id = u.id
      WHERE u.id = ?
   `).get(userId);
   if (!row) return DEFAULT_PLAN;
-  return effectivePlanKey(row, now());
+  const timestamp = now();
+  renewManualOffer(row, timestamp);
+  return effectivePlanKey(row, timestamp);
+}
+
+// Durée d'une période offerte. Le même nombre sert à la première attribution et
+// à chaque renouvellement : c'est lui qui définit ce que « un an » veut dire.
+const MANUAL_OFFER_PERIOD_MS = 365 * 24 * 60 * 60 * 1_000;
+
+// Renouvellement paresseux d'une offre accordée par l'administration : au premier
+// accès constatant l'échéance, la période est repoussée d'un an plutôt que de
+// laisser l'utilisateur retomber sur Découverte. Aucun cron n'est nécessaire —
+// une tâche de fond qui n'a pas tourné laisserait l'accès tomber sans raison, et
+// le comportement serait différent selon le jour de la semaine.
+//
+// La prolongation part de l'instant présent et non de l'échéance dépassée : après
+// deux ans sans connexion, repartir de l'échéance recalculerait une date toujours
+// dépassée, et l'utilisateur ne comprendrait pas pourquoi son accès saute.
+//
+// La ligne visée est identifiée par `id` et non par `user_id` : un compte peut
+// conserver plusieurs lignes d'abonnement terminées dans son historique, et les
+// toucher toutes reviendrait à ressusciter des abonnements que Stripe a clos.
+function renewManualOffer(row, timestamp) {
+  if (!row || row.is_super_admin) return;
+  if (row.stripe_subscription_id) return;
+  if (row.status !== "active" && row.status !== "trialing") return;
+  // `cancel_at_period_end` à 1 signifie que l'offre s'éteint à l'échéance : c'est
+  // le geste explicite de retrait, et il prime sur le renouvellement.
+  if (row.cancel_at_period_end) return;
+  if (!row.current_period_end) return;
+  if (row.current_period_end > timestamp) return;
+
+  // La ligne est visée par `id` : voir la note sur l'historique plus haut.
+  const periodEnd = timestamp + MANUAL_OFFER_PERIOD_MS;
+  db.prepare(`
+    UPDATE subscriptions SET current_period_end = ?, updated_at = ? WHERE id = ?
+  `).run(periodEnd, timestamp, row.subscription_id);
+  row.current_period_end = periodEnd;
+  // Aucun écrit dans `admin_actions` : ce tableau journalise des décisions
+  // humaines avec un motif et un auteur, alors que ce renouvellement est une
+  // règle du système. La trace est `updated_at`, que la fiche du back-office
+  // affiche déjà.
 }
 
 // `grace_until` porte la grâce de 48 h décidée en cas de perte d'accès : elle se
@@ -1476,7 +1518,14 @@ function resolvePlanKey(userId) {
 // enregistrée ne peuvent pas diverger.
 function isEntitled(row, timestamp) {
   if (!row) return false;
-  if (row.status === "active" || row.status === "trialing") return true;
+  const stripeSubId = row.stripe_subscription_id;
+  const isManual = !stripeSubId || stripeSubId === "";
+  if (row.status === "active" || row.status === "trialing") {
+    if (isManual && row.current_period_end) {
+      return row.current_period_end > timestamp;
+    }
+    return true;
+  }
   // `past_due` et `unpaid` restent couverts : les relances de Stripe sont en cours
   // et l'utilisateur n'a rien fait de mal.
   if (row.status === "past_due" || row.status === "unpaid") return true;
@@ -1696,10 +1745,11 @@ function syncSubscriptionFromStripe(subscription) {
 // Résumé destiné au client : aucun identifiant Stripe n'est exposé.
 function getSubscriptionSummary(userId) {
   const row = db.prepare(`
-    SELECT plan, status, current_period_end, cancel_at_period_end, grace_until, stripe_subscription_id
+    SELECT id AS subscription_id, plan, status, current_period_end, cancel_at_period_end,
+           grace_until, stripe_subscription_id
     FROM subscriptions
     WHERE user_id = ?
-    ORDER BY updated_at DESC
+    ORDER BY (status NOT IN ('canceled', 'incomplete_expired')) DESC, updated_at DESC
     LIMIT 1
   `).get(userId);
   const customer = db.prepare("SELECT 1 AS ok FROM billing_customers WHERE user_id = ?").get(userId);
@@ -1712,8 +1762,13 @@ function getSubscriptionSummary(userId) {
       currentPeriodEnd: null,
       graceUntil: null,
       manual: false,
+      autoRenew: false,
     };
   }
+  // Le résumé est affiché avant toute résolution d'offre sur certains écrans : sans
+  // ce renouvellement, la date affichée resterait celle d'une période dépassée alors
+  // que l'accès est renouvelé, et l'interface annoncerait un accès échu.
+  renewManualOffer(row, now());
   return {
     hasBillingAccount: Boolean(customer),
     plan: row.plan,
@@ -1724,6 +1779,9 @@ function getSubscriptionSummary(userId) {
     // Sans identifiant d'abonnement Stripe, la ligne décrit un accès accordé par
     // l'administration : l'afficher comme un renouvellement à venir serait faux.
     manual: !row.stripe_subscription_id,
+    // Seule une offre manuelle sans arrêt programmé se prolonge d'elle-même. Un
+    // abonnement Stripe suit le cycle de Stripe, et le rôle prime sur tout.
+    autoRenew: !row.stripe_subscription_id && !row.cancel_at_period_end,
   };
 }
 
@@ -2987,9 +3045,20 @@ function listAdminUsers(search, limit, offset) {
            (SELECT COUNT(*) FROM qrcodes q WHERE q.user_id = u.id) AS qrcode_count,
            (SELECT COUNT(*) FROM qrcodes q WHERE q.user_id = u.id AND q.is_active = 1) AS active_count,
            (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > ${timestamp}) AS session_count,
-           (SELECT plan FROM subscriptions WHERE user_id = u.id ORDER BY updated_at DESC LIMIT 1) AS plan,
-           (SELECT status FROM subscriptions WHERE user_id = u.id ORDER BY updated_at DESC LIMIT 1) AS status,
-           (SELECT grace_until FROM subscriptions WHERE user_id = u.id ORDER BY updated_at DESC LIMIT 1) AS grace_until
+           (SELECT id FROM subscriptions WHERE user_id = u.id
+             ORDER BY (status NOT IN ('canceled','incomplete_expired')) DESC, updated_at DESC LIMIT 1) AS subscription_id,
+           (SELECT plan FROM subscriptions WHERE user_id = u.id
+             ORDER BY (status NOT IN ('canceled','incomplete_expired')) DESC, updated_at DESC LIMIT 1) AS plan,
+           (SELECT status FROM subscriptions WHERE user_id = u.id
+             ORDER BY (status NOT IN ('canceled','incomplete_expired')) DESC, updated_at DESC LIMIT 1) AS status,
+           (SELECT grace_until FROM subscriptions WHERE user_id = u.id
+             ORDER BY (status NOT IN ('canceled','incomplete_expired')) DESC, updated_at DESC LIMIT 1) AS grace_until,
+           (SELECT current_period_end FROM subscriptions WHERE user_id = u.id
+             ORDER BY (status NOT IN ('canceled','incomplete_expired')) DESC, updated_at DESC LIMIT 1) AS current_period_end,
+           (SELECT cancel_at_period_end FROM subscriptions WHERE user_id = u.id
+             ORDER BY (status NOT IN ('canceled','incomplete_expired')) DESC, updated_at DESC LIMIT 1) AS cancel_at_period_end,
+           (SELECT stripe_subscription_id FROM subscriptions WHERE user_id = u.id
+             ORDER BY (status NOT IN ('canceled','incomplete_expired')) DESC, updated_at DESC LIMIT 1) AS stripe_subscription_id
     FROM users u
     ${where}
     ORDER BY u.id DESC
@@ -3205,11 +3274,18 @@ function consumeRecoveryCode(userId, record, code) {
   return true;
 }
 
+// La ligne courante est la seule ligne non terminale — l'index unique
+// `idx_subscriptions_live_user` le garantit. Trier seulement par `updated_at`
+// laisserait une ligne d'historique récemment touchée passer devant elle : un
+// webhook Stripe arrivé en retard après une résiliation suffit à faire displaysse
+// l'ancien abonnement résilié au lieu de l'accès en cours.
 function adminSubscriptionRow(userId) {
   return db.prepare(`
-    SELECT plan, status, current_period_end, cancel_at_period_end, grace_until, stripe_subscription_id
+    SELECT id, plan, status, current_period_end, cancel_at_period_end, grace_until,
+           stripe_subscription_id
     FROM subscriptions WHERE user_id = ?
-    ORDER BY updated_at DESC LIMIT 1
+    ORDER BY (status NOT IN ('canceled', 'incomplete_expired')) DESC, updated_at DESC
+    LIMIT 1
   `).get(userId) || null;
 }
 
@@ -3223,20 +3299,27 @@ async function handleAdminApi(request, response, url) {
     const { limit, offset } = parsePagination(url);
     const search = cleanText(url.searchParams.get("search") || "", 120);
     const { rows, total } = listAdminUsers(search, limit, offset);
+    const timestamp = now();
     sendJson(response, 200, {
-      users: rows.map((row) => ({
-        id: row.id,
-        displayName: row.display_name,
-        email: row.email,
-        emailVerified: Boolean(row.email_verified_at),
-        isSuperAdmin: Boolean(row.is_super_admin),
-        createdAt: isoDate(row.created_at),
-        qrcodeCount: row.qrcode_count,
-        activeCount: row.active_count,
-        sessionCount: row.session_count,
-        plan: effectivePlanKey(row, now()),
-        status: row.status || null,
-      })),
+      users: rows.map((row) => {
+        // Le renouvellement est appliqué ici aussi : sans lui, la liste afficherait
+        // une offre retombée sur Découverte alors que la fiche du même compte
+        // afficherait l'accès renouvelé, et l'écran se contredirait lui-même.
+        renewManualOffer(row, timestamp);
+        return {
+          id: row.id,
+          displayName: row.display_name,
+          email: row.email,
+          emailVerified: Boolean(row.email_verified_at),
+          isSuperAdmin: Boolean(row.is_super_admin),
+          createdAt: isoDate(row.created_at),
+          qrcodeCount: row.qrcode_count,
+          activeCount: row.active_count,
+          sessionCount: row.session_count,
+          plan: effectivePlanKey(row, timestamp),
+          status: row.status || null,
+        };
+      }),
       total,
       limit,
       offset,
@@ -3568,21 +3651,25 @@ async function handleAdminApi(request, response, url) {
       const timestamp = now();
       const periodEnd = timestamp + days * 24 * 60 * 60 * 1_000;
       // Aucun identifiant Stripe : la ligne décrit un accès accordé par
-      // l'administration, pas un paiement. `cancel_at_period_end` garantit
-      // qu'il s'éteint seul, sans facturation ni action de nettoyage.
+      // l'administration, pas un paiement. `cancel_at_period_end` reste à 0, ce
+      // qui autorise `renewManualOffer` à prolonger la période d'un an à chaque
+      // échéance, sans facturation ni action de nettoyage.
       if (subscription) {
+        // La ligne est visée par `id` : un compte peut conserver plusieurs lignes
+        // d'abonnement terminées, et les réécrire toutes ressusciterait des
+        // abonnements que Stripe a clos.
         db.prepare(`
           UPDATE subscriptions
-          SET plan = ?, status = 'active', current_period_end = ?, cancel_at_period_end = 1,
+          SET plan = ?, status = 'active', current_period_end = ?, cancel_at_period_end = 0,
               grace_until = NULL, updated_at = ?
-          WHERE user_id = ?
-        `).run(plan, periodEnd, timestamp, target.id);
+          WHERE id = ?
+        `).run(plan, periodEnd, timestamp, subscription.id);
       } else {
         db.prepare(`
           INSERT INTO subscriptions (
             user_id, plan, status, stripe_customer_id, stripe_subscription_id, stripe_price_id,
             current_period_end, cancel_at_period_end, grace_until, created_at, updated_at
-          ) VALUES (?, ?, 'active', '', NULL, '', ?, 1, NULL, ?, ?)
+          ) VALUES (?, ?, 'active', '', NULL, '', ?, 0, NULL, ?, ?)
         `).run(target.id, plan, periodEnd, timestamp, timestamp);
       }
       audit("subscription_granted", target, {
@@ -3591,12 +3678,16 @@ async function handleAdminApi(request, response, url) {
         days,
         currentPeriodEnd: isoDate(periodEnd),
         previousPlan: subscription?.plan || null,
+        autoRenew: true,
       });
       sendJson(response, 200, {
         ok: true,
         plan,
         currentPeriodEnd: isoDate(periodEnd),
-        message: `Accès ${PLAN_CATALOG[plan].label} offert jusqu'au ${isoDate(periodEnd)}, sans facturation.`,
+        autoRenew: true,
+        message:
+          `Accès ${PLAN_CATALOG[plan].label} offert jusqu'au ${isoDate(periodEnd)}, ` +
+          `renouvelé automatiquement d'un an, sans facturation.`,
       });
       return;
     }

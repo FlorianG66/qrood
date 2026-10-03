@@ -2,7 +2,7 @@
 
 Sujet de suivi du projet QROOD. Format lisible par l'extension **Todo Tree** (VS Code) : `- [ ]` à faire, `- [x] livré.
 
-Dernière mise à jour : 2 octobre 2026.
+Dernière mise à jour : 3 octobre 2026.
 
 ---
 
@@ -43,8 +43,8 @@ Si un point se reproduit, le diagnostic se fait dans le navigateur : `jsdom` et 
 
 ## Risques connus
 
-- [ ] **Expiration des offres offertes** — `isEntitled()` (`server.mjs:1479`) renvoie `true` pour tout abonnement `active` sans lire `current_period_end`. Une offre offerte à durée fixe peut rester active au-delà de sa date de fin : le statut est écrit une fois et aucun webhook Stripe ne le changera, l'écriture étant manuelle. L'interface annonce pourtant « Jusqu'au ». À corriger avant de vendre ce mécanisme.
-- [ ] **Offre offerte et historique** — l'écriture d'offre cible `WHERE user_id = ?` sans restreindre à la ligne courante : plusieurs lignes d'abonnement terminées pour un même compte seraient toutes modifiées. Le test ne couvre qu'un compte à une seule ligne.
+- [x] **Expiration des offres offertes** — corrigé : `isEntitled()` (`server.mjs`) exige maintenant `current_period_end` pour une offre manuelle, et `renewManualOffer()` repousse la période d'un an au premier accès constatant l'échéance. Renouvellement paresseux, sans cron : le comportement ne dépend pas du jour de la semaine. La ligne courante est ciblée par `id`.
+- [x] **Offre offerte et historique** — l'écriture cible `WHERE id = ?`, plus toutes les lectures de la ligne courante. Le tri est passé à « non terminale d'abord » : un webhook Stripe tardif après une résiliation faisait passer l'ancien abonnement résilié devant l'accès en cours. Test ajouté sur un compte à deux lignes.
 - [ ] **Parallélisme du rafraîchissement** — après une intervention, liste, journal et fiche se rechargent en parallèle sans jeton de requête. Non observé ; sérialiser ralentirait l'interface.
 - [ ] **Avertissement `buildx`** — `deploy.sh` déclenche un avertissement Docker (`Bake` configuré sans `buildx`). Le build passe par le driver par défaut, sans conséquence observée.
 
@@ -88,6 +88,16 @@ Si un point se reproduit, le diagnostic se fait dans le navigateur : `jsdom` et 
 - [x] `refreshAfterAction()` remet liste, fiche et journal à jour ; sélection vidée et fiche refermée après suppression
 - [x] `selectUser()` accepte un mode silencieux : plus de défilement automatique hors clic
 - [x] Messages distincts pour suppression, réinitialisation et confirmation d'adresse
+
+### Offre offerte, échéance et renouvellement — courant
+
+- [x] `renewManualOffer()` : une offre manuelle échue est repoussée d'un an à partir de l'instant présent, jamais du reliquat de période dépassée
+- [x] `cancel_at_period_end` à 0 sur l'offre accordée : il autorise le renouvellement, et reste le geste explicite de retrait quand il passe à 1
+- [x] Un abonnement Stripe n'est jamais renouvelé par cette règle : son cycle appartient à Stripe
+- [x] Super-admin prioritaire, avant toute logique d'abonnement
+- [x] Renouvellement appliqué à la page du compte, à la fiche et à la liste du back-office, pour que les écrans ne se contredisent pas
+- [x] `autoRenew` exposé dans le résumé, affiché sur `/compte` et dans la fiche du back-office
+- [x] Aucun écrit dans `admin_actions` : le journal reste réservé aux décisions humaines
 
 ### Divers — commits antérieurs
 

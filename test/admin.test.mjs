@@ -205,6 +205,80 @@ function countSubscriptions(databasePath, email) {
   }
 }
 
+// Recule l'échéance d'une ligne d'abonnement : le temps n'est pas injectable depuis
+// les tests, alors on déplace la date que le serveur va lire.
+function expireSubscription(databasePath, email, { days = 1, cancelAtPeriodEnd = null } = {}) {
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec("PRAGMA busy_timeout = 5000;");
+    const user = database.prepare("SELECT id FROM users WHERE email = ?").get(email);
+    const past = Date.now() - days * 24 * 3_600 * 1_000;
+    // L'ordre suit l'ordre des `?` de la requête : échéance, puis arrêt éventuel.
+    const stop = cancelAtPeriodEnd === null ? "" : ", cancel_at_period_end = ?";
+    const params = cancelAtPeriodEnd === null ? [past, user.id] : [past, cancelAtPeriodEnd ? 1 : 0, user.id];
+    database
+      .prepare(`
+        UPDATE subscriptions SET current_period_end = ?${stop} WHERE user_id = ?
+      `)
+      .run(...params);
+  } finally {
+    database.close();
+  }
+}
+
+// Ajoute une ligne d'abonnement terminée, comme en laisse une résiliation Stripe.
+// L'index unique n'interdit qu'une seule ligne non terminale par compte : un
+// historique de lignes terminées est donc possible et normal.
+function addTerminalSubscription(databasePath, email, { plan = "pro", periodEnd = null } = {}) {
+  const database = new DatabaseSync(databasePath);
+  try {
+    database.exec("PRAGMA busy_timeout = 5000;");
+    const user = database.prepare("SELECT id FROM users WHERE email = ?").get(email);
+    const timestamp = Date.now();
+    database.prepare(`
+      INSERT INTO subscriptions (
+        user_id, plan, status, stripe_customer_id, stripe_subscription_id, stripe_price_id,
+        current_period_end, cancel_at_period_end, grace_until, created_at, updated_at
+      ) VALUES (?, ?, 'canceled', ?, ?, ?, ?, 1, NULL, ?, ?)
+    `).run(
+      user.id,
+      plan,
+      `cus_historique_${user.id}`,
+      `sub_historique_${user.id}_${timestamp}`,
+      `price_historique_${plan}`,
+      periodEnd ?? timestamp - 30 * 24 * 3_600 * 1_000,
+      timestamp,
+      timestamp,
+    );
+  } finally {
+    database.close();
+  }
+}
+
+function readPlans(databasePath, email) {
+  const database = new DatabaseSync(databasePath);
+  try {
+    return database
+      .prepare("SELECT plan, status FROM subscriptions WHERE user_id = (SELECT id FROM users WHERE email = ?)")
+      .all(email);
+  } finally {
+    database.close();
+  }
+}
+
+function readPeriodEnd(databasePath, email) {
+  const database = new DatabaseSync(databasePath);
+  try {
+    return database.prepare(
+      `SELECT current_period_end FROM subscriptions
+        WHERE user_id = (SELECT id FROM users WHERE email = ?)
+        ORDER BY (status NOT IN ('canceled','incomplete_expired')) DESC, updated_at DESC LIMIT 1`,
+    ).get(email).current_period_end;
+  } finally {
+    database.close();
+  }
+}
+
 function countSessions(databasePath, email) {
   const database = new DatabaseSync(databasePath);
   try {
@@ -955,7 +1029,12 @@ test("l'administration peut offrir une offre, et seulement à un compte sans abo
     assert.equal(after.subscription.plan, "pro");
     assert.equal(after.subscription.status, "active");
     assert.equal(after.subscription.manual, true, "sans identifiant Stripe, l'offre n'est pas un abonnement");
-    assert.equal(after.subscription.cancelAtPeriodEnd, true, "elle s'éteint seule, sans renouvellement");
+    assert.equal(
+      after.subscription.cancelAtPeriodEnd,
+      false,
+      "elle se renouvelle d'un an à chaque échéance, ce qui exige de ne pas demander son arrêt",
+    );
+    assert.equal(after.subscription.autoRenew, true, "l'offre manuelle se prolonge toute seule");
     assert.equal(after.entitlement.plan, "pro");
     assert.equal(after.entitlement.maxQrcodes, 25);
 
@@ -975,6 +1054,46 @@ test("l'administration peut offrir une offre, et seulement à un compte sans abo
     assert.equal(afterUpgrade.entitlement.plan, "ultra");
     assert.equal(afterUpgrade.entitlement.maxQrcodes, null);
     assert.equal(countSubscriptions(databasePath, client.email), 1, "une seule ligne d'abonnement par compte");
+
+    // Une échéance dépassée ne doit pas faire tomber l'accès : l'offre est
+    // renouvelée d'un an au premier accès qui la constate, et c'est bien une année
+    // entière à partir de maintenant, pas le reliquat de la période dépassée.
+    expireSubscription(databasePath, client.email, { days: 1 });
+    const renewedAt = Date.now();
+    const renewed = await (await request(`/api/admin/users/${clientId}`, { cookie: owner.cookie })).json();
+    assert.equal(renewed.entitlement.plan, "ultra", "l'offre survit à son échéance");
+    assert.equal(renewed.subscription.autoRenew, true);
+    const renewedEnd = new Date(renewed.subscription.currentPeriodEnd).getTime();
+    const oneYear = 365 * 24 * 3_600 * 1_000;
+    assert.ok(
+      renewedEnd > renewedAt + oneYear - 60_000 && renewedEnd <= renewedAt + oneYear + 60_000,
+      `le renouvellement doit porter un an depuis maintenant : ${renewed.subscription.currentPeriodEnd}`,
+    );
+
+    // Un compte peut garder des lignes terminées d'anciens abonnements : l'offre
+    // écrite ici ne doit toucher que la ligne courante, sinon elle ressusciterait
+    // des abonnements que Stripe a clos.
+    addTerminalSubscription(databasePath, client.email, { plan: "pro" });
+    assert.equal(countSubscriptions(databasePath, client.email), 2, "l'historique est bien conservé");
+    const regrant = await gift({ plan: "pro", days: 30 });
+    assert.equal(regrant.status, 200, logSink.value);
+    const afterRegrant = await (await request(`/api/admin/users/${clientId}`, { cookie: owner.cookie })).json();
+    assert.equal(afterRegrant.subscription.plan, "pro");
+    const historical = readPlans(databasePath, client.email).filter((row) => row.status === "canceled");
+    assert.equal(historical.length, 1, "la ligne terminée n'a pas été réécrite");
+    assert.equal(historical[0].plan, "pro", "elle garde l'offre qu'elle portait, pas celle du dessus");
+
+    // Un arrêt demandé prime sur le renouvellement : c'est le geste explicite de
+    // retrait, et il doit survivre au passage du temps.
+    expireSubscription(databasePath, client.email, { days: 1, cancelAtPeriodEnd: true });
+    const stopped = await (await request(`/api/admin/users/${clientId}`, { cookie: owner.cookie })).json();
+    assert.equal(stopped.entitlement.plan, "decouverte", "une offre arrêtée retombe sur Découverte");
+    assert.equal(stopped.subscription.autoRenew, false);
+    const stillStopped = readPeriodEnd(databasePath, client.email);
+    assert.ok(
+      stillStopped < Date.now(),
+      "l'échéance dépassée n'est pas repoussée quand l'arrêt est demandé",
+    );
 
     // Un vrai abonnement Stripe reste maître : écrire par-dessus créerait un
     // écart que le prochain webhook refermerait sans prévenir personne.
@@ -1007,15 +1126,26 @@ test("l'administration peut offrir une offre, et seulement à un compte sans abo
 
     const rows = readAuditRows(databasePath, "metadata");
     const grants = rows.filter((row) => row.action === "subscription_granted");
-    assert.equal(grants.length, 2, "les deux offres accordées, et rien d'autre");
+    assert.equal(grants.length, 3, "les trois offres accordées, et rien d'autre");
     assert.equal(grants[0].actor_email, SUPER_ADMIN_EMAIL);
     assert.equal(grants[0].target_email, client.email);
     assert.equal(grants[0].reason, reason);
+    // Le renouvellement paresseux n'écrit rien dans le journal : il ne correspond à
+    // aucune décision humaine, et le motif « offrir une offre » ne vaudrait pas
+    // preuve d'une nouvelle intervention du super-admin.
+    assert.ok(
+      !rows.some((row) => row.action === "subscription_renewed"),
+      "le renouvellement automatique reste hors du journal des interventions",
+    );
     const meta = JSON.parse(grants[1].metadata);
     assert.equal(meta.plan, "ultra");
     assert.equal(meta.days, 90);
     assert.equal(meta.previousPlan, "pro");
+    assert.equal(meta.autoRenew, true, "l'offre est journalisée comme renouvelée d'office");
     assert.equal(meta.factor, "password");
+    const last = JSON.parse(grants[2].metadata);
+    assert.equal(last.plan, "pro");
+    assert.equal(last.previousPlan, "ultra", "l'historique n'a pas défini la ligne courante");
   } finally {
     await harness.stop();
   }
