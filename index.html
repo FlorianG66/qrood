@@ -489,6 +489,11 @@
             <label for="loginPassword">Mot de passe</label>
             <input id="loginPassword" name="password" type="password" maxlength="128" autocomplete="current-password" required />
           </div>
+          <div class="field-group" id="loginTwoFactorGroup" hidden>
+            <label for="loginTwoFactorCode">Code d'authentification</label>
+            <input id="loginTwoFactorCode" name="twoFactorCode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="20" aria-describedby="loginTwoFactorHint" />
+            <p class="field-hint" id="loginTwoFactorHint">Code de 6 chiffres de ton application, ou code de récupération si le téléphone est perdu.</p>
+          </div>
           <button class="button button-primary auth-submit" type="submit">Se connecter <span>↗</span></button>
         </form>
 

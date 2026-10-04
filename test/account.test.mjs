@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import os from "node:os";
@@ -52,6 +53,75 @@ function tokenFromUrl(text, queryKey) {
   const match = text.match(new RegExp(`[?&]${queryKey}=([A-Za-z0-9_-]+)`));
   assert.ok(match, `l'e-mail doit contenir ${queryKey}`);
   return match[1];
+}
+
+async function errorCode(response) {
+  return (await response.json()).error.code;
+}
+
+// Les deux aides ci-dessous rejouent l'algorithme du serveur plutôt que d'appeler
+// une route d'activation : un test qui réutiliserait l'implémentation ne prouverait
+// rien sur la compatibilité avec une vraie application d'authentification.
+function base32ToBytes(base32) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const bytes = [];
+  let buffer = 0;
+  let bits = 0;
+  for (const character of base32.replace(/=+$/, "").toUpperCase()) {
+    const index = alphabet.indexOf(character);
+    assert.notEqual(index, -1, `caractère base32 inattendu : ${character}`);
+    buffer = (buffer << 5) | index;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((buffer >> bits) & 0xff);
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+function totpCodeFor(secret, at = Date.now()) {
+  const counter = Math.floor(at / 1_000 / 30);
+  const message = Buffer.alloc(8);
+  message.writeBigUInt64BE(BigInt(counter));
+  const digest = createHmac("sha1", base32ToBytes(secret)).update(message).digest();
+  const offset = digest[digest.length - 1] & 0x0f;
+  const binary =
+    ((digest[offset] & 0x7f) << 24) |
+    (digest[offset + 1] << 16) |
+    (digest[offset + 2] << 8) |
+    digest[offset + 3];
+  return String(binary % 1_000_000).padStart(6, "0");
+}
+
+function readTwoFactor(databasePath, email) {
+  const database = new DatabaseSync(databasePath);
+  try {
+    const row = database.prepare(`
+      SELECT t.secret, t.confirmed_at, t.pending_secret, t.pending_expires_at, t.recovery_codes
+      FROM two_factor_auth t JOIN users u ON u.id = t.user_id
+      WHERE u.email = ?
+    `).get(email);
+    if (!row) return { enrolled: false, pending: false, recoveryCodes: 0 };
+    return {
+      enrolled: Boolean(row.secret && row.confirmed_at),
+      pending: Boolean(row.pending_secret && row.pending_expires_at > Date.now()),
+      recoveryCodes: JSON.parse(row.recovery_codes || "[]").length,
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function countSessions(databasePath, email) {
+  const database = new DatabaseSync(databasePath);
+  try {
+    return database.prepare(`
+      SELECT COUNT(*) AS c FROM sessions s JOIN users u ON u.id = s.user_id WHERE u.email = ?
+    `).get(email).c;
+  } finally {
+    database.close();
+  }
 }
 
 async function request(url, options = {}) {
@@ -519,6 +589,236 @@ test("le changement d'adresse refuse une adresse déjà prise", async () => {
     // reste celle du compte tant que le lien n'a pas été ouvert.
     assert.equal((await (await request("/api/auth/me", { cookie: second.cookie })).json()).user.email,
       "second@exemple.test");
+  } finally {
+    await stopServer(server);
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("double authentification : elle protège la connexion et se pilote depuis le compte", async () => {
+  PORT = await getFreePort();
+  ORIGIN = `http://localhost:${PORT}`;
+  const temporaryDirectory = mkdtempSync(path.join(os.tmpdir(), "qrood-a2f-"));
+  const logSink = { value: "" };
+  const databasePath = path.join(temporaryDirectory, "test.sqlite");
+  const outbox = path.join(temporaryDirectory, "outbox");
+  const server = await startServer(
+    buildChildEnvironment({ QROOD_DB_PATH: databasePath, QROOD_MAIL_OUTBOX_DIR: outbox }),
+    logSink,
+  );
+
+  const twoFactor = (options) => request("/api/auth/2fa", options);
+  const call = (path, body, cookie, csrf) =>
+    request(`/api/auth/2fa${path}`, {
+      method: "POST",
+      headers: browser(),
+      cookie,
+      csrf,
+      body,
+    });
+
+  try {
+    // ── Aucune route de second facteur ne répond sans session ────────────────
+    for (const [method, path] of [
+      ["GET", "/api/auth/2fa"],
+      ["POST", "/api/auth/2fa/setup"],
+      ["POST", "/api/auth/2fa/confirm"],
+      ["POST", "/api/auth/2fa/recovery-codes"],
+      ["POST", "/api/auth/2fa/disable"],
+    ]) {
+      const denied = await request(path, { method, headers: browser(), body: method === "POST" ? {} : undefined });
+      assert.equal(denied.status, 401, `${method} ${path} doit exiger une session`);
+    }
+
+    const account = await registerUser("a2f@exemple.test");
+
+    // ── Activation ───────────────────────────────────────────────────────────
+    const initial = await (await twoFactor({ cookie: account.cookie })).json();
+    assert.equal(initial.enrolled, false);
+    assert.equal(initial.recoveryCodesRemaining, 0);
+    assert.equal(initial.setupPending, false);
+
+    // Le jeton CSRF reste obligatoire : une session seule ne suffit pas à écrire.
+    const withoutCsrf = await call("/setup", { currentPassword: account.password }, account.cookie, undefined);
+    assert.equal(withoutCsrf.status, 403);
+
+    // Sur une session volée, le mot de passe est le seul facteur restant connu de la
+    // victime : le poser sans lui reviendrait à lui céder le compte.
+    const withoutPassword = await call("/setup", {}, account.cookie, account.csrf);
+    assert.equal(withoutPassword.status, 400);
+    assert.equal(await errorCode(withoutPassword), "current_password_required");
+
+    const wrongPassword = await call("/setup", { currentPassword: "MauvaisMotDePasse1" }, account.cookie, account.csrf);
+    assert.equal(wrongPassword.status, 403);
+    assert.equal(await errorCode(wrongPassword), "invalid_current_password");
+
+    const setup = await call("/setup", { currentPassword: account.password }, account.cookie, account.csrf);
+    assert.equal(setup.status, 200, logSink.value);
+    const { secret, uri } = await setup.json();
+    assert.match(secret, /^[A-Z2-7]{32}$/, "le secret est base32, comme l'attend le standard");
+    assert.ok(uri.startsWith("otpauth://totp/"), `URI inattendue : ${uri}`);
+    assert.ok(uri.includes(`secret=${secret}`), "le QR code doit porter le secret présenté");
+
+    // Tant que le code n'est pas confirmé, le secret n'est pas actif : c'est ce qui
+    // empêche un secret jeté au hasard de fermer l'accès au compte.
+    const pending = readTwoFactor(databasePath, account.email);
+    assert.equal(pending.enrolled, false);
+    assert.equal(pending.pending, true);
+    assert.equal((await (await twoFactor({ cookie: account.cookie })).json()).setupPending, true);
+
+    // Une connexion réussit encore : l'activation commencée n'a pas changé l'état.
+    const stillReachable = await request("/api/auth/login", {
+      method: "POST",
+      headers: browser(),
+      body: { email: account.email, password: account.password },
+    });
+    assert.equal(stillReachable.status, 200, "un secret non confirmé ne doit rien changer à la connexion");
+
+    const wrongConfirm = await call("/confirm", { code: "000000" }, account.cookie, account.csrf);
+    assert.equal(wrongConfirm.status, 403);
+    assert.equal(await errorCode(wrongConfirm), "invalid_two_factor_code");
+
+    const confirmed = await call("/confirm", { code: totpCodeFor(secret) }, account.cookie, account.csrf);
+    assert.equal(confirmed.status, 200, logSink.value);
+    const recoveryCodes = (await confirmed.json()).recoveryCodes;
+    assert.equal(recoveryCodes.length, 8);
+    assert.equal(new Set(recoveryCodes).size, 8, "chaque code de récupération est unique");
+    assert.ok(recoveryCodes.every((code) => /^[A-Z2-9]{5}-[A-Z2-9]{5}$/.test(code)), recoveryCodes.join(" "));
+    // Les codes ne vivent qu'hachés : une copie de la base ne donne rien.
+    assert.equal(readTwoFactor(databasePath, account.email).recoveryCodes, 8);
+
+    const afterConfirm = await (await twoFactor({ cookie: account.cookie })).json();
+    assert.equal(afterConfirm.enrolled, true);
+    assert.equal(afterConfirm.recoveryCodesRemaining, 8);
+    assert.equal(afterConfirm.setupPending, false);
+    assert.ok(afterConfirm.confirmedAt);
+
+    // ── Le mot de passe seul ne suffit plus à entrer ─────────────────────────
+    const sessionsBefore = countSessions(databasePath, account.email);
+    const passwordOnly = await request("/api/auth/login", {
+      method: "POST",
+      headers: browser(),
+      body: { email: account.email, password: account.password },
+    });
+    assert.equal(passwordOnly.status, 401);
+    assert.equal(await errorCode(passwordOnly), "two_factor_required");
+    assert.equal(
+      countSessions(databasePath, account.email),
+      sessionsBefore,
+      "aucune session ne doit être créée avant la validation du second facteur",
+    );
+    assert.equal(
+      (await (await request("/api/auth/me", { cookie: sessionCookie(passwordOnly) })).json()).user,
+      null,
+      "et aucun cookie ne doit être renvoyé",
+    );
+
+    // Un code erroné se distingue du code absent par un seul mot : l'interface doit
+    // savoir s'il a à afficher le champ de saisie ou à refuser la tentative.
+    const wrongCode = await request("/api/auth/login", {
+      method: "POST",
+      headers: browser(),
+      body: { email: account.email, password: account.password, twoFactorCode: "000000" },
+    });
+    assert.equal(wrongCode.status, 401);
+    assert.equal(await errorCode(wrongCode), "invalid_two_factor_code");
+
+    // ── Le code de l'application ────────────────────────────────────────────
+    const liveCode = totpCodeFor(secret);
+    const withCode = await request("/api/auth/login", {
+      method: "POST",
+      headers: browser(),
+      body: { email: account.email, password: account.password, twoFactorCode: liveCode },
+    });
+    assert.equal(withCode.status, 200, logSink.value);
+    const reconnected = { cookie: sessionCookie(withCode), csrf: (await withCode.clone().json()).csrfToken };
+
+    // Le même code, une seconde fois : la fenêtre de tolérance (±30 s) le rendrait
+    // encore valable sans le compteur mémorisé.
+    const replayed = await request("/api/auth/login", {
+      method: "POST",
+      headers: browser(),
+      body: { email: account.email, password: account.password, twoFactorCode: liveCode },
+    });
+    assert.equal(replayed.status, 401);
+    assert.equal(await errorCode(replayed), "invalid_two_factor_code");
+
+    // ── Un code de récupération, une seule fois ─────────────────────────────
+    const recovery = recoveryCodes[0];
+    const withRecovery = await request("/api/auth/login", {
+      method: "POST",
+      headers: browser(),
+      body: { email: account.email, password: account.password, twoFactorCode: recovery },
+    });
+    assert.equal(withRecovery.status, 200, logSink.value);
+    assert.equal(readTwoFactor(databasePath, account.email).recoveryCodes, 7);
+
+    const reusedRecovery = await request("/api/auth/login", {
+      method: "POST",
+      headers: browser(),
+      body: { email: account.email, password: account.password, twoFactorCode: recovery },
+    });
+    assert.equal(reusedRecovery.status, 401);
+    assert.equal(await errorCode(reusedRecovery), "invalid_two_factor_code");
+
+    // ── Régénération : mot de passe puis second facteur, jamais l'inverse ────
+    const regeneratePasswordOnly = await call("/recovery-codes", { currentPassword: account.password },
+      reconnected.cookie, reconnected.csrf);
+    assert.equal(regeneratePasswordOnly.status, 403);
+    assert.equal(await errorCode(regeneratePasswordOnly), "two_factor_required");
+
+    const wrongRegenerateCode = await call("/recovery-codes",
+      { currentPassword: account.password, twoFactorCode: "000000" }, reconnected.cookie, reconnected.csrf);
+    assert.equal(wrongRegenerateCode.status, 403);
+    assert.equal(await errorCode(wrongRegenerateCode), "invalid_two_factor_code");
+
+    const regenerated = await call("/recovery-codes",
+      { currentPassword: account.password, twoFactorCode: recoveryCodes[1] }, reconnected.cookie, reconnected.csrf);
+    assert.equal(regenerated.status, 200, logSink.value);
+    const freshCodes = (await regenerated.json()).recoveryCodes;
+    assert.equal(freshCodes.length, 8);
+    // Les anciens tombent avec la régénération : c'est tout son objet, sinon un code
+    // déjà dérobé continuerait de servir après que l'utilisateur a réagi.
+    assert.ok(!freshCodes.includes(recovery), "un code déjà consommé ne doit pas revenir");
+    assert.equal(readTwoFactor(databasePath, account.email).recoveryCodes, 8);
+
+    // ── La session d'origine survit à la désactivation d'un facteur ──────────
+    const withoutFactor = await call("/disable", { currentPassword: account.password },
+      reconnected.cookie, reconnected.csrf);
+    assert.equal(withoutFactor.status, 403);
+    assert.equal(await errorCode(withoutFactor), "two_factor_required");
+
+    // Le téléphone est perdu : c'est le cas d'usage des codes de récupération. Le
+    // mot de passe seul ne désactive rien, et un code déjà consommé plus haut non plus.
+    const staleCode = await call("/disable",
+      { currentPassword: account.password, twoFactorCode: recovery }, reconnected.cookie, reconnected.csrf);
+    assert.equal(staleCode.status, 403);
+    assert.equal(await errorCode(staleCode), "invalid_two_factor_code");
+
+    const disabled = await call("/disable",
+      { currentPassword: account.password, twoFactorCode: freshCodes[0] }, reconnected.cookie, reconnected.csrf);
+    assert.equal(disabled.status, 200, logSink.value);
+    assert.equal(readTwoFactor(databasePath, account.email).enrolled, false);
+    assert.equal((await (await twoFactor({ cookie: reconnected.cookie })).json()).enrolled, false);
+
+    // Le repli revient : sans second facteur, le mot de passe suffit de nouveau.
+    const backToPassword = await request("/api/auth/login", {
+      method: "POST",
+      headers: browser(),
+      body: { email: account.email, password: account.password },
+    });
+    assert.equal(backToPassword.status, 200);
+
+    // Désactiver deux fois n'est pas une erreur utile : la seconde n'a plus rien à
+    // protéger et doit le dire clairement plutôt que d'échouer sur un secret absent.
+    const alreadyDisabled = await call("/disable",
+      { currentPassword: account.password, twoFactorCode: "000000" }, reconnected.cookie, reconnected.csrf);
+    assert.equal(alreadyDisabled.status, 409);
+    assert.equal(await errorCode(alreadyDisabled), "two_factor_not_enrolled");
+
+    // Ni mot de passe ni code ne doivent avoir atterri dans les journaux.
+    assert.doesNotMatch(logSink.value, /MotDePassePlan789/);
+    assert.ok(!logSink.value.includes(secret), "le secret d'authentification ne doit jamais être journalisé");
   } finally {
     await stopServer(server);
     rmSync(temporaryDirectory, { recursive: true, force: true });

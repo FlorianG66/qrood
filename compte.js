@@ -14,6 +14,9 @@
     subscription: null,
     emailToken: null,
     toastTimer: null,
+    twoFactor: null,
+    twoFactorMode: null,
+    twoFactorSecret: null,
   };
 
   const elements = {};
@@ -39,7 +42,7 @@
       render();
       elements.accountMain.hidden = false;
       elements.accountLoading.remove();
-      await confirmPendingEmailChange();
+      await Promise.all([confirmPendingEmailChange(), loadTwoFactor()]);
     } catch (error) {
       elements.accountLoading.innerHTML = "";
       const message = document.createElement("p");
@@ -94,6 +97,25 @@
     elements.planHint = $("#planHint");
     elements.exportButton = $("#exportButton");
     elements.backOfficeLink = $("#backOfficeLink");
+    elements.twoFactorStatus = $("#twoFactorStatus");
+    elements.twoFactorActions = $("#twoFactorActions");
+    elements.twoFactorModal = $("#twoFactorModal");
+    elements.twoFactorTitle = $("#twoFactorModalTitle");
+    elements.twoFactorIntro = $("#twoFactorIntro");
+    elements.twoFactorSetupBody = $("#twoFactorSetupBody");
+    elements.twoFactorCodesBody = $("#twoFactorCodesBody");
+    elements.twoFactorCodes = $("#twoFactorCodes");
+    elements.twoFactorQr = $("#twoFactorQr");
+    elements.twoFactorSecret = $("#twoFactorSecret");
+    elements.twoFactorForm = $("#twoFactorForm");
+    elements.twoFactorPasswordGroup = $("#twoFactorPasswordGroup");
+    elements.twoFactorPassword = $("#twoFactorPassword");
+    elements.twoFactorCodeGroup = $("#twoFactorCodeGroup");
+    elements.twoFactorCode = $("#twoFactorCode");
+    elements.twoFactorConfirmCodeGroup = $("#twoFactorConfirmCodeGroup");
+    elements.twoFactorConfirmCode = $("#twoFactorConfirmCode");
+    elements.twoFactorError = $("#twoFactorError");
+    elements.twoFactorSubmit = $("#twoFactorSubmit");
     elements.toast = $("#toast");
     elements.toastMessage = $("#toastMessage");
   }
@@ -106,6 +128,11 @@
     $("#portalButton").addEventListener("click", onPortal);
     $("#deleteForm").addEventListener("submit", onDelete);
     $("#logoutButton").addEventListener("click", onLogout);
+    elements.twoFactorActions.addEventListener("click", onTwoFactorClick);
+    elements.twoFactorForm.addEventListener("submit", onTwoFactorSubmit);
+    for (const button of document.querySelectorAll("[data-close-modal]")) {
+      button.addEventListener("click", () => closeTwoFactorModal());
+    }
   }
 
   async function api(path, options = {}) {
@@ -175,6 +202,7 @@
 
     showPendingEmail(state.user.pendingEmail);
     renderPlan();
+    renderTwoFactor();
   }
 
   // L'offre nommée ici est l'offre effective, celle qui décide des quotas, et non
@@ -346,6 +374,206 @@
       });
       window.location.assign("/");
     });
+  }
+
+  // ── Double authentification ────────────────────────────────────────────────
+  //
+  // La protection se règle depuis le compte lui-même, et pas depuis le
+  // back-office : c'est la seule porte qui reste ouverte quand aucun Super-admin
+  // n'a accès au serveur. Chaque écriture demande le mot de passe puis le code,
+  // parce que désactiver le second facteur sur une session volée laisserait le
+  // compte sans rien d'autre que le mot de passe.
+
+  async function loadTwoFactor() {
+    try {
+      state.twoFactor = await api("/api/auth/2fa");
+      renderTwoFactor();
+    } catch (error) {
+      elements.twoFactorStatus.textContent = error.message || "État indisponible.";
+    }
+  }
+
+  function renderTwoFactor() {
+    const status = state.twoFactor;
+    if (!status) return;
+    elements.twoFactorActions.replaceChildren();
+    elements.twoFactorStatus.textContent = status.enrolled
+      ? `Active. Un code de 6 chiffres sera demandé à chaque connexion. ${status.recoveryCodesRemaining} code(s) de récupération restant(s).`
+      : "Inactive : ton mot de passe est aujourd'hui le seul facteur de ton compte.";
+
+    const add = (id, label, danger = false) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `button ${danger ? "button-danger" : "button-light"} button-small`;
+      button.dataset.twoFactor = id;
+      button.textContent = label;
+      elements.twoFactorActions.append(button);
+    };
+    if (status.enrolled) {
+      add("recovery-codes", "Nouveaux codes de récupération");
+      add("disable", "Désactiver", true);
+    } else {
+      add("setup", "Activer");
+    }
+  }
+
+  function onTwoFactorClick(event) {
+    const button = event.target.closest("button[data-two-factor]");
+    if (!button) return;
+    openTwoFactorDialog(button.dataset.twoFactor);
+  }
+
+  function openTwoFactorDialog(mode) {
+    state.twoFactorMode = mode;
+    state.twoFactorSecret = null;
+    elements.twoFactorError.hidden = true;
+    elements.twoFactorSetupBody.hidden = false;
+    elements.twoFactorCodesBody.hidden = true;
+    elements.twoFactorQr.hidden = true;
+    elements.twoFactorQr.replaceChildren();
+    elements.twoFactorSecret.hidden = true;
+    elements.twoFactorSecret.textContent = "";
+    elements.twoFactorForm.reset();
+    elements.twoFactorPassword.required = true;
+    elements.twoFactorPasswordGroup.hidden = false;
+    elements.twoFactorCodeGroup.hidden = true;
+    elements.twoFactorCode.required = false;
+    // La confirmation seule n'a pas son propre champ : elle réutilise celui du QR.
+    elements.twoFactorConfirmCodeGroup.hidden = mode === "setup";
+    elements.twoFactorConfirmCode.required = mode !== "setup";
+
+    // Le QR n'a de sens que pour une première activation : en régénérant des
+    // codes ou en désactivant, il n'y a aucun secret à présenter.
+    if (mode === "setup") {
+      elements.twoFactorTitle.textContent = "Activer la double authentification";
+      elements.twoFactorIntro.textContent =
+        "Un code de 6 chiffres demandé à chaque connexion, en plus de ton mot de passe.";
+      elements.twoFactorSubmit.textContent = "Afficher le QR code";
+    } else if (mode === "recovery-codes") {
+      elements.twoFactorTitle.textContent = "Nouveaux codes de récupération";
+      elements.twoFactorIntro.textContent =
+        "Les codes précédents cessent d'être acceptés. Les nouveaux ne s'affichent qu'une fois.";
+      elements.twoFactorSubmit.textContent = "Générer les codes";
+    } else {
+      elements.twoFactorTitle.textContent = "Désactiver la double authentification";
+      elements.twoFactorIntro.textContent =
+        "Tes connexions ne demanderont plus qu'un mot de passe. Tu peux la réactiver à tout moment.";
+      elements.twoFactorSubmit.textContent = "Désactiver";
+    }
+    elements.twoFactorModal.hidden = false;
+    elements.twoFactorPassword.focus();
+  }
+
+  function closeTwoFactorModal() {
+    elements.twoFactorModal.hidden = true;
+    // Les codes de récupération disparaissent avec la modale : ils ne sont
+    // jamais stockés en clair, donc les laisser à l'écran jusqu'au rechargement
+    // les exposerait à quiconque ouvre la page ensuite.
+    state.twoFactorSecret = null;
+    state.twoFactorMode = null;
+    elements.twoFactorForm.reset();
+  }
+
+  async function onTwoFactorSubmit(event) {
+    event.preventDefault();
+    const mode = state.twoFactorMode;
+    const password = elements.twoFactorPassword.value;
+    elements.twoFactorError.hidden = true;
+    elements.twoFactorSubmit.disabled = true;
+    try {
+      if (mode === "setup" && !state.twoFactorSecret) {
+        const result = await api("/api/auth/2fa/setup", {
+          method: "POST",
+          body: { currentPassword: password },
+        });
+        state.twoFactorSecret = result.secret;
+        renderTwoFactorQr(result);
+        elements.twoFactorCodeGroup.hidden = false;
+        elements.twoFactorCode.required = true;
+        elements.twoFactorPasswordGroup.hidden = true;
+        elements.twoFactorPassword.required = false;
+        elements.twoFactorSubmit.textContent = "Activer";
+        elements.twoFactorCode.focus();
+        return;
+      }
+      if (mode === "setup") {
+        const result = await api("/api/auth/2fa/confirm", {
+          method: "POST",
+          body: { code: elements.twoFactorCode.value.trim() },
+        });
+        await loadTwoFactor();
+        showRecoveryCodes(result.recoveryCodes);
+        return;
+      }
+      if (mode === "recovery-codes") {
+        const result = await api("/api/auth/2fa/recovery-codes", {
+          method: "POST",
+          body: { currentPassword: password, twoFactorCode: elements.twoFactorConfirmCode.value.trim() },
+        });
+        await loadTwoFactor();
+        showRecoveryCodes(result.recoveryCodes);
+        return;
+      }
+      await api("/api/auth/2fa/disable", {
+        method: "POST",
+        body: { currentPassword: password, twoFactorCode: elements.twoFactorConfirmCode.value.trim() },
+      });
+      closeTwoFactorModal();
+      await loadTwoFactor();
+      showToast("Double authentification désactivée.");
+    } catch (error) {
+      elements.twoFactorError.textContent = error.message || "L'opération a échoué.";
+      elements.twoFactorError.hidden = false;
+    } finally {
+      elements.twoFactorSubmit.disabled = false;
+    }
+  }
+
+  function showRecoveryCodes(codes) {
+    elements.twoFactorCodes.replaceChildren();
+    for (const code of codes) {
+      const item = document.createElement("li");
+      item.className = "recovery-item";
+      item.textContent = code;
+      elements.twoFactorCodes.append(item);
+    }
+    elements.twoFactorSetupBody.hidden = true;
+    elements.twoFactorCodesBody.hidden = false;
+  }
+
+  function renderTwoFactorQr({ uri, secret }) {
+    elements.twoFactorSecret.textContent = `À saisir à la main si le scan échoue : ${secret}`;
+    elements.twoFactorSecret.hidden = false;
+    const host = elements.twoFactorQr;
+    host.hidden = false;
+    host.replaceChildren();
+    // Le secret reste lisible dans la page si la bibliothèque de QR n'a pas
+    // chargé : sans cela, l'activation serait bloquée sans issue.
+    if (typeof window.qrcode !== "function") {
+      elements.twoFactorQr.hidden = true;
+      return;
+    }
+    const qr = window.qrcode(0, "M");
+    qr.addData(uri);
+    qr.make();
+    const modules = qr.getModuleCount();
+    const margin = 4;
+    const scale = 8;
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = (modules + margin * 2) * scale;
+    canvas.setAttribute("role", "img");
+    canvas.setAttribute("aria-label", "QR code de configuration de l'authentification");
+    const context = canvas.getContext("2d");
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = "#111111";
+    for (let row = 0; row < modules; row += 1) {
+      for (let column = 0; column < modules; column += 1) {
+        if (!qr.isDark(row, column)) continue;
+        context.fillRect((column + margin) * scale, (row + margin) * scale, scale, scale);
+      }
+    }
+    host.append(canvas);
   }
 
   async function onLogout() {

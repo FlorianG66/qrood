@@ -15,6 +15,9 @@ import { fileURLToPath } from "node:url";
 // de test, sinon le test passerait aussi bien sur une politique qui n'existe plus.
 const SUPER_ADMIN_EMAIL = "florian.guichard66@gmail.com";
 const PASSWORD = "MotDePasseBackOffice789";
+// Le secret du compte avant la généralisation : le test de migration en a besoin,
+// et le graver ici évite de le laisser se déduire de la ligne SQL qui l'insère.
+const LEGACY_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 let PORT;
@@ -372,12 +375,19 @@ async function bootBackOffice() {
 
   server = await restart();
 
+  // Arrêter le serveur sans supprimer la base : c'est ce qu'exige un test de
+  // migration, qui doit écrire le fichier entre deux démarrages. `stop` reste le
+  // geste de fin, celui qui nettoie le dossier temporaire.
+  const halt = async () => {
+    await stopServer(server);
+  };
+
   const stop = async () => {
     await stopServer(server);
     rmSync(directory, { recursive: true, force: true });
   };
 
-  return { databasePath, directory, logSink, owner, client, restart, stop };
+  return { databasePath, directory, logSink, owner, client, restart, halt, stop };
 }
 
 test("le back-office est servi sans session, ses données jamais", async () => {
@@ -975,7 +985,7 @@ function readTwoFactor(databasePath, email) {
   try {
     const row = database.prepare(`
       SELECT t.secret, t.confirmed_at, t.pending_secret, t.recovery_codes
-      FROM admin_two_factor t JOIN users u ON u.id = t.user_id
+      FROM two_factor_auth t JOIN users u ON u.id = t.user_id
       WHERE u.email = ?
     `).get(email);
     if (!row) return { enrolled: false, recoveryCodes: 0 };
@@ -1316,6 +1326,87 @@ test("la double authentification devient la condition de chaque écriture", asyn
     // Le repli revient : sans double authentification, le mot de passe suffit.
     const backToPassword = await write({ reason, currentPassword: PASSWORD });
     assert.equal(backToPassword.status, 200, logSink.value);
+  } finally {
+    await harness.stop();
+  }
+});
+
+test("la généralisation de la double authentification migrate une base existante", async () => {
+  const harness = await bootBackOffice();
+  const { databasePath, logSink, restart, halt } = harness;
+
+  try {
+    // ── Une base d'avant la généralisation ─────────────────────────────────
+    // La table est reconstruite à l'identique de l'ancienne version, puis remplie :
+    // c'est le seul moyen de prouver que le secret survit, puisque le serveur n'a
+    // jamais écrit sous l'ancien nom. Le serveur est arrêté avant : SQLite refuse
+    // d'écrire dans un fichier ouvert, et surtout le démarrage suivant doit être le
+    // premier à voir la base dans son état d'avant.
+    await halt();
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      BEGIN;
+      DROP INDEX IF EXISTS idx_two_factor_auth_pending;
+      ALTER TABLE two_factor_auth RENAME TO admin_two_factor;
+      CREATE INDEX idx_admin_two_factor_pending ON admin_two_factor(pending_expires_at);
+      COMMIT;
+    `);
+    const superAdmin = legacy.prepare("SELECT id FROM users WHERE email = ?").get(SUPER_ADMIN_EMAIL);
+    legacy.prepare(`
+      INSERT INTO admin_two_factor (user_id, secret, confirmed_at, pending_secret, pending_expires_at, last_counter, recovery_codes, updated_at)
+      VALUES (?, ?, ?, NULL, NULL, NULL, '["haché"]', ?)
+    `).run(superAdmin.id, LEGACY_SECRET, Date.now(), Date.now());
+    legacy.close();
+
+    // ── Le redémarrage doit aboutir ─────────────────────────────────────────
+    await restart();
+    assert.doesNotMatch(logSink.value, /SQL logic error|already exists/i, logSink.value);
+
+    // Le secret est resté, sans réenrôlement : le compte ne doit pas être verrouillé
+    // hors de chez lui par une simple mise à jour.
+    const migrated = readTwoFactor(databasePath, SUPER_ADMIN_EMAIL);
+    assert.equal(migrated.enrolled, true, "le secret existant doit survivre à la migration");
+    assert.equal(migrated.recoveryCodes, 1);
+
+    // La table legacy a disparu, et l'index suit le nouveau nom.
+    const check = new DatabaseSync(databasePath);
+    const tables = check
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+      .all()
+      .map((row) => row.name);
+    assert.ok(!tables.includes("admin_two_factor"), "l'ancienne table doit avoir disparu");
+    assert.ok(tables.includes("two_factor_auth"));
+    const indexes = check
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'two_factor_auth'")
+      .all()
+      .map((row) => row.name);
+    assert.ok(indexes.includes("idx_two_factor_auth_pending"), "l'index doit porter le nouveau nom");
+    check.close();
+
+    // ── Le secret migré sert réellement ─────────────────────────────────────
+    // Le mot de passe seul ne redonne plus de session : la preuve que le second
+    // facteur a survécu n'est pas la ligne en base, c'est le fait qu'il refuse
+    // d'entrer.
+    const loginWithoutCode = await request("/api/auth/login", {
+      method: "POST",
+      body: { email: SUPER_ADMIN_EMAIL, password: PASSWORD },
+    });
+    assert.equal(loginWithoutCode.status, 401, logSink.value);
+    assert.equal(await errorCode(loginWithoutCode), "two_factor_required");
+
+    const loginWithCode = await request("/api/auth/login", {
+      method: "POST",
+      body: {
+        email: SUPER_ADMIN_EMAIL,
+        password: PASSWORD,
+        twoFactorCode: totpCodeFor(LEGACY_SECRET),
+      },
+    });
+    assert.equal(loginWithCode.status, 200, logSink.value);
+
+    const status = await (await request("/api/admin/2fa", { cookie: sessionCookie(loginWithCode) })).json();
+    assert.equal(status.enrolled, true);
+    assert.equal(status.recoveryCodesRemaining, 1);
   } finally {
     await harness.stop();
   }

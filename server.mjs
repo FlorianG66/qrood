@@ -157,8 +157,8 @@ const EMAIL_CHANGE_PURPOSE = "email_change";
 const VERIFICATION_TOKEN_TTL_MS = readInteger("QROOD_VERIFICATION_TOKEN_HOURS", 24, 1, 168) * 60 * 60 * 1_000;
 const RESET_TOKEN_TTL_MS = readInteger("QROOD_RESET_TOKEN_MINUTES", 60, 5, 1_440) * 60 * 1_000;
 const EMAIL_CHANGE_TOKEN_TTL_MS = readInteger("QROOD_EMAIL_CHANGE_TOKEN_MINUTES", 60, 5, 1_440) * 60 * 1_000;
-// Plancher entre deux envois pour une même adresse et un même but : il
-// dépend de l'heure du dernier envoi, donc il survit au redémarrage.
+// Plancher entre deux envois pour une mǦme adresse et un mǦme but : il
+// dǸpend de l'heure du dernier envoi, donc il survit au redǸmarrage.
 const MAIL_RESEND_DELAY_MS = readInteger("QROOD_MAIL_RESEND_DELAY_SECONDS", 60, 0, 3_600) * 1_000;
 const MAIL_TRANSPORT = (readStripeEnv("MAIL_TRANSPORT") || "outbox").toLowerCase();
 const MAIL_FROM = readStripeEnv("MAIL_FROM") || "no-reply@qrood.example";
@@ -166,6 +166,11 @@ const MAIL_OUTBOX_DIRECTORY = process.env.QROOD_MAIL_OUTBOX_DIR
   || path.join(DB_PATH === ":memory:" ? path.join(ROOT, "data") : path.dirname(DB_PATH), "outbox");
 const MAIL_API_URL = readStripeEnv("MAIL_API_URL");
 const MAIL_API_KEY = readStripeEnv("MAIL_API_KEY");
+
+// Auth OAuth Google
+const GOOGLE_CLIENT_ID = readStripeEnv("GOOGLE_CLIENT_ID") || process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = readStripeEnv("GOOGLE_CLIENT_SECRET") || process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `${PUBLIC_ORIGIN}/api/auth/google/callback`;
 
 if (IS_PRODUCTION && !PUBLIC_ORIGIN.startsWith("https://")) {
   throw new Error("QROOD_PUBLIC_ORIGIN doit utiliser HTTPS en production.");
@@ -199,7 +204,7 @@ if (DB_PATH !== ":memory:") {
 }
 
 const db = new DatabaseSync(DB_PATH);
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 8;
 // La version est lue avant toute écriture : c'est elle qui distingue une base
 // existante d'une base neuve, et donc une migration d'un simple rattrapage.
 const previousSchemaVersion = Number(db.prepare("PRAGMA user_version").get()?.user_version || 0);
@@ -211,14 +216,16 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     display_name TEXT NOT NULL,
     email TEXT NOT NULL COLLATE NOCASE UNIQUE,
-    password_hash TEXT NOT NULL,
+    password_hash TEXT,
     created_at INTEGER NOT NULL,
     pending_email TEXT,
     -- Le rôle n'existe que par défaut faux, et aucune route ne l'écrit : il se
     -- promeut par une commande SQL explicite. Cette valeur par défaut n'est pas
     -- une précaution de migration, c'est la garantie structurelle qu'un compte
     -- créé par une route publique ne puisse pas en hériter.
-    is_super_admin INTEGER NOT NULL DEFAULT 0 CHECK(is_super_admin IN (0,1))
+    is_super_admin INTEGER NOT NULL DEFAULT 0 CHECK(is_super_admin IN (0,1)),
+    auth_provider TEXT NOT NULL DEFAULT 'local' CHECK(auth_provider IN ('local','google')),
+    provider_id TEXT
   ) STRICT;
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -348,13 +355,15 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_admin_actions_created ON admin_actions(created_at DESC);
 
-  -- Double authentification du rôle. Le secret actif n'est écrit qu'après
-  -- confirmation d'un code : pending_secret permet de présenter le QR code avant
-  -- que l'opérateur l'ait scanné, sans qu'un secret jamais vérifié devienne actif.
-  -- last_counter empêche le rejeu d'un code déjà consommé dans la fenêtre de
-  -- tolérance. Les codes de récupération ne sont stockés que hachés, comme les
-  -- jetons, et retirés de la liste au premier usage.
-  CREATE TABLE IF NOT EXISTS admin_two_factor (
+  -- Double authentification, ouverte à tout compte et pas seulement au rôle. Le
+  -- secret actif n'est écrit qu'après confirmation d'un code : pending_secret
+  -- permet de présenter le QR code avant qu'il ait été scanné, sans qu'un secret
+  -- jamais vérifié devienne actif. last_counter empêche le rejeu d'un code déjà
+  -- consommé dans la fenêtre de tolérance. Les codes de récupération ne sont
+  -- stockés que hachés, comme les jetons, et retirés de la liste au premier usage.
+  -- La clé est user_id : un compte ne peut avoir qu'une seule ligne, quel que
+  -- soit le rôle qu'il porte.
+  CREATE TABLE IF NOT EXISTS two_factor_auth (
     user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     secret TEXT,
     confirmed_at INTEGER,
@@ -365,8 +374,8 @@ db.exec(`
     updated_at INTEGER NOT NULL
   ) STRICT;
 
-  CREATE INDEX IF NOT EXISTS idx_admin_two_factor_pending
-    ON admin_two_factor(pending_expires_at);
+  CREATE INDEX IF NOT EXISTS idx_two_factor_auth_pending
+    ON two_factor_auth(pending_expires_at);
 
   -- Jeton à usage unique, jamais stocké en clair : seul son SHA-256 est
   -- conservé, comme pour les sessions. La colonne used_at rend la
@@ -523,14 +532,50 @@ function ensureSuperAdminColumn() {
   }
 }
 
+// La double authentification n'appartient plus au seul rôle super-admin : la table
+// est renommée, pas dupliquée. Deux tables auraient voulu dire deux jeux de règles
+// TOTP, deux jeux de codes de récupération, et une divergence à la première
+// correction de sécurité.
+//
+// Le schéma ci-dessus crée déjà `two_factor_auth` sur toute base, y compris ancienne :
+// le simple `CREATE TABLE IF NOT EXISTS` précède cette fonction et pose donc une
+// table neuve et vide avant que la legacy soit rencontrée. Un `RENAME TO` unconditional
+// échouerait alors sur « il existe déjà une table de ce nom », et le serveur ne
+// démarrerait plus du tout. D'où les deux voies : renommer quand la table cible
+// n'existe pas, recopier sinon.
+function migrateTwoFactorAuthGeneralization() {
+  const tableExists = (name) =>
+    Boolean(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+  if (!tableExists("admin_two_factor")) return;
+  db.exec(`
+    BEGIN;
+    ${
+      tableExists("two_factor_auth")
+        ? `INSERT OR IGNORE INTO two_factor_auth (
+             user_id, secret, confirmed_at, pending_secret, pending_expires_at,
+             last_counter, recovery_codes, updated_at
+           )
+           SELECT user_id, secret, confirmed_at, pending_secret, pending_expires_at,
+                  last_counter, recovery_codes, updated_at
+           FROM admin_two_factor;
+           DROP TABLE admin_two_factor;`
+        : "ALTER TABLE admin_two_factor RENAME TO two_factor_auth;"
+    }
+    DROP INDEX IF EXISTS idx_admin_two_factor_pending;
+    CREATE INDEX IF NOT EXISTS idx_two_factor_auth_pending ON two_factor_auth(pending_expires_at);
+    COMMIT;
+  `);
+}
+
 ensureQrcodeLegacyKey();
 ensureQrcodeStyleColumns();
 ensureQrcodeActivityColumns();
 ensureEmailVerificationColumns();
 ensurePendingEmailColumn();
-ensureSuperAdminColumn();
+\nensureSuperAdminColumn();
 migrateEntreprisePlanRemoval();
 migrateAuthTokenPurposes();
+migrateTwoFactorAuthGeneralization();
 
 // Politique de super-admin unique : seul florian.guichard66@gmail.com peut l'être.
 function enforceUniqueSuperAdmin() {
@@ -2371,6 +2416,11 @@ async function handleAuthApi(request, response, url) {
     if (!user || !valid) {
       throw new HttpError(401, "E-mail ou mot de passe incorrect.", "invalid_credentials");
     }
+    // Le second facteur est vérifié avant toute création de session : le mot de
+    // passe volé ne doit pas suffire à obtenir un cookie, même éphémère, car une
+    // session créée puis invalidée resterait une surface d'attaque pendant le temps
+    // de la requête.
+    await verifyLoginTwoFactor(user.id, body);
     db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(now());
     const createdSession = createSession(user.id, request);
     sendJson(response, 200, {
@@ -2382,6 +2432,16 @@ async function handleAuthApi(request, response, url) {
       }),
       csrfToken: createdSession.csrfToken,
     }, { "Set-Cookie": sessionCookie(createdSession.token) });
+    return;
+  }
+
+  // ── Double authentification du compte ───────────────────────────────────────
+  //
+  // Ces routes exigent une session : c'est la contrepartie de leur existence. Un
+  // secret d'authentification posé sans session ouvrirait le compte à quiconque
+  // détient le cookie, et l'activation exige donc le mot de passe en plus.
+  if (url.pathname.startsWith("/api/auth/2fa")) {
+    await handleTwoFactorApi(request, response, url);
     return;
   }
 
@@ -3175,7 +3235,7 @@ function consumeTotpCode(userId, secret, code, at = now()) {
     if (record?.last_counter != null && candidateCounter <= record.last_counter) continue;
     const expected = Buffer.from(totpAtCounter(secret, candidateCounter));
     if (timingSafeEqual(expected, candidate)) {
-      db.prepare("UPDATE admin_two_factor SET last_counter = ? WHERE user_id = ?").run(candidateCounter, userId);
+      db.prepare("UPDATE two_factor_auth SET last_counter = ? WHERE user_id = ?").run(candidateCounter, userId);
       return candidateCounter;
     }
   }
@@ -3210,7 +3270,7 @@ function storedRecoveryCodes(record) {
 }
 
 function twoFactorRecord(userId) {
-  return db.prepare("SELECT * FROM admin_two_factor WHERE user_id = ?").get(userId) || null;
+  return db.prepare("SELECT * FROM two_factor_auth WHERE user_id = ?").get(userId) || null;
 }
 
 function isTwoFactorEnrolled(record) {
@@ -3226,6 +3286,20 @@ function twoFactorStatus(userId) {
     recoveryCodesRemaining: enrolled ? storedRecoveryCodes(record).length : 0,
     setupPending: Boolean(record?.pending_secret && record.pending_expires_at > now()),
   };
+}
+
+// Vérifie un second facteur déjà authentifié et renvoie le moyen par lequel il a
+// servi, ou `null` si le code est refusé. Aucun appelant ne doit traiter un refus
+// comme un simple échec de connexion : c'est le même refus pour un code expiré, un
+// code déjà consommé et une clé de récupération épuisée.
+//
+// La clé de limitation est le compte et non l'IP : derrière un partage de connexion
+// ou un VPN, une limite par adresse punirait un utilisateur légitime tout en
+// laissant un attaquant libre d'enumer les codes depuis une autre adresse.
+function verifyTwoFactorCode(userId, record, code) {
+  if (consumeTotpCode(userId, record.secret, code) !== null) return "totp";
+  if (consumeRecoveryCode(userId, record, code)) return "recovery";
+  return null;
 }
 
 // Second facteur exigé sur chaque écriture d'exploitation. Tant que la double
@@ -3249,9 +3323,8 @@ async function requireAdminTwoFactor(session, body) {
   // 10 essais par 5 minutes : un code à 6 chiffres s'énumère en 10^6 essais, la
   // fenêtre de 30 s ne suffit donc pas à le deviner de but en blanc.
   checkRateLimit(`admin-2fa:${session.userId}`, 10, 5 * 60 * 1_000);
-  if (consumeTotpCode(session.userId, record.secret, code) !== null) return "totp";
-  const consumed = consumeRecoveryCode(session.userId, record, code);
-  if (consumed) return "recovery";
+  const accepted = verifyTwoFactorCode(session.userId, record, code);
+  if (accepted) return accepted;
   throw new HttpError(403, "Code d'authentification invalide.", "invalid_two_factor_code");
 }
 
@@ -3266,7 +3339,7 @@ function consumeRecoveryCode(userId, record, code) {
   });
   if (index === -1) return false;
   codes.splice(index, 1);
-  db.prepare("UPDATE admin_two_factor SET recovery_codes = ?, updated_at = ? WHERE user_id = ?").run(
+  db.prepare("UPDATE two_factor_auth SET recovery_codes = ?, updated_at = ? WHERE user_id = ?").run(
     JSON.stringify(codes),
     now(),
     userId,
@@ -3279,6 +3352,179 @@ function consumeRecoveryCode(userId, record, code) {
 // laisserait une ligne d'historique récemment touchée passer devant elle : un
 // webhook Stripe arrivé en retard après une résiliation suffit à faire displaysse
 // l'ancien abonnement résilié au lieu de l'accès en cours.
+// ── Double authentification d'un compte ──────────────────────────────────────
+//
+// Le mécanisme est celui du rôle super-admin, généralisé à tout compte : mêmes
+// règles TOTP, mêmes codes de récupération, une seule table. Les routes sont
+// séparées de `/api/admin/2fa/*` parce que les exigences ne sont pas les mêmes : ni
+// rôle, ni journal d'intervention, ni motif — l'utilisateur agit sur son propre
+// compte, et exiger une raison de huit caractères n'aurait aucun sens.
+
+const TOTP_URI_ISSUER = "QROOD";
+
+// Une seule fonction pour les deux surfaces : la chaîne servie à l'application
+// d'authentification est celle qu'un scanner lit, et une divergence entre le
+// back-office et `/compte` produirait un secret que l'un des deux écrans ne
+// présenterait jamais.
+function totpUri(secret, email) {
+  return (
+    `otpauth://totp/${encodeURIComponent(`${TOTP_URI_ISSUER}:${email}`)}` +
+    `?secret=${secret}&issuer=${encodeURIComponent(TOTP_URI_ISSUER)}` +
+    `&algorithm=SHA1&digits=${TOTP_DIGITS}&period=${TOTP_STEP_SECONDS}`
+  );
+}
+
+// Second facteur exigé à la connexion. Le message d'erreur distingue le code absent
+// du code invalide : ce n'est pas une fuite, le mot de passe vient d'être validé et
+// l'interface a besoin de savoir s'il doit afficher le champ de saisie ou refuser.
+async function verifyLoginTwoFactor(userId, body) {
+  const record = twoFactorRecord(userId);
+  if (!isTwoFactorEnrolled(record)) return;
+  const code = typeof body.twoFactorCode === "string" ? body.twoFactorCode.trim() : "";
+  if (!code) {
+    throw new HttpError(
+      401,
+      "Saisis le code de ton application d'authentification, ou un code de récupération.",
+      "two_factor_required",
+    );
+  }
+  // Même limite que sur une intervention d'exploitation, et par compte : un mot de
+  // passe correct ne doit pas autoriser à deviner le second facteur.
+  checkRateLimit(`login-2fa:${userId}`, 10, 5 * 60 * 1_000);
+  if (verifyTwoFactorCode(userId, record, code)) return;
+  throw new HttpError(401, "Code d'authentification invalide.", "invalid_two_factor_code");
+}
+
+async function handleTwoFactorApi(request, response, url) {
+  const session = requireSession(request);
+
+  if (request.method === "GET" && url.pathname === "/api/auth/2fa") {
+    checkRateLimit(`2fa-read:${session.userId}`, 60, 60 * 1_000);
+    sendJson(response, 200, twoFactorStatus(session.userId));
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/2fa/setup") {
+    verifyCsrf(request, session);
+    checkRateLimit(`2fa-setup:${session.userId}`, 5, 10 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    // Le mot de passe est exigé : sur une session volée, c'est le seul facteur
+    // encore connu de la victime.
+    await requireCurrentPassword(session, body);
+    const secret = base32Encode(randomBytes(TOTP_SECRET_BYTES));
+    const expiresAt = now() + TOTP_SETUP_TTL_MS;
+    // Réécrire `pending_secret` remplace une activation commencée et abandonnée :
+    // deux secrets en attente laisseraient l'interface en présenter un au hasard,
+    // sans que l'utilisateur sache lequel a été confirmé.
+    db.prepare(`
+      INSERT INTO two_factor_auth (user_id, pending_secret, pending_expires_at, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        pending_secret = excluded.pending_secret,
+        pending_expires_at = excluded.pending_expires_at,
+        updated_at = excluded.updated_at
+    `).run(session.userId, secret, expiresAt, now());
+    sendJson(response, 200, {
+      secret,
+      uri: totpUri(secret, session.email),
+      expiresAt: isoDate(expiresAt),
+    });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/2fa/confirm") {
+    verifyCsrf(request, session);
+    checkRateLimit(`2fa-confirm:${session.userId}`, 10, 5 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    const record = twoFactorRecord(session.userId);
+    if (!record?.pending_secret || record.pending_expires_at <= now()) {
+      throw new HttpError(
+        409,
+        "L'activation a expiré : relance-la pour obtenir un nouveau QR code.",
+        "two_factor_setup_expired",
+      );
+    }
+    // Le code est validé contre le secret en attente, et non contre le secret actif :
+    // sans cela, confirmer une nouvelle activation validerait le code de l'ancienne,
+    // et l'interface apparenterait un secret qui n'a jamais été vu à un code que
+    // l'utilisateur connaît déjà.
+    if (consumeTotpCode(session.userId, record.pending_secret, body.code) === null) {
+      throw new HttpError(403, "Ce code ne correspond pas au QR code affiché.", "invalid_two_factor_code");
+    }
+    const codes = generateRecoveryCodes();
+    db.prepare(`
+      UPDATE two_factor_auth
+      SET secret = pending_secret,
+          pending_secret = NULL,
+          pending_expires_at = NULL,
+          last_counter = NULL,
+          confirmed_at = ?,
+          recovery_codes = ?,
+          updated_at = ?
+      WHERE user_id = ?
+    `).run(now(), JSON.stringify(codes.map(recoveryCodeHash)), now(), session.userId);
+    // Une seule fois : la base n'en garde que des empreintes.
+    sendJson(response, 200, { recoveryCodes: codes });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/2fa/recovery-codes") {
+    verifyCsrf(request, session);
+    checkRateLimit(`2fa-recovery:${session.userId}`, 5, 10 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    const record = twoFactorRecord(session.userId);
+    if (!isTwoFactorEnrolled(record)) {
+      throw new HttpError(409, "La double authentification n'est pas active.", "two_factor_not_enrolled");
+    }
+    // Mot de passe puis second facteur : régénérer les codes de récupération est
+    // exactement ce qu'un attaquant ferait après avoir capturé une session volée.
+    // Le mot de passe seul ne suffirait pas à s'en rémunérer.
+    await requireCurrentPassword(session, body);
+    const code = typeof body.twoFactorCode === "string" ? body.twoFactorCode.trim() : "";
+    if (!code) {
+      throw new HttpError(403, "Saisis ton code d'authentification.", "two_factor_required");
+    }
+    checkRateLimit(`2fa-verify:${session.userId}`, 10, 5 * 60 * 1_000);
+    if (!verifyTwoFactorCode(session.userId, record, code)) {
+      throw new HttpError(403, "Code d'authentification invalide.", "invalid_two_factor_code");
+    }
+    const codes = generateRecoveryCodes();
+    db.prepare("UPDATE two_factor_auth SET recovery_codes = ?, updated_at = ? WHERE user_id = ?").run(
+      JSON.stringify(codes.map(recoveryCodeHash)),
+      now(),
+      session.userId,
+    );
+    sendJson(response, 200, { recoveryCodes: codes });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/auth/2fa/disable") {
+    verifyCsrf(request, session);
+    checkRateLimit(`2fa-disable:${session.userId}`, 5, 10 * 60 * 1_000);
+    const body = requireObject(await readJson(request));
+    const record = twoFactorRecord(session.userId);
+    if (!isTwoFactorEnrolled(record)) {
+      throw new HttpError(409, "La double authentification n'est pas active.", "two_factor_not_enrolled");
+    }
+    // Désactiver le second facteur ne demande jamais moins que ce qu'en demander
+    // l'activation : mot de passe, puis code.
+    await requireCurrentPassword(session, body);
+    const code = typeof body.twoFactorCode === "string" ? body.twoFactorCode.trim() : "";
+    if (!code) {
+      throw new HttpError(403, "Saisis ton code d'authentification.", "two_factor_required");
+    }
+    checkRateLimit(`2fa-verify:${session.userId}`, 10, 5 * 60 * 1_000);
+    if (!verifyTwoFactorCode(session.userId, record, code)) {
+      throw new HttpError(403, "Code d'authentification invalide.", "invalid_two_factor_code");
+    }
+    db.prepare("DELETE FROM two_factor_auth WHERE user_id = ?").run(session.userId);
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  throw new HttpError(404, "Ressource introuvable.", "not_found");
+}
+
 function adminSubscriptionRow(userId) {
   return db.prepare(`
     SELECT id, plan, status, current_period_end, cancel_at_period_end, grace_until,
@@ -3365,7 +3611,7 @@ async function handleAdminApi(request, response, url) {
     const secret = base32Encode(randomBytes(TOTP_SECRET_BYTES));
     const expiresAt = now() + TOTP_SETUP_TTL_MS;
     db.prepare(`
-      INSERT INTO admin_two_factor (user_id, pending_secret, pending_expires_at, updated_at)
+      INSERT INTO two_factor_auth (user_id, pending_secret, pending_expires_at, updated_at)
       VALUES (?, ?, ?, ?)
       ON CONFLICT(user_id) DO UPDATE SET
         pending_secret = excluded.pending_secret,
@@ -3375,7 +3621,7 @@ async function handleAdminApi(request, response, url) {
     recordAdminAction(session, adminTargetUser(session.userId), "two_factor_setup", reason);
     sendJson(response, 200, {
       secret,
-      uri: `otpauth://totp/${encodeURIComponent(`QROOD:${session.email}`)}?secret=${secret}&issuer=QROOD&algorithm=SHA1&digits=${TOTP_DIGITS}&period=${TOTP_STEP_SECONDS}`,
+      uri: totpUri(secret, session.email),
       expiresAt: isoDate(expiresAt),
     });
     return;
@@ -3395,7 +3641,7 @@ async function handleAdminApi(request, response, url) {
     }
     const codes = generateRecoveryCodes();
     db.prepare(`
-      UPDATE admin_two_factor
+      UPDATE two_factor_auth
       SET secret = pending_secret,
           pending_secret = NULL,
           pending_expires_at = NULL,
@@ -3428,7 +3674,7 @@ async function handleAdminApi(request, response, url) {
     // le mot de passe ne suffit pas, il faut le second facteur.
     await requireAdminTwoFactor(session, body);
     const codes = generateRecoveryCodes();
-    db.prepare("UPDATE admin_two_factor SET recovery_codes = ?, updated_at = ? WHERE user_id = ?").run(
+    db.prepare("UPDATE two_factor_auth SET recovery_codes = ?, updated_at = ? WHERE user_id = ?").run(
       JSON.stringify(codes.map(recoveryCodeHash)),
       now(),
       session.userId,
@@ -3451,7 +3697,7 @@ async function handleAdminApi(request, response, url) {
     }
     await requireCurrentPassword(session, body);
     await requireAdminTwoFactor(session, body);
-    db.prepare("DELETE FROM admin_two_factor WHERE user_id = ?").run(session.userId);
+    db.prepare("DELETE FROM two_factor_auth WHERE user_id = ?").run(session.userId);
     recordAdminAction(session, adminTargetUser(session.userId), "two_factor_disabled", reason);
     sendJson(response, 200, { ok: true });
     return;

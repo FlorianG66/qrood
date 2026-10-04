@@ -3281,6 +3281,7 @@
 
   function openAuthModal(mode = "login", message = "") {
     setAuthMode(mode);
+    resetTwoFactorChallenge();
     elements.authError.textContent = message;
     elements.authError.hidden = !message;
     elements.authModal.hidden = false;
@@ -3337,6 +3338,26 @@
     }
   }
 
+  // Un second facteur ne se demande qu'après l'échec du premier essai : l'afficher
+  // d'emblée ferait porter à tous les comptes la saisie d'un code qu'ils n'ont pas.
+  function resetTwoFactorChallenge() {
+    const group = $("#loginTwoFactorGroup");
+    const field = $("#loginTwoFactorCode");
+    if (!group || !field) return;
+    group.hidden = true;
+    field.value = "";
+    field.removeAttribute("required");
+  }
+
+  function requestTwoFactorCode() {
+    const group = $("#loginTwoFactorGroup");
+    const field = $("#loginTwoFactorCode");
+    if (!group || !field) return;
+    group.hidden = false;
+    field.required = true;
+    window.setTimeout(() => field.focus(), 0);
+  }
+
   async function handleLogin(event) {
     event.preventDefault();
     const attempt = ++state.authAttempt;
@@ -3344,15 +3365,24 @@
     setFormBusy(elements.loginForm, true, "Connexion…");
     try {
       const formData = new FormData(elements.loginForm);
+      const twoFactorCode = String(formData.get("twoFactorCode") || "").trim();
       const result = await api("/api/auth/login", {
         method: "POST",
-        body: { email: formData.get("email"), password: formData.get("password") },
+        body: {
+          email: formData.get("email"),
+          password: formData.get("password"),
+          // Le champ est absent tant que le serveur n'a pas demandé le code : le
+          // serveur le refuse qu'importe, mais ne pas l'envoyer évite de faire
+          // croire qu'un code a été pris en compte.
+          ...(twoFactorCode ? { twoFactorCode } : {}),
+        },
       });
       if (attempt !== state.authAttempt) return;
       applyAuthenticatedSession(result);
       const userId = result.user.id;
       const epoch = state.sessionEpoch;
       elements.loginForm.reset();
+      resetTwoFactorChallenge();
       closeModal("authModal");
       await loadLibrary();
       if (!isCurrentSession(userId, epoch)) return;
@@ -3361,6 +3391,18 @@
       showToast(summary ? `Connexion réussie · ${summary}` : "Connexion réussie.");
     } catch (error) {
       if (attempt !== state.authAttempt) return;
+      // Le serveur distingue « il manque le second facteur » de « ce facteur est
+      // faux » : le premier ouvre le champ, le second le laisse ouvert pour que le
+      // code soit seulement corrigé. Les deux autres cas referment le champ, car
+      // ni l'adresse ni le mot de passe n'ont été reconnus.
+      if (error.code === "two_factor_required" || error.code === "invalid_two_factor_code") {
+        requestTwoFactorCode();
+        if (error.code === "invalid_two_factor_code") {
+          $("#loginTwoFactorCode").value = "";
+        }
+      } else {
+        resetTwoFactorChallenge();
+      }
       if (elements.authModal.hidden) showToast(error.message || "Connexion réussie, mais la bibliothèque n’a pas pu être chargée.");
       else {
         elements.authError.textContent = error.message;

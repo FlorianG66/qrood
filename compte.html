@@ -13,7 +13,8 @@
     </script>
     <link rel="stylesheet" href="styles.css?v=30" />
     <script src="cursor.js?v=3" defer></script>
-    <script src="compte.js?v=1" defer></script>
+    <script src="qrcode-generator.js" defer></script>
+    <script src="compte.js?v=2" defer></script>
   </head>
   <body class="account-body">
     <div class="app-shell">
@@ -95,6 +96,16 @@
           </form>
         </section>
 
+        <section class="account-card" aria-labelledby="twoFactorTitle">
+          <h2 id="twoFactorTitle">Double authentification</h2>
+          <p class="field-hint" id="twoFactorStatus">Chargement.</p>
+          <p class="account-note">
+            Un code de 6 chiffres demandé à chaque connexion, en plus du mot de passe. Garde tes
+            codes de récupération hors de l'application : chacun ne sert qu'une fois.
+          </p>
+          <div class="account-actions" id="twoFactorActions"></div>
+        </section>
+
         <section class="account-card" aria-labelledby="planTitle">
           <h2 id="planTitle">Abonnement</h2>
           <dl class="account-facts" id="planFacts">
@@ -138,6 +149,51 @@
       <main class="account-main account-main-loading" id="accountLoading">
         <p>Chargement de ton compte…</p>
       </main>
+    </div>
+
+    <div class="modal-backdrop" id="twoFactorModal" hidden>
+      <section class="modal-card modal-card-wide" role="dialog" aria-modal="true" aria-labelledby="twoFactorModalTitle">
+        <button class="modal-close" type="button" data-close-modal="twoFactorModal" aria-label="Fermer">×</button>
+        <span class="section-kicker">SÉCURITÉ DU COMPTE</span>
+        <h2 id="twoFactorModalTitle">Double authentification</h2>
+
+        <div id="twoFactorSetupBody">
+          <p class="modal-intro" id="twoFactorIntro">Un code de 6 chiffres demandé à chaque connexion.</p>
+          <div id="twoFactorQr" class="account-qr" hidden></div>
+          <p class="field-hint" id="twoFactorSecret" hidden></p>
+          <form id="twoFactorForm">
+            <div class="field-group" id="twoFactorPasswordGroup">
+              <label for="twoFactorPassword">Mot de passe actuel</label>
+              <input id="twoFactorPassword" name="currentPassword" type="password" maxlength="128" autocomplete="current-password" required />
+              <p class="field-hint">Poser un code sur une session volée reviendrait à protéger le compte de celui qui l'a volé.</p>
+            </div>
+            <div class="field-group" id="twoFactorCodeGroup" hidden>
+              <label for="twoFactorCode">Code affiché par l'application</label>
+              <input id="twoFactorCode" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" />
+              <p class="field-hint">Tant qu'il n'est pas validé, la double authentification reste inactive et tes connexions ne changent pas.</p>
+            </div>
+            <div class="field-group" id="twoFactorConfirmCodeGroup" hidden>
+              <label for="twoFactorConfirmCode">Code d'authentification</label>
+              <input id="twoFactorConfirmCode" name="code" type="text" autocomplete="one-time-code" maxlength="20" />
+              <p class="field-hint">Code de 6 chiffres de l'application, ou code de récupération si le téléphone est perdu. Un code ne sert qu'une fois.</p>
+            </div>
+            <p class="account-note" id="twoFactorError" hidden></p>
+            <div class="modal-actions">
+              <button class="button button-light" type="button" data-close-modal="twoFactorModal">Annuler</button>
+              <button class="button button-dark" type="submit" id="twoFactorSubmit">Afficher le QR code</button>
+            </div>
+          </form>
+        </div>
+
+        <div id="twoFactorCodesBody" hidden>
+          <p class="modal-intro">Codes de récupération : affichés une seule fois, jamais stockés en clair.</p>
+          <ul class="recovery-list" id="twoFactorCodes"></ul>
+          <p class="field-hint">Garde-les hors de l'application. Chacun sert une fois, si le téléphone est perdu.</p>
+          <div class="modal-actions">
+            <button class="button button-dark" type="button" data-close-modal="twoFactorModal">J'ai noté les codes</button>
+          </div>
+        </div>
+      </section>
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"><span class="toast-icon">V</span><span id="toastMessage"></span></div>

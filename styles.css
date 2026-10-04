@@ -4440,7 +4440,8 @@ body.modal-open .app-shell *::after {
   border-top: 1px solid var(--line);
 }
 
-.admin-body .modal-actions {
+.admin-body .modal-actions,
+.account-body .modal-actions {
   display: flex;
   gap: 12px;
   justify-content: flex-end;
@@ -4449,18 +4450,32 @@ body.modal-open .app-shell *::after {
 
 /* La modale d'activation est plus large : le QR doit rester lisible sans être
    agrandi par le navigateur, et les codes de récupération se lisent ligne par
-   ligne. */
-.admin-body .modal-card-wide {
+   ligne. La page « Mon compte » présente le même QR, donc la même largeur. */
+.admin-body .modal-card-wide,
+.account-body .modal-card-wide {
   max-width: 560px;
 }
 
-.admin-qr {
+/* Les mêmes boutons que le back-office : la liste d'actions d'un compte est le
+   prolongement direct des formulaires qui la surplombent. */
+.account-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.admin-qr,
+.account-qr {
   display: flex;
   justify-content: center;
   margin: 18px 0 8px;
 }
 
-.admin-qr canvas {
+.admin-qr canvas,
+.account-qr canvas {
   width: 224px;
   height: 224px;
   image-rendering: pixelated;
