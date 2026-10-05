@@ -17,6 +17,9 @@
     twoFactor: null,
     twoFactorMode: null,
     twoFactorSecret: null,
+    googleEnabled: false,
+    hasPassword: true,
+    googleLinked: false,
   };
 
   const elements = {};
@@ -39,10 +42,17 @@
       state.user = result.user;
       state.entitlement = result.entitlement;
       state.subscription = result.subscription;
+      // Ces trois indicateurs décident de ce que la page peut proposer : un compte
+      // sans mot de passe n'affiche pas les champs de mot de passe, et une identité
+      // déjà reliée n'affiche pas le formulaire de liaison.
+      state.googleEnabled = Boolean(result.googleEnabled);
+      state.hasPassword = result.hasPassword !== false;
+      state.googleLinked = Boolean(result.googleLinked);
       render();
       elements.accountMain.hidden = false;
       elements.accountLoading.remove();
       await Promise.all([confirmPendingEmailChange(), loadTwoFactor()]);
+      handleOauthReturn();
     } catch (error) {
       elements.accountLoading.innerHTML = "";
       const message = document.createElement("p");
@@ -90,6 +100,16 @@
     elements.emailStatus = $("#emailStatus");
     elements.pendingEmailNote = $("#pendingEmailNote");
     elements.newEmail = $("#newEmail");
+    elements.emailPasswordGroup = $("#emailPasswordGroup");
+    elements.oldPasswordGroup = $("#oldPasswordGroup");
+    elements.deletePasswordGroup = $("#deletePasswordGroup");
+    elements.googleCard = $("#googleCard");
+    elements.googleStatus = $("#googleStatus");
+    elements.googleNote = $("#googleNote");
+    elements.googleLinkForm = $("#googleLinkForm");
+    elements.googleUnlinkForm = $("#googleUnlinkForm");
+    elements.googleActions = $("#googleActions");
+    elements.googleReauthButton = $("#googleReauthButton");
     elements.planName = $("#planName");
     elements.planStatus = $("#planStatus");
     elements.planRenewal = $("#planRenewal");
@@ -128,6 +148,9 @@
     $("#portalButton").addEventListener("click", onPortal);
     $("#deleteForm").addEventListener("submit", onDelete);
     $("#logoutButton").addEventListener("click", onLogout);
+    $("#googleLinkForm").addEventListener("submit", onGoogleLink);
+    $("#googleUnlinkForm").addEventListener("submit", onGoogleUnlink);
+    elements.googleReauthButton.addEventListener("click", onGoogleReauth);
     elements.twoFactorActions.addEventListener("click", onTwoFactorClick);
     elements.twoFactorForm.addEventListener("submit", onTwoFactorSubmit);
     for (const button of document.querySelectorAll("[data-close-modal]")) {
@@ -180,13 +203,25 @@
     try {
       await action();
     } catch (error) {
-      showToast(error.message || "L'opération a échoué.");
+      reportError(error);
     } finally {
       if (submit) {
         submit.disabled = false;
         submit.textContent = label;
       }
     }
+  }
+
+  // Un compte sans mot de passe n'a qu'une preuve possible, et elle vieillit. Le
+  // message doit donc dire quoi faire, plutôt que de répéter un refus : la demande
+  // n'a pas échoué, elle a expiré.
+  function reportError(error) {
+    if (error.code === "reauth_required") {
+      revealReauth();
+      showToast("Ta session n'est plus récente : prouve ton identité avec Google pour continuer.");
+      return;
+    }
+    showToast(error.message || "L'opération a échoué.");
   }
 
   function render() {
@@ -202,7 +237,126 @@
 
     showPendingEmail(state.user.pendingEmail);
     renderPlan();
+    renderGoogle();
+    renderPasswordFields();
     renderTwoFactor();
+  }
+
+  // ── Connexion Google ───────────────────────────────────────────────────────
+  //
+  // Google est une porte d'entrée, pas un compte à part : relier ajoute une entrée
+  // sans rien remplacer, délier en retire une, et la page suit l'état réel plutôt
+  // qu'un drapeau posé en mémoire.
+
+  function renderGoogle() {
+    elements.googleCard.hidden = !state.googleEnabled;
+    if (!state.googleEnabled) return;
+
+    const enrolled = Boolean(state.twoFactor?.enrolled);
+    elements.googleStatus.textContent = state.googleLinked
+      ? "Identité reliée : ton compte s'ouvre avec Google, à côté de son mot de passe."
+      : "Aucune identité reliée : ton compte ne s'ouvre qu'avec son mot de passe.";
+
+    // Une double authentification occupe déjà le rôle de second facteur. La proposer
+    // quand même laisserait croire que Google peut s'y substituer : il ne le peut pas,
+    // et le serveur refuserait l'aller-retour.
+    if (enrolled) {
+      elements.googleNote.hidden = false;
+      elements.googleNote.textContent =
+        "Ta double authentification demande déjà un code à chaque connexion : la connexion Google y est désactivée, et le serveur la refusera.";
+      elements.googleLinkForm.hidden = true;
+      elements.googleUnlinkForm.hidden = true;
+      elements.googleActions.hidden = true;
+      return;
+    }
+
+    elements.googleNote.hidden = state.hasPassword;
+    elements.googleNote.textContent = state.hasPassword
+      ? ""
+      : "Ton compte n'a pas de mot de passe : Google tient lieu de preuve pour changer d'adresse, définir un mot de passe ou supprimer le compte. Cette preuve est valable une quinzaine de minutes, après quoi il faut la renouveler.";
+
+    elements.googleLinkForm.hidden = state.googleLinked;
+    elements.googleUnlinkForm.hidden = !state.googleLinked || !state.hasPassword;
+    elements.googleActions.hidden = Boolean(state.hasPassword) || !state.googleLinked;
+  }
+
+  // La case de mot de passe disparaît quand le compte n'en a pas : la laisser visible,
+  // vide et facultative, inviterait l'utilisateur à la remplir pour rien — et à croire
+  // qu'un mot de passe existe quelque part.
+  function renderPasswordFields() {
+    for (const group of [elements.emailPasswordGroup, elements.oldPasswordGroup, elements.deletePasswordGroup]) {
+      if (group) group.hidden = !state.hasPassword;
+    }
+  }
+
+  // Le bouton de preuve est déjà sur la page ; c'est le refus d'une action qui le rend
+  // visible, quand la fenêtre d'un compte sans mot de passe s'est refermée entre-temps.
+  function revealReauth() {
+    if (!state.googleEnabled || state.hasPassword || !state.googleLinked || state.twoFactor?.enrolled) return;
+    elements.googleActions.hidden = false;
+    elements.googleCard.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  // Un aller-retour par le fournisseur ne se poursuit pas depuis une requête
+  // JavaScript : le serveur renvoie l'adresse, et c'est la page qui l'ouvre.
+  async function startGoogleFlow(path, body = {}) {
+    const result = await api(path, { method: "POST", body });
+    window.location.assign(result.url);
+  }
+
+  function onGoogleLink(event) {
+    event.preventDefault();
+    withBusy(event.currentTarget, async () => {
+      await startGoogleFlow("/api/account/google/link", { currentPassword: $("#googleLinkPassword").value });
+    });
+  }
+
+  function onGoogleUnlink(event) {
+    event.preventDefault();
+    withBusy(event.currentTarget, async () => {
+      await api("/api/account/google/unlink", {
+        method: "POST",
+        body: { currentPassword: $("#googleUnlinkPassword").value },
+      });
+      // Le lien et le mot de passe viennent de disparaître de la page : elle est
+      // rechargée pour que rien n'y reste, et pour que le bouton « Déconnexion » ne
+      // repose pas sur un état que le serveur ne partage plus.
+      window.location.assign("/compte");
+    });
+  }
+
+  function onGoogleReauth() {
+    elements.googleReauthButton.disabled = true;
+    startGoogleFlow("/api/account/google/reauth").catch((error) => {
+      reportError(error);
+      elements.googleReauthButton.disabled = false;
+    });
+  }
+
+  // Le retour du fournisseur se lit ici : la liaison et la ré-authentification
+  // reviennent toutes deux à cette page, avec un code plutôt qu'un message.
+  const OAUTH_MESSAGES = {
+    liaison_reussie: "Identité Google reliée à ton compte.",
+    reauth_reussie: "Identité prouvée : tu peux à nouveau modifier ton compte.",
+    refus: "Connexion Google annulée.",
+    state_invalide: "Demande expirée. Recommence depuis cette page.",
+    code_manquant: "Google n'a pas renvoyé de code d'autorisation. Recommence.",
+    session_expiree: "Ta session a changé pendant la connexion : reprends la demande ici.",
+    identite_refusee: "Google n'a pas confirmé ton adresse. Un compte Google vérifié est nécessaire.",
+    fournisseur_indisponible: "Google ne répond pas. Réessaie dans un instant.",
+    deux_facteurs: "Ton compte exige un code d'authentification : connecte-toi avec ton mot de passe.",
+    google_non_lie: "Aucune identité Google n'est reliée à ce compte.",
+    deja_lie: "Ton compte est déjà relié à une identité Google.",
+    identite_deja_liee: "Cette identité Google est déjà reliée à un autre compte.",
+    autre_identite: "L'identité Google qui s'ouvre n'est pas celle de ce compte.",
+    email_deja_utilise: "Un compte existe déjà avec cette adresse : connecte-toi par mot de passe.",
+  };
+
+  function handleOauthReturn() {
+    const code = new URLSearchParams(window.location.search).get("oauth");
+    if (!code) return;
+    window.history.replaceState({}, "", "/compte");
+    showToast(OAUTH_MESSAGES[code] || "La connexion Google n'a pas abouti.");
   }
 
   // L'offre nommée ici est l'offre effective, celle qui décide des quotas, et non
@@ -326,6 +480,11 @@
         body: { currentPassword: $("#oldPassword").value, newPassword: password },
       });
       form.reset();
+      // Un compte qui vient de recevoir son mot de passe n'est plus un compte sans
+      // mot de passe : les champs réapparaissent, et Google cesse d tenir lieu de
+      // preuve pour la suite.
+      state.hasPassword = true;
+      render();
       showToast("Mot de passe mis à jour.");
     });
   }
@@ -397,9 +556,15 @@
     const status = state.twoFactor;
     if (!status) return;
     elements.twoFactorActions.replaceChildren();
+    // Un compte sans mot de passe ne peut pas activer la double authentification : elle
+    // fermerait la connexion Google, qui est sa seule porte, et le serveur la refuse.
+    // L'annoncer ici évite un bouton qui mènerait à un cul-de-sac.
+    const blocked = !status.enrolled && !state.hasPassword;
     elements.twoFactorStatus.textContent = status.enrolled
       ? `Active. Un code de 6 chiffres sera demandé à chaque connexion. ${status.recoveryCodesRemaining} code(s) de récupération restant(s).`
-      : "Inactive : ton mot de passe est aujourd'hui le seul facteur de ton compte.";
+      : blocked
+        ? "Inactive, et indisponible : ton compte n'a pas de mot de passe. Google est ta seule porte d'entrée, et la double authentification la fermerait sans te laisser d'autre moyen de l'ouvrir."
+        : "Inactive : ton mot de passe est aujourd'hui le seul facteur de ton compte.";
 
     const add = (id, label, danger = false) => {
       const button = document.createElement("button");
@@ -412,9 +577,12 @@
     if (status.enrolled) {
       add("recovery-codes", "Nouveaux codes de récupération");
       add("disable", "Désactiver", true);
-    } else {
+    } else if (!blocked) {
       add("setup", "Activer");
     }
+    // Activer ou désactiver le second facteur change ce que vaut une identité Google :
+    // la page du compte doit le refléter sans attendre un rechargement.
+    renderGoogle();
   }
 
   function onTwoFactorClick(event) {

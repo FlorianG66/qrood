@@ -41,6 +41,7 @@ Le serveur s’arrête automatiquement après 30 minutes sans requête métier (
 - Copie du contenu encodé
 - Inscription et connexion par e-mail/mot de passe
 - Connexion avec un compte Google, sans liaison automatique à un compte existant
+- Liaison et déliaison d'une identité Google depuis la page du compte, et ré-authentification par Google pour les comptes sans mot de passe
 - Sessions serveur avec cookie `HttpOnly` et `SameSite=Strict`
 - Bibliothèque personnelle accessible sur les autres navigateurs après connexion
 - Statistiques : nombre de scans, évolution sur 30 jours, dernier scan, type d’appareil et domaine de provenance
@@ -229,12 +230,23 @@ Les points d'appel du fournisseur (`QROOD_GOOGLE_AUTH_URL`, `QROOD_GOOGLE_TOKEN_
 - **Aucune liaison automatique.** Si un compte existe déjà avec cette adresse, la connexion est refusée. Une adresse en commun ne prouve rien — un compte peut avoir été créé par quelqu'un qui n'a jamais confirmé la sienne, et le lui remettre reviendrait à lui céder le compte.
 - Une identité dont l'adresse n'est pas déclarée vérifiée par le fournisseur est refusée, sans créer de compte.
 - Le `state` est tiré au hasard, mis dans un cookie `HttpOnly` borné à dix minutes et aux seules routes Google, puis relu en comparaison constante. Le cookie est effacé par la réponse, succès ou échec.
+- **Le cookie d'état est signé.** Il porte le `state`, l'intention du parcours, le compte et la session visés, plus une signature HMAC que le serveur seul peut produire. Sans elle, quiconque peut poser un cookie à ce nom — un hôte frère du même domaine, un trajet non chiffré, une fuite d'en-tête — désignerait lui-même le compte et la session, et une liaison s'appliquerait ensuite à la victime avec l'identité de l'attaquant. Un cookie dont la signature ne correspond pas est lu comme illisible : le parcours est refusé, jamais réinterprété.
 - La destination de retour ne peut être qu'un chemin de ce site : une URL absolue, un `//exemple.test` ou un `/\exemple.test` sont ramenés à la racine. Le `Location` rendu est relatif, il ne peut donc pas désigner un autre site.
 - Un compte créé par Google n'a pas de mot de passe (`password_hash` est `NULL`) et ne peut pas être ouvert par `POST /api/auth/login` : la réponse est identique à celle d'une adresse inconnue, sans révéler que le compte existe.
 - L'adresse déclarée vérifiée par Google est enregistrée comme vérifiée : c'est la preuve du fournisseur qui vaut confirmation, aucun e-mail n'est envoyé.
 - Les échecs sont rendus par un code court dans l'URL de retour (`?oauth=…`) ; le message est écrit par l'interface, jamais par le serveur. Aucun secret du fournisseur n'est écrit dans le journal.
 
-**Non couvert à ce stade :** la page profil ne sait pas encore lier ou délier une identité Google, donc un compte local et un compte Google ne peuvent pas être réunis. Un compte créé par Google n'a pas de second facteur propre : l'identité Google en tient lieu, y compris lorsqu'un mot de passe existe aussi sur ce compte.
+### Relier une identité à un compte existant
+
+La page « Mon compte » sait relier et délier une identité Google, et se ré-authentifier par elle.
+
+- **Relier** (`POST /api/account/google/link`) exige le mot de passe actuel, puis un aller-retour par le fournisseur. Rien n'est remplacé : ni le mot de passe, ni l'adresse, ni les QR codes. Le compte garde la sienne — l'adresse déclarée par Google n'entre pas dans le compte.
+- Le `state` de ce parcours est lié à la session et au compte : une liaison commencée par un compte et achevée dans une autre session est refusée (`session_expiree`), de même qu'un lien ouvert sans session. Une session fermée entre-temps ne laisse donc pas une liaison en suspens.
+- **Délier** (`POST /api/account/google/unlink`) exige le mot de passe actuel et est immédiat. L'identité libérée n'est plus rattachée à ce compte : la prochaine connexion avec elle crée un compte distinct, avec une bibliothèque vide. Un compte sans mot de passe ne peut pas être délié — il lui resterait un accès et aucune autre porte (`password_required_to_unlink`). Ce refus est rendu avant toute demande de preuve : sans mot de passe, aucun aller par Google n'y répondrait. Délier ne demande rien au fournisseur et reste donc possible même si la configuration Google disparaît ; un lien qui subsiste ne deviendrait pas impossible à retirer.
+- **La double authentification prime sur Google.** Un compte qui exige un code à chaque connexion ne peut ni se connecter par Google, ni y relier une identité, ni s'en servir pour se ré-authentifier (`two_factor_conflict`, `deux_facteurs`). Google ne remplace pas un second facteur : il en est un, parmi d'autres.
+- **Un compte sans mot de passe ne peut pas activer la double authentification** (`password_required_before_two_factor`). Elle fermerait partout la seule porte qui l'ouvre : connexion Google refusée, liaison et ré-authentification refusées, aucun mot de passe à saisir. Il ne resterait qu'une réinitialisation par e-mail, pour un compte qui n'en a jamais connu. La page du compte ne propose donc pas l'activation tant qu'aucun mot de passe n'est défini.
+- **Les comptes sans mot de passe.** Changer d'adresse, définir un mot de passe et supprimer le compte sont des actions qu'un mot de passe autorise. Sur un compte créé par Google, la preuve tient lieu de mot de passe : le retour du fournisseur date la session (`sessions.fresh_until`), et cette preuve vaut `QROOD_FRESH_WINDOW_MINUTES` minutes — quinze par défaut. Passé ce délai, l'action est refusée (`reauth_required`) et la page propose de renouveler la preuve (`POST /api/account/google/reauth`). Un compte qui reçoit un mot de passe referme cette voie : le mot de passe redevient exigé.
+- Un aller-retour de ré-authentification ne vaut que pour l'identité reliée au compte : ouvrir la page avec une autre identité Google est refusé (`autre_identite`), et aucune fenêtre n'est rouverte.
 
 ## Configuration
 
@@ -256,6 +268,16 @@ Par défaut, l’interface reste en **mode direct local** : le QR code contient 
 ```powershell
 $env:QROOD_ALLOW_PRIVATE_DESTINATIONS = "true"
 ```
+
+`QROOD_FRESH_WINDOW_MINUTES` règle la durée de validité d'une preuve d'identité Google sur un compte sans mot de passe : quinze minutes par défaut, une minute au minimum, une heure au maximum. Une valeur plus courte expose le compte pendant une fenêtre plus large, une valeur plus longue revient à laisser une session voler la place du mot de passe.
+
+`QROOD_OAUTH_FLOW_KEY` est la clé qui signe le cookie d'état des parcours Google. Elle n'est pas obligatoire : à défaut, le serveur tire une clé aléatoire au démarrage, ce qui invalide les parcours en cours au redémarrage — sans conséquence, un flux de dix minutes serait de toute façon expiré. Définissez-la dès que le serveur tourne sur plusieurs instances ou derrière un redémarrage, pour qu'un parcours commencé ailleurs se termine ici :
+
+```powershell
+$env:QROOD_OAUTH_FLOW_KEY = "32 octets aléatoires, gardés secrets"
+```
+
+Une clé partagée n'appartient qu'à ce but : elle ne remplace ni le secret du client OAuth, ni celui des sessions. La changer annule les parcours en cours, sans plus de conséquence.
 
 ### Limite connue : alias DNS privés
 
@@ -288,15 +310,22 @@ Le back-office est couvert par `test/admin.test.mjs` (huit scénarios sur un ser
 - l'offre offerte : refus des offres inexistantes et des durées hors bornes, échéance conforme à la durée demandée, remplacement d'un accès précédent sans accumuler de lignes, refus sur un compte porteur d'un abonnement Stripe, et mention au journal de l'offre, de la durée et de l'offre précédente ;
 - la double authentification : repli par mot de passe, activation par code confirmé, rejet d'un code rejoué, code de récupération à usage unique, et mention du facteur utilisé au journal.
 
-La connexion Google est couverte par `test/oauth.test.mjs`, qui fait tourner un faux fournisseur sur une autre machine (sept scénarios) :
+La connexion Google est couverte par `test/oauth.test.mjs`, qui fait tourner un faux fournisseur sur la machine locale (quatorze scénarios) :
 
 - le flux complet : aller, échange du code authentifié, lecture du profil, création d'un compte sans mot de passe, session ouverte et identité retrouvée sur le retour suivant, même quand l'adresse du fournisseur a changé ;
 - le `state` : absent, différent, rejoué après effacement du cookie, code injecté sans échange préalable, refus de Google et code manquant ;
 - les identités non prouvées (adresse non vérifiée, absente ou mal formée) et un fournisseur qui répond mal, sans secret dans le journal ;
 - le refus de reprendre ou de lier un compte existant, et le fait qu'un compte sans mot de passe ne s'ouvre pas par `POST /api/auth/login` ;
 - la destination de retour : un chemin du site est conservé, toute adresse extérieure est ramenée à la racine ;
-- l'absence de configuration : `404 oauth_unavailable` et `googleEnabled: false` ;
-- la migration d'une base d'avant la connexion Google : `password_hash` rendu facultatif, comptes conservés, références et index reposés, second démarrage sans effet.
+- l'absence de configuration : `404 oauth_unavailable` et `googleEnabled: false`, mais une déliaison qui répond quand même au lieu de disparaître avec le fournisseur ;
+- la migration d'une base d'avant la connexion Google : `password_hash` rendu facultatif, comptes conservés, références et index reposés, second démarrage sans effet ;
+- la liaison : mot de passe exigé, mot de passe conservé, adresse du fournisseur écartée, connexion Google ensuite dirigée vers le seul compte existant, seconde liaison refusée ;
+- la liaison et la session : refus sans session, refus sur une autre session, refus après fermeture de la session d'origine, et aucun changement en base ;
+- la double authentification, prioritaire dans les deux sens : liaison et connexion Google refusées sur un compte protégé, refus de la connexion Google après une activation, et repli toujours possible par mot de passe et code ;
+- la preuve d'un compte sans mot de passe : session fraîche au retour du fournisseur, expiration de la fenêtre, refus de changer d'adresse et de supprimer le compte sans preuve, refus de délier le dernier accès, ré-authentification par une autre identité refusée, puis changement d'adresse accepté — et, une fois un mot de passe défini, exigence du mot de passe revenue ;
+- la déliaison : refus quand rien n'est relié, exigence du mot de passe, mot de passe et session conservés, connexion par mot de passe intacte, et identité libérée qui crée son propre compte sans reprendre l'ancien ;
+- le cookie d'état forgé : un cookie qui désigne lui-même le compte et la session d'une victime est refusé sans échange du code, sans lien en base et sans compte créé, et réécrire l'intention ne change rien — la signature ne correspond plus, le cookie est illisible ;
+- l'activation de la double authentification sans mot de passe : refus avant l'émission de tout secret, refus de délier qui nomme le mot de passe plutôt qu'une preuve impossible, puis activation acceptée une fois le mot de passe défini.
 
 ## Passage en production
 

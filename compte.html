@@ -14,7 +14,7 @@
     <link rel="stylesheet" href="styles.css?v=30" />
     <script src="cursor.js?v=3" defer></script>
     <script src="qrcode-generator.js" defer></script>
-    <script src="compte.js?v=2" defer></script>
+    <script src="compte.js?v=3" defer></script>
   </head>
   <body class="account-body">
     <div class="app-shell">
@@ -63,7 +63,7 @@
               <label for="newEmail">Nouvelle adresse e-mail</label>
               <input id="newEmail" name="email" type="email" maxlength="254" autocomplete="email" required />
             </div>
-            <div class="field-group">
+            <div class="field-group" id="emailPasswordGroup">
               <label for="emailPassword">Mot de passe actuel</label>
               <input id="emailPassword" name="currentPassword" type="password" maxlength="128" autocomplete="current-password" required />
             </div>
@@ -78,7 +78,7 @@
         <section class="account-card" aria-labelledby="passwordTitle">
           <h2 id="passwordTitle">Mot de passe</h2>
           <form id="passwordForm">
-            <div class="field-group">
+            <div class="field-group" id="oldPasswordGroup">
               <label for="oldPassword">Mot de passe actuel</label>
               <input id="oldPassword" name="currentPassword" type="password" maxlength="128" autocomplete="current-password" required />
             </div>
@@ -94,6 +94,41 @@
             <button class="button button-dark button-small" type="submit">Changer le mot de passe</button>
             <p class="field-hint">Tes autres sessions ouvertes seront déconnectées.</p>
           </form>
+        </section>
+
+        <section class="account-card" aria-labelledby="googleTitle" id="googleCard" hidden>
+          <h2 id="googleTitle">Connexion Google</h2>
+          <p class="field-hint" id="googleStatus">Chargement.</p>
+          <p class="account-note" id="googleNote" hidden></p>
+
+          <form id="googleLinkForm" hidden>
+            <div class="field-group">
+              <label for="googleLinkPassword">Mot de passe actuel</label>
+              <input id="googleLinkPassword" name="currentPassword" type="password" maxlength="128" autocomplete="current-password" required />
+              <p class="field-hint">
+                Relier n'efface rien : ni ton mot de passe, ni ton adresse, ni tes QR codes ne changent.
+                Google est alors une porte d'entrée de plus, à côté du mot de passe.
+              </p>
+            </div>
+            <button class="button button-dark button-small" type="submit">Relier mon compte Google</button>
+          </form>
+
+          <form id="googleUnlinkForm" hidden>
+            <div class="field-group">
+              <label for="googleUnlinkPassword">Mot de passe actuel</label>
+              <input id="googleUnlinkPassword" name="currentPassword" type="password" maxlength="128" autocomplete="current-password" required />
+              <p class="field-hint">
+                Délier est immédiat et définitif. Ensuite, te connecter avec cette identité Google créera
+                un compte distinct du tien, avec une bibliothèque vide : garde ton mot de passe, c'est lui
+                qui rouvre le bon compte.
+              </p>
+            </div>
+            <button class="button button-danger button-small" type="submit">Délier mon compte Google</button>
+          </form>
+
+          <div class="account-actions" id="googleActions" hidden>
+            <button class="button button-light button-small" id="googleReauthButton" type="button">Prouver mon identité avec Google</button>
+          </div>
         </section>
 
         <section class="account-card" aria-labelledby="twoFactorTitle">
@@ -133,7 +168,7 @@
             informations. Cette action est irréversible.
           </p>
           <form id="deleteForm">
-            <div class="field-group">
+            <div class="field-group" id="deletePasswordGroup">
               <label for="deletePassword">Mot de passe actuel</label>
               <input id="deletePassword" name="currentPassword" type="password" maxlength="128" autocomplete="current-password" required />
             </div>

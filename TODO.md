@@ -8,13 +8,14 @@ Dernière mise à jour : 5 octobre 2026.
 
 ## Connexion avec un compte tiers (Google, Microsoft, autre)
 
-Tranché : intégration directe des fournisseurs, sans service intermédiaire. Un compte Google se connecte ; Microsoft et les autressuivront le même schéma. Le premier jalon est livré, le reste de la liste est ce qui reste à faire.
+Tranché : intégration directe des fournisseurs, sans service intermédiaire. Un compte Google se connecte ; Microsoft et les autres suivront le même schéma. La connexion et la page profil sont livrées ; le reste de la liste est ce qui reste à faire.
 
 - [x] Table `users.auth_provider` / `users.provider_id`, et `password_hash` rendu facultatif — un compte créé par un fournisseur n'a rien à y écrire
 - [x] Index unique `(auth_provider, provider_id)` : un identifiant externe ne désigne qu'un compte
 - [x] Route de démarrage `/api/auth/google/start`, avec `state` tiré au hasard
 - [x] Route de retour `/api/auth/google/callback` : échange du code, lecture du profil, création ou ouverture de session
 - [x] `state` vérifié au retour en comparaison constante, cookie `HttpOnly` borné à dix minutes et aux routes Google
+- [x] Cookie d'état signé (HMAC, clé `QROOD_OAUTH_FLOW_KEY` ou aléatoire par processus) : sans signature, un tiers capable de poser ce cookie - hôte frère du domaine, trajet non chiffré, fuite d'en-tête - désignerait le compte et la session d'une victime et lui relierait sa propre identité Google
 - [x] Redirection après connexion contrainte au domaine QROOD (open redirect), `Location` relatif
 - [x] Aucune liaison automatique : une adresse déjà portée par un compte existant est refusée, sans rien lui demander
 - [x] Refus d'une identité dont l'adresse n'est pas déclarée vérifiée par le fournisseur
@@ -23,11 +24,17 @@ Tranché : intégration directe des fournisseurs, sans service intermédiaire. U
 - [x] Interface : messages d'échec écrits par le front, code court dans l'URL, jamais de texte venu du serveur
 - [x] Tests : flux complet, `state` absent/différent/rejoué, identité non prouvée, compte existant, open redirect, compte sans mot de passe, migration d'une base antérieure
 - [x] Points d'appel du fournisseur surchargeables hors production, pour que les tests ne sortent pas du réseau local
-- [ ] Page profil : lier et délier une identité Google, pour réunir un compte local et un compte Google
-- [ ] Second facteur : l'identité Google tient lieu de second facteur, y compris quand le compte a aussi un mot de passe. À trancher si la double authentification doit se cumuler à ce mode de connexion
-- [ ] Compte créé par Google : ni changement d'adresse ni changement de mot de passe depuis `/compte`, les deux exigent le mot de passe actuel. Une voie sans mot de passe est à ouvrir
+- [x] Page profil : lier et délier une identité Google, pour réunir un compte local et un compte Google — le mot de passe actuel est exigé dans les deux sens, et l'adresse du fournisseur n'entre jamais dans le compte
+- [x] Liaison astreinte à la session : refus sans session, sur une autre session, ou après fermeture de la session d'origine
+- [x] Second facteur tranché : la double authentification prime. Un compte qui exige un code ne se connecte pas par Google, n'y relie rien, et ne s'en sert pas pour se prouver — Google est un facteur parmi d'autres, jamais un substitut
+- [x] Compte créé par Google : voie sans mot de passe ouverte. Le retour du fournisseur date la session (`sessions.fresh_until`, quinze minutes par défaut), et cette preuve remplace le mot de passe pour l'adresse, le mot de passe et la suppression. Un mot de passe défini la referme
+- [x] Interface : section « Connexion Google » sur `/compte`, messages du retour (`liaison_reussie`, `reauth_reussie`, refus), champs de mot de passe masqués quand le compte n'en a pas
+- [x] Délier reste possible sans configuration Google : retirer une identité ne demande rien au fournisseur, faute de quoi un lien survivrait à la disparition des identifiants sans aucun moyen de s'en défaire
+- [x] Un compte sans mot de passe ne peut pas activer la double authentification : elle lui fermerait partout sa seule porte - connexion Google, liaison, ré-authentification et suppression d'un lien. Refus rendu avant l'émission de tout secret, bouton masqué sur `/compte`
+- [x] Un compte sans mot de passe ne peut pas être délié, et le refus nomme le mot de passe à définir avant de renvoyer vers une preuve Google qui n'y pourrait rien
+- [x] Tests : liaison, session étrangère, priorité de la double authentification, fenêtre de preuve qui expire, identité relibérée, cookie d'état forgé, activation A2F sans mot de passe — quatorze scénarios au total
 - [ ] Microsoft, puis tout autre fournisseur : même schéma, en généralisant le `state` au-delà de Google
-- [ ] Vérifier en navigateur : bouton, messages d'échec, retour sur la bonne page
+- [ ] Vérifier en navigateur : bouton, section du compte, messages d'échec, retour sur la bonne page
 
 ## A2F pour les comptes utilisateurs
 
@@ -48,6 +55,8 @@ Livré, mais jamais ouvert dans un vrai navigateur : aucun outil de pilotage nav
 - [ ] Raccourci `/compte` → `/back-office` et affichage conditionné au rôle
 - [ ] Affichage d'une offre offerte sur `/compte` (« Offert, aucun abonnement », « Jusqu'au »)
 - [ ] Bouton « Continuer avec Google » dans la modale d'authentification, et messages d'échec du retour
+- [ ] Section « Connexion Google » sur `/compte` : champs masqués pour un compte sans mot de passe, lien de preuve révélé après un refus `reauth_required`, avertissement avant une déliaison
+- [ ] A2F sur `/compte` : pas de bouton « Activer » sans mot de passe, et la ligne d'état qui explique pourquoi
 
 Si un point se reproduit, le diagnostic se fait dans le navigateur : `jsdom` et `linkedom` ne sont pas installés, et `admin.js` n'a pas de point d'entrée testable sans ajouter une dépendance.
 
