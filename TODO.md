@@ -2,23 +2,32 @@
 
 Sujet de suivi du projet QROOD. Format lisible par l'extension **Todo Tree** (VS Code) : `- [ ]` à faire, `- [x] livré.
 
-Dernière mise à jour : 3 octobre 2026.
+Dernière mise à jour : 5 octobre 2026.
 
 ---
 
 ## Connexion avec un compte tiers (Google, Microsoft, autre)
 
-- [ ] Trancher : service intermédiaire (Auth0, Clerk, Supabase Auth) ou intégration directe des fournisseurs
-- [ ] Trancher quels fournisseurs, et dans quel ordre
-- [ ] Trancher si le mot de passe devient facultatif — `users.password_hash` est `NOT NULL`, un compte créé par OAuth n'a rien à y mettre
-- [ ] Table `user_identities` (compte ↔ fournisseur ↔ identifiant externe), une ligne par mode de connexion rattaché à un compte
-- [ ] Route de démarrage `/auth/:provider`
-- [ ] Route de retour `/auth/:provider/callback`
-- [ ] Paramètre `state` vérifié au retour : sans lui, le callback est ouvert à la réutilisation
-- [ ] Redirection après connexion contrainte au domaine QROOD (open redirect)
-- [ ] Liaison par adresse e-mail uniquement si le fournisseur la déclare vérifiée, et jamais d'écrasement silencieux d'un compte existant
-- [ ] Page profil : lier et délier un mode de connexion
-- [ ] Tests : linkage, rejet d'e-mail non vérifié, rejeu de `state`, open redirect, compte sans mot de passe
+Tranché : intégration directe des fournisseurs, sans service intermédiaire. Un compte Google se connecte ; Microsoft et les autressuivront le même schéma. Le premier jalon est livré, le reste de la liste est ce qui reste à faire.
+
+- [x] Table `users.auth_provider` / `users.provider_id`, et `password_hash` rendu facultatif — un compte créé par un fournisseur n'a rien à y écrire
+- [x] Index unique `(auth_provider, provider_id)` : un identifiant externe ne désigne qu'un compte
+- [x] Route de démarrage `/api/auth/google/start`, avec `state` tiré au hasard
+- [x] Route de retour `/api/auth/google/callback` : échange du code, lecture du profil, création ou ouverture de session
+- [x] `state` vérifié au retour en comparaison constante, cookie `HttpOnly` borné à dix minutes et aux routes Google
+- [x] Redirection après connexion contrainte au domaine QROOD (open redirect), `Location` relatif
+- [x] Aucune liaison automatique : une adresse déjà portée par un compte existant est refusée, sans rien lui demander
+- [x] Refus d'une identité dont l'adresse n'est pas déclarée vérifiée par le fournisseur
+- [x] Compte retrouvé par l'identifiant externe, pas par l'adresse : un changement d'adresse chez Google ne perd pas l'accès
+- [x] Interface : bouton « Continuer avec Google », affiché seulement si le serveur le dit configuré
+- [x] Interface : messages d'échec écrits par le front, code court dans l'URL, jamais de texte venu du serveur
+- [x] Tests : flux complet, `state` absent/différent/rejoué, identité non prouvée, compte existant, open redirect, compte sans mot de passe, migration d'une base antérieure
+- [x] Points d'appel du fournisseur surchargeables hors production, pour que les tests ne sortent pas du réseau local
+- [ ] Page profil : lier et délier une identité Google, pour réunir un compte local et un compte Google
+- [ ] Second facteur : l'identité Google tient lieu de second facteur, y compris quand le compte a aussi un mot de passe. À trancher si la double authentification doit se cumuler à ce mode de connexion
+- [ ] Compte créé par Google : ni changement d'adresse ni changement de mot de passe depuis `/compte`, les deux exigent le mot de passe actuel. Une voie sans mot de passe est à ouvrir
+- [ ] Microsoft, puis tout autre fournisseur : même schéma, en généralisant le `state` au-delà de Google
+- [ ] Vérifier en navigateur : bouton, messages d'échec, retour sur la bonne page
 
 ## A2F pour les comptes utilisateurs
 
@@ -38,6 +47,7 @@ Livré, mais jamais ouvert dans un vrai navigateur : aucun outil de pilotage nav
 - [ ] Rendu de la modale A2F : QR code, secret de secours, codes de récupération
 - [ ] Raccourci `/compte` → `/back-office` et affichage conditionné au rôle
 - [ ] Affichage d'une offre offerte sur `/compte` (« Offert, aucun abonnement », « Jusqu'au »)
+- [ ] Bouton « Continuer avec Google » dans la modale d'authentification, et messages d'échec du retour
 
 Si un point se reproduit, le diagnostic se fait dans le navigateur : `jsdom` et `linkedom` ne sont pas installés, et `admin.js` n'a pas de point d'entrée testable sans ajouter une dépendance.
 

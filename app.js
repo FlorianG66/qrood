@@ -1021,6 +1021,7 @@
       updatePreview();
       renderHistory();
       handleBillingReturn();
+      handleOauthReturn();
     }, { once: true });
   }
 
@@ -1104,6 +1105,8 @@
     elements.authError = $("#authError");
     elements.loginForm = $("#loginForm");
     elements.registerForm = $("#registerForm");
+    elements.googleAuth = $("#googleAuth");
+    elements.googleSignIn = $("#googleSignIn");
     elements.statsModal = $("#statsModal");
     elements.toast = $("#toast");
     elements.toastMessage = $("#toastMessage");
@@ -1273,6 +1276,12 @@
     });
     elements.loginForm.addEventListener("submit", handleLogin);
     elements.registerForm.addEventListener("submit", handleRegister);
+    elements.googleSignIn?.addEventListener("click", () => {
+      // Le serveur ne rend l'utilisateur qu'à une adresse de ce site : la page
+      // courante est transmise pour qu'il revienne où il était, et il décide.
+      const here = `${window.location.pathname}${window.location.search}`;
+      elements.googleSignIn.href = `/api/auth/google/start?next=${encodeURIComponent(here)}`;
+    });
     $$("[data-close-modal]").forEach((button) => {
       button.addEventListener("click", () => closeModal(button.dataset.closeModal));
     });
@@ -2942,6 +2951,7 @@
     const attempt = state.authAttempt;
     const result = await api("/api/auth/me");
     if (attempt !== state.authAttempt) return;
+    renderGoogleAuth(result.googleEnabled);
     if (!result.user) {
       clearSession();
       return;
@@ -2965,6 +2975,41 @@
     state.subscription = result.subscription || null;
     state.legacyHistory = loadLegacyHistoryForUser(result.user.id);
     renderAuthState();
+  }
+
+  // Le lien Google reste masqué tant que le serveur n'a pas dit qu'un fournisseur
+  // est configuré : annoncer une connexion qui n'existe pas serait pire que son
+  // absence. La décision vient du serveur à chaque chargement, jamais du cache.
+  function renderGoogleAuth(enabled) {
+    // Le bouton suit la configuration du serveur, jamais l'inverse : sans
+    // identifiants côté Google, un clic ne mènerait qu'à une page d'erreur.
+    if (elements.googleAuth) elements.googleAuth.hidden = !enabled;
+  }
+
+  // Le retour d'une connexion Google porte un code court, jamais un texte : le
+  // message est écrit ici, et l'URL est nettoyée pour qu'un rechargement ne
+  // répète pas l'annonce d'un échec déjà traitées.
+  const OAUTH_MESSAGES = {
+    refus: "Connexion Google annulée.",
+    state_invalide: "Connexion Google expirée. Recommencez depuis cette page.",
+    code_manquant: "Google n’a pas renvoyé de code d’autorisation. Recommencez.",
+    identite_refusee: "Google n’a pas confirmé votre adresse. Un compte Google vérifié est nécessaire.",
+    email_deja_utilise: "Un compte existe déjà avec cette adresse. Connectez-vous par mot de passe.",
+    fournisseur_indisponible: "Google ne répond pas. Réessayez dans un instant.",
+  };
+
+  function handleOauthReturn() {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("oauth");
+    if (!code) return;
+    window.history.replaceState({}, "", `${window.location.pathname}${window.location.hash}`);
+    if (code === "succes") {
+      showToast("Connexion réussie.");
+      return;
+    }
+    const message = OAUTH_MESSAGES[code] || "La connexion Google n’a pas abouti.";
+    if (state.user) showToast(message);
+    else openAuthModal("login", message);
   }
 
   function clearEditor() {

@@ -3815,6 +3815,64 @@ body.modal-open .app-shell *::after {
   display: none;
 }
 
+/* Connexion Google : le lien est un lien, pas un bouton de formulaire — c'est le
+   serveur qui renvoie vers Google, donc le retour à la page d'accueil fonctionne
+   même si ce script ne s'exécute pas. Masqué tant que le serveur n'a pas confirmé
+   qu'un fournisseur est configuré. */
+.auth-alt[hidden] {
+  display: none;
+}
+
+.auth-alt-rule {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 18px 0 14px;
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.auth-alt-rule::before,
+.auth-alt-rule::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+.auth-alt-link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 0 18px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink);
+  background: var(--white);
+  font-size: 11px;
+  font-weight: 800;
+  transition: transform var(--duration-fast) var(--ease-out), box-shadow var(--duration-fast) var(--ease-out);
+}
+
+.auth-alt-link:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 18px rgba(16, 27, 51, 0.09);
+}
+
+.auth-alt-link:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.auth-alt-mark {
+  flex: 0 0 auto;
+}
+
 .security-note,
 .privacy-note {
   display: flex;

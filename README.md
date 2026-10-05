@@ -40,6 +40,7 @@ Le serveur s’arrête automatiquement après 30 minutes sans requête métier (
 - Export PNG 1024 px et SVG vectoriel
 - Copie du contenu encodé
 - Inscription et connexion par e-mail/mot de passe
+- Connexion avec un compte Google, sans liaison automatique à un compte existant
 - Sessions serveur avec cookie `HttpOnly` et `SameSite=Strict`
 - Bibliothèque personnelle accessible sur les autres navigateurs après connexion
 - Statistiques : nombre de scans, évolution sur 30 jours, dernier scan, type d’appareil et domaine de provenance
@@ -199,6 +200,42 @@ Tant que la double authentification n'est pas activée, chaque intervention dema
 - Le journal note le facteur réellement utilisé (`password`, `totp`, `recovery`), ce qui distingue une intervention validée par le propriétaire d'une intervention validée par un mot de passe volé.
 - Les tentatives sont limitées par période, activation et désactivation comprises.
 
+## Connexion avec un compte Google
+
+### Mise en place
+
+1. Créer un client OAuth de type « Application Web » dans la console Google, avec l'autorisation `openid email profile` et l'URI de redirection exacte :
+
+   ```
+   https://qr.example.com/api/auth/google/callback
+   ```
+
+2. Déclarer les variables d'environnement :
+
+```powershell
+$env:QROOD_GOOGLE_CLIENT_ID = "…apps.googleusercontent.com"
+$env:QROOD_GOOGLE_CLIENT_SECRET = "GOCSPX-…"
+```
+
+Le préfixe `GOOGLE_` est aussi accepté, sans le `QROOD_`. Sans ces deux valeurs, aucun bouton ne s'affiche et les routes répondent `404 oauth_unavailable` : le reste de la plateforme fonctionne normalement. `GOOGLE_REDIRECT_URI` n'est à définir que si l'URI de redirection déclarée chez Google n'est pas celle déduite de `QROOD_PUBLIC_ORIGIN`.
+
+Les points d'appel du fournisseur (`QROOD_GOOGLE_AUTH_URL`, `QROOD_GOOGLE_TOKEN_URL`, `QROOD_GOOGLE_USERINFO_URL`) sont surchargeables uniquement hors production : le serveur refuse de démarrer si l'un d'eux est modifié alors que `NODE_ENV=production`. C'est ce qui permet aux tests de suivre le flux de bout en bout sans sortir du réseau local.
+
+### Fonctionnement
+
+- Le bouton n'est affiché que si le serveur confirme qu'un fournisseur est configuré : la décision est relue à chaque chargement, jamais supposée par l'interface.
+- Le parcours est le flux `code` d'OAuth 2.0 : aller sur `/api/auth/google/start`, échange du code contre un jeton d'accès, puis lecture du profil. Les deux appels réseau sont bornés à dix secondes et refusent toute redirection vers une autre origine.
+- Le compte est cherché par l'identifiant externe du fournisseur (`sub`), jamais par l'adresse : une adresse Google peut changer, l'identifiant non.
+- **Aucune liaison automatique.** Si un compte existe déjà avec cette adresse, la connexion est refusée. Une adresse en commun ne prouve rien — un compte peut avoir été créé par quelqu'un qui n'a jamais confirmé la sienne, et le lui remettre reviendrait à lui céder le compte.
+- Une identité dont l'adresse n'est pas déclarée vérifiée par le fournisseur est refusée, sans créer de compte.
+- Le `state` est tiré au hasard, mis dans un cookie `HttpOnly` borné à dix minutes et aux seules routes Google, puis relu en comparaison constante. Le cookie est effacé par la réponse, succès ou échec.
+- La destination de retour ne peut être qu'un chemin de ce site : une URL absolue, un `//exemple.test` ou un `/\exemple.test` sont ramenés à la racine. Le `Location` rendu est relatif, il ne peut donc pas désigner un autre site.
+- Un compte créé par Google n'a pas de mot de passe (`password_hash` est `NULL`) et ne peut pas être ouvert par `POST /api/auth/login` : la réponse est identique à celle d'une adresse inconnue, sans révéler que le compte existe.
+- L'adresse déclarée vérifiée par Google est enregistrée comme vérifiée : c'est la preuve du fournisseur qui vaut confirmation, aucun e-mail n'est envoyé.
+- Les échecs sont rendus par un code court dans l'URL de retour (`?oauth=…`) ; le message est écrit par l'interface, jamais par le serveur. Aucun secret du fournisseur n'est écrit dans le journal.
+
+**Non couvert à ce stade :** la page profil ne sait pas encore lier ou délier une identité Google, donc un compte local et un compte Google ne peuvent pas être réunis. Un compte créé par Google n'a pas de second facteur propre : l'identité Google en tient lieu, y compris lorsqu'un mot de passe existe aussi sur ce compte.
+
 ## Configuration
 
 Les variables d’environnement sont utiles pour une installation derrière un proxy HTTPS :
@@ -250,6 +287,16 @@ Le back-office est couvert par `test/admin.test.mjs` (huit scénarios sur un ser
 - l'application effective des actions, avec un journal qui survit à la suppression du compte visé ;
 - l'offre offerte : refus des offres inexistantes et des durées hors bornes, échéance conforme à la durée demandée, remplacement d'un accès précédent sans accumuler de lignes, refus sur un compte porteur d'un abonnement Stripe, et mention au journal de l'offre, de la durée et de l'offre précédente ;
 - la double authentification : repli par mot de passe, activation par code confirmé, rejet d'un code rejoué, code de récupération à usage unique, et mention du facteur utilisé au journal.
+
+La connexion Google est couverte par `test/oauth.test.mjs`, qui fait tourner un faux fournisseur sur une autre machine (sept scénarios) :
+
+- le flux complet : aller, échange du code authentifié, lecture du profil, création d'un compte sans mot de passe, session ouverte et identité retrouvée sur le retour suivant, même quand l'adresse du fournisseur a changé ;
+- le `state` : absent, différent, rejoué après effacement du cookie, code injecté sans échange préalable, refus de Google et code manquant ;
+- les identités non prouvées (adresse non vérifiée, absente ou mal formée) et un fournisseur qui répond mal, sans secret dans le journal ;
+- le refus de reprendre ou de lier un compte existant, et le fait qu'un compte sans mot de passe ne s'ouvre pas par `POST /api/auth/login` ;
+- la destination de retour : un chemin du site est conservé, toute adresse extérieure est ramenée à la racine ;
+- l'absence de configuration : `404 oauth_unavailable` et `googleEnabled: false` ;
+- la migration d'une base d'avant la connexion Google : `password_hash` rendu facultatif, comptes conservés, références et index reposés, second démarrage sans effet.
 
 ## Passage en production
 

@@ -157,8 +157,8 @@ const EMAIL_CHANGE_PURPOSE = "email_change";
 const VERIFICATION_TOKEN_TTL_MS = readInteger("QROOD_VERIFICATION_TOKEN_HOURS", 24, 1, 168) * 60 * 60 * 1_000;
 const RESET_TOKEN_TTL_MS = readInteger("QROOD_RESET_TOKEN_MINUTES", 60, 5, 1_440) * 60 * 1_000;
 const EMAIL_CHANGE_TOKEN_TTL_MS = readInteger("QROOD_EMAIL_CHANGE_TOKEN_MINUTES", 60, 5, 1_440) * 60 * 1_000;
-// Plancher entre deux envois pour une mǦme adresse et un mǦme but : il
-// dǸpend de l'heure du dernier envoi, donc il survit au redǸmarrage.
+// Plancher entre deux envois pour une même adresse et un même but : il
+// dépend de l'heure du dernier envoi, donc il survit au redémarrage.
 const MAIL_RESEND_DELAY_MS = readInteger("QROOD_MAIL_RESEND_DELAY_SECONDS", 60, 0, 3_600) * 1_000;
 const MAIL_TRANSPORT = (readStripeEnv("MAIL_TRANSPORT") || "outbox").toLowerCase();
 const MAIL_FROM = readStripeEnv("MAIL_FROM") || "no-reply@qrood.example";
@@ -167,10 +167,37 @@ const MAIL_OUTBOX_DIRECTORY = process.env.QROOD_MAIL_OUTBOX_DIR
 const MAIL_API_URL = readStripeEnv("MAIL_API_URL");
 const MAIL_API_KEY = readStripeEnv("MAIL_API_KEY");
 
-// Auth OAuth Google
-const GOOGLE_CLIENT_ID = readStripeEnv("GOOGLE_CLIENT_ID") || process.env.GOOGLE_CLIENT_ID || "";
-const GOOGLE_CLIENT_SECRET = readStripeEnv("GOOGLE_CLIENT_SECRET") || process.env.GOOGLE_CLIENT_SECRET || "";
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `${PUBLIC_ORIGIN}/api/auth/google/callback`;
+// Connexion avec un compte Google. Sans identifiants configurés, le fournisseur
+// n'existe pas : les routes répondent « introuvable » et l'interface n'affiche
+// aucun bouton, plutôt que d'annoncer une connexion qui échouerait toujours.
+const GOOGLE_CLIENT_ID = readStripeEnv("GOOGLE_CLIENT_ID");
+const GOOGLE_CLIENT_SECRET = readStripeEnv("GOOGLE_CLIENT_SECRET");
+const GOOGLE_REDIRECT_URI = readStripeEnv("GOOGLE_REDIRECT_URI") || `${PUBLIC_ORIGIN}/api/auth/google/callback`;
+// Les trois points d'appel du fournisseur sont surchargeables, sinon aucun test ne
+// peut suivre le flux de bout en bout sans aller sur Internet. Le garde-fou de
+// production est deux lignes plus bas : en production, ils ne sont pas surchargeables.
+const GOOGLE_DEFAULT_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_DEFAULT_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const GOOGLE_DEFAULT_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo";
+const GOOGLE_AUTH_URL = cleanText(process.env.QROOD_GOOGLE_AUTH_URL, 500) || GOOGLE_DEFAULT_AUTH_URL;
+const GOOGLE_TOKEN_URL = cleanText(process.env.QROOD_GOOGLE_TOKEN_URL, 500) || GOOGLE_DEFAULT_TOKEN_URL;
+const GOOGLE_USERINFO_URL = cleanText(process.env.QROOD_GOOGLE_USERINFO_URL, 500) || GOOGLE_DEFAULT_USERINFO_URL;
+const GOOGLE_AUTH_ENABLED = Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+const GOOGLE_HTTP_TIMEOUT_MS = 10_000;
+
+if (!/^https?:\/\/[^\s/]+/.test(GOOGLE_REDIRECT_URI)) {
+  throw new Error("GOOGLE_REDIRECT_URI doit être une URL HTTP ou HTTPS absolue.");
+}
+if (IS_PRODUCTION) {
+  if (!GOOGLE_REDIRECT_URI.startsWith("https://")) {
+    throw new Error("GOOGLE_REDIRECT_URI doit utiliser HTTPS en production.");
+  }
+  if (GOOGLE_AUTH_URL !== GOOGLE_DEFAULT_AUTH_URL
+    || GOOGLE_TOKEN_URL !== GOOGLE_DEFAULT_TOKEN_URL
+    || GOOGLE_USERINFO_URL !== GOOGLE_DEFAULT_USERINFO_URL) {
+    throw new Error("Les points d'appel Google ne se surchargent pas en production.");
+  }
+}
 
 if (IS_PRODUCTION && !PUBLIC_ORIGIN.startsWith("https://")) {
   throw new Error("QROOD_PUBLIC_ORIGIN doit utiliser HTTPS en production.");
@@ -532,6 +559,107 @@ function ensureSuperAdminColumn() {
   }
 }
 
+// Le fournisseur d'identité est ajouté par `ALTER TABLE` et non dans le `CREATE TABLE`
+// ci-dessus, qui ne s'applique qu'aux bases neuves. `NOT NULL DEFAULT 'local'` rend la
+// colonne valide pour toutes les lignes existantes sans les parcourir : aucun compte
+// créé avant la migration ne se retrouve lié à un fournisseur.
+function ensureAuthProviderColumns() {
+  const names = new Set(db.prepare("PRAGMA table_info(users)").all().map((column) => column.name));
+  if (!names.has("auth_provider")) {
+    db.exec("ALTER TABLE users ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'local' CHECK(auth_provider IN ('local','google'))");
+  }
+  if (!names.has("provider_id")) {
+    db.exec("ALTER TABLE users ADD COLUMN provider_id TEXT");
+  }
+  // Un identifiant externe ne désigne qu'un compte, et un compte ne porte qu'un seul
+  // identifiant Google : l'index est la garantie matérielle en cas de deux callbacks
+  // simultanés, là où le SELECT voit le même état que la requête concurrente.
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_provider_identity
+      ON users(auth_provider, provider_id)
+      WHERE provider_id IS NOT NULL
+  `);
+  relaxPasswordHashNotNull();
+}
+
+// Un compte créé par Google n'a pas de mot de passe : `password_hash` devient
+// facultatif, `NULL` signifiant « aucun mot de passe local ». SQLite ne sait pas lever
+// un `NOT NULL`, donc la table est recréée à l'identique, lignes conservées, puis les
+// index reposés. Sept tables référencent `users` : `PRAGMA foreign_keys` est désactivé
+// autour de l'opération — le pragma est ignoré à l'intérieur d'une transaction — et
+// rétabli aussitôt après, que la reprise ait abouti ou non.
+const USERS_COLUMNS = [
+  "id",
+  "display_name",
+  "email",
+  "password_hash",
+  "created_at",
+  "pending_email",
+  "is_super_admin",
+  "email_verified_at",
+  "auth_provider",
+  "provider_id",
+];
+
+function relaxPasswordHashNotNull() {
+  const declared = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'").get()?.sql || "";
+  if (!declared.includes("password_hash TEXT NOT NULL")) return;
+
+  const columns = db.prepare("PRAGMA table_info(users)").all().map((column) => column.name);
+  const unexpected = columns.filter((name) => !USERS_COLUMNS.includes(name));
+  const missing = USERS_COLUMNS.filter((name) => !columns.includes(name));
+  if (unexpected.length || missing.length) {
+    // Recopier en ignorant une colonne reviendrait à perdre des comptes en silence.
+    // Le serveur refuse de démarrer : la liste est nommée, la correction est locale.
+    throw new Error(
+      `La table users ne correspond pas à la migration (en trop : ${unexpected.join(", ") || "aucune"} ; `
+      + `manquantes : ${missing.join(", ") || "aucune"}).`,
+    );
+  }
+
+  const selectList = USERS_COLUMNS.map((name) => `"${name}"`).join(", ");
+  db.exec("PRAGMA foreign_keys = OFF;");
+  try {
+    db.exec("BEGIN;");
+    db.exec(`
+      CREATE TABLE users_retablies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        display_name TEXT NOT NULL,
+        email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        password_hash TEXT,
+        created_at INTEGER NOT NULL,
+        pending_email TEXT,
+        is_super_admin INTEGER NOT NULL DEFAULT 0 CHECK(is_super_admin IN (0,1)),
+        email_verified_at INTEGER,
+        auth_provider TEXT NOT NULL DEFAULT 'local' CHECK(auth_provider IN ('local','google')),
+        provider_id TEXT
+      ) STRICT;
+    `);
+    db.prepare(`INSERT INTO users_retablies SELECT ${selectList} FROM users;`).run();
+    const copied = db.prepare("SELECT COUNT(*) AS total FROM users_retablies").get().total;
+    const expected = db.prepare("SELECT COUNT(*) AS total FROM users").get().total;
+    if (copied !== expected) {
+      throw new Error(`la reprise de users a copié ${copied} lignes sur ${expected}.`);
+    }
+    db.exec("DROP TABLE users;");
+    db.exec("ALTER TABLE users_retablies RENAME TO users;");
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_pending_email
+        ON users(pending_email)
+        WHERE pending_email IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_provider_identity
+        ON users(auth_provider, provider_id)
+        WHERE provider_id IS NOT NULL;
+    `);
+    db.exec("COMMIT;");
+  } catch (error) {
+    db.exec("ROLLBACK;");
+    throw error;
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON;");
+  }
+}
+
 // La double authentification n'appartient plus au seul rôle super-admin : la table
 // est renommée, pas dupliquée. Deux tables auraient voulu dire deux jeux de règles
 // TOTP, deux jeux de codes de récupération, et une divergence à la première
@@ -572,7 +700,8 @@ ensureQrcodeStyleColumns();
 ensureQrcodeActivityColumns();
 ensureEmailVerificationColumns();
 ensurePendingEmailColumn();
-\nensureSuperAdminColumn();
+ensureSuperAdminColumn();
+ensureAuthProviderColumns();
 migrateEntreprisePlanRemoval();
 migrateAuthTokenPurposes();
 migrateTwoFactorAuthGeneralization();
@@ -797,6 +926,56 @@ function sessionCookie(token) {
 
 function clearSessionCookie() {
   const attributes = ["qrood_session=", "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=0"];
+  if (SECURE_COOKIES) attributes.push("Secure");
+  return attributes.join("; ");
+}
+
+// ── Connexion Google ────────────────────────────────────────────────────────
+//
+// Le parcours OAuth est un aller-retour hors site : le navigateur revient de Google
+// par une navigation. Seul `SameSite=Lax` accompagne ce retour — `Strict` ne
+// renverrait pas le cookie, et la connexion serait impossible à boucler. Le cookie
+// reste `HttpOnly` (le script de la page ne peut ni le lire ni l'écrire) et borné au
+// préfixe des routes Google : il ne suit personne ailleurs, et expire en dix minutes.
+const GOOGLE_STATE_COOKIE = "qrood_oauth_state";
+const GOOGLE_RETURN_COOKIE = "qrood_oauth_next";
+const GOOGLE_STATE_TTL_MS = readInteger("QROOD_OAUTH_STATE_MINUTES", 10, 1, 30) * 60 * 1_000;
+
+function googleStateCookie(state) {
+  const attributes = [
+    `${GOOGLE_STATE_COOKIE}=${state}`,
+    "Path=/api/auth/google",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${Math.floor(GOOGLE_STATE_TTL_MS / 1000)}`,
+  ];
+  if (SECURE_COOKIES) attributes.push("Secure");
+  return attributes.join("; ");
+}
+
+function clearGoogleStateCookie() {
+  const attributes = [`${GOOGLE_STATE_COOKIE}=`, "Path=/api/auth/google", "HttpOnly", "SameSite=Lax", "Max-Age=0"];
+  if (SECURE_COOKIES) attributes.push("Secure");
+  return attributes.join("; ");
+}
+
+// La page de retour voyage dans son propre cookie, encodée : un chemin peut contenir
+// `;`, qui tronquerait un cookie en clair. Le décodage est encadré par la même
+// validation que la valeur reçue en query string — un cookie altéré ne gagne rien.
+function googleReturnCookie(path) {
+  const attributes = [
+    `${GOOGLE_RETURN_COOKIE}=${Buffer.from(path, "utf8").toString("base64url")}`,
+    "Path=/api/auth/google",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${Math.floor(GOOGLE_STATE_TTL_MS / 1000)}`,
+  ];
+  if (SECURE_COOKIES) attributes.push("Secure");
+  return attributes.join("; ");
+}
+
+function clearGoogleReturnCookie() {
+  const attributes = [`${GOOGLE_RETURN_COOKIE}=`, "Path=/api/auth/google", "HttpOnly", "SameSite=Lax", "Max-Age=0"];
   if (SECURE_COOKIES) attributes.push("Secure");
   return attributes.join("; ");
 }
@@ -1064,12 +1243,22 @@ function validateDisplayName(value) {
   return displayName;
 }
 
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/u;
+
 function validateEmail(value) {
   const email = cleanText(value, 254).toLowerCase();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/u.test(email)) {
+  if (!EMAIL_PATTERN.test(email)) {
     throw new HttpError(400, "L’adresse e-mail est invalide.", "invalid_email");
   }
   return email;
+}
+
+// Même mise en forme que `validateEmail`, sans exception : le fournisseur n'est pas
+// un client de l'API, donc une adresse absente ou fausse n'est pas une requête
+// invalide, c'est une identité refusée.
+function normalizeEmail(value) {
+  const email = cleanText(value, 254).toLowerCase();
+  return EMAIL_PATTERN.test(email) ? email : null;
 }
 
 function validatePassword(value) {
@@ -2306,6 +2495,19 @@ function sendHtml(response, status, html, extraHeaders = {}, securityOptions = {
   response.end(body);
 }
 
+// Une redirection ne renvoie que l'adresse : le `Location` est relatif, donc il ne
+// peut pas désigner un autre site que celui qui a construit la chaîne. Les pages
+// d'arrivée sont des pages du site, jamais une donnée à interpréter.
+function sendRedirect(response, location, extraHeaders = {}) {
+  securityHeaders(response);
+  response.writeHead(302, {
+    Location: location,
+    "Cache-Control": "no-store",
+    ...extraHeaders,
+  });
+  response.end();
+}
+
 function sendError(response, error) {
   const isStripe = isStripeSdkError(error);
   const status = isStripe ? 502 : (error instanceof HttpError ? error.status : 500);
@@ -2347,11 +2549,230 @@ function publicUser(row) {
   };
 }
 
+// La destination de retour ne peut être qu'un chemin de ce site. Tout ce qui
+// n'est pas un chemin simple — une URL absolue, un `//.exemple.test`, un
+// `/\exemple.test` que le navigateur réinterprète, un caractère de contrôle — est
+// ramené à la racine : c'est la seule forme qui ne peut pas devenir une redirection
+// ouverte.
+const MAX_RETURN_PATH_LENGTH = 200;
+
+function safeReturnPath(value) {
+  const candidate = cleanText(value, MAX_RETURN_PATH_LENGTH);
+  if (!candidate.startsWith("/")) return "/";
+  if (candidate.startsWith("//") || candidate.includes("\\") || /[\s<>"']/.test(candidate)) return "/";
+  return candidate;
+}
+
+function readReturnCookie(raw) {
+  if (typeof raw !== "string" || !/^[A-Za-z0-9_-]+$/.test(raw)) return "/";
+  try {
+    return safeReturnPath(Buffer.from(raw, "base64url").toString("utf8"));
+  } catch {
+    return "/";
+  }
+}
+
+// L'échec est rendu par un code court dans l'URL de retour, jamais par un texte : la
+// page d'accueil affiche un message en français, et le serveur n'écrit rien dans un
+// document. Les deux sorties — succès et échec — remettent à zéro le cookie d'état,
+// que le navigateur n'enverra donc plus au retour suivant.
+function sendAuthReturn(response, path, code, cookies) {
+  const target = new URL(path, PUBLIC_ORIGIN);
+  target.searchParams.set("oauth", code);
+  sendRedirect(response, `${target.pathname}${target.search}`, { "Set-Cookie": cookies });
+}
+
+async function handleGoogleAuthApi(request, response, url) {
+  if (!GOOGLE_AUTH_ENABLED) {
+    throw new HttpError(404, "La connexion avec un compte tiers n’est pas configurée.", "oauth_unavailable");
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/auth/google/start") {
+    checkRateLimit(`oauth-start:${getClientIp(request)}`, 10, 10 * 60 * 1_000);
+    // Le bouton vit sur une page du site : la navigation est donc de même origine.
+    // Un `state` fabriqué ailleurs ne franchit pas ce contrôle.
+    verifyBrowserOrigin(request);
+    const state = randomToken(32);
+    const authorization = new URL(GOOGLE_AUTH_URL);
+    authorization.searchParams.set("client_id", GOOGLE_CLIENT_ID);
+    authorization.searchParams.set("redirect_uri", GOOGLE_REDIRECT_URI);
+    authorization.searchParams.set("response_type", "code");
+    authorization.searchParams.set("scope", "openid email profile");
+    authorization.searchParams.set("state", state);
+    // `select_account` évite qu'un compte déjà présent dans la session de Google
+    // s'impose à un utilisateur qui voulait en changer.
+    authorization.searchParams.set("prompt", "select_account");
+    sendRedirect(response, authorization.href, {
+      "Set-Cookie": [googleStateCookie(state), googleReturnCookie(safeReturnPath(url.searchParams.get("next")))],
+    });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/auth/google/callback") {
+    await completeGoogleAuth(request, response, url);
+    return;
+  }
+
+  throw new HttpError(404, "Ressource introuvable.", "not_found");
+}
+
+async function completeGoogleAuth(request, response, url) {
+  checkRateLimit(`oauth-callback:${getClientIp(request)}`, 20, 10 * 60 * 1_000);
+  const cookies = parseCookies(request.headers.cookie);
+  const returnTo = readReturnCookie(cookies.get(GOOGLE_RETURN_COOKIE));
+  const clearCookies = [clearGoogleStateCookie(), clearGoogleReturnCookie()];
+  const fail = (code) => sendAuthReturn(response, returnTo, code, clearCookies);
+
+  try {
+    // Le `state` relie le retour à l'aller. Sans lui, un callback forgé connecterait
+    // l'auteur de la requête sur le compte de la personne dont il usurpe le nom. Il est
+    // vérifié avant tout, y compris quand Google signale un refus : un abandon rendu
+    // par un tiers ne doit pas non plus pouvoir s'afficher.
+    if (!safeTokenEquals(cookies.get(GOOGLE_STATE_COOKIE) || "", url.searchParams.get("state"))) {
+      fail("state_invalide");
+      return;
+    }
+    // Google signale un refus de l'utilisateur par `error`, sans code : c'est un
+    // abandon, pas une panne.
+    if (url.searchParams.get("error")) {
+      fail("refus");
+      return;
+    }
+    const code = cleanText(url.searchParams.get("code"), 512);
+    if (!code) {
+      fail("code_manquant");
+      return;
+    }
+
+    const identity = await fetchGoogleIdentity(code);
+    if (!identity) {
+      fail("identite_refusee");
+      return;
+    }
+    const userId = resolveGoogleUserId(identity);
+    if (!userId) {
+      fail("email_deja_utilise");
+      return;
+    }
+
+    // Aucune vérification de second facteur ici : l'identité Google est déjà un
+    // facteur de possession, et le retour se fait par redirection, sans champ où
+    // saisir un code. Un compte protégé aussi par mot de passe reste donc
+    // accessible par Google sans code — arbitrage à trancher si la double
+    // authentification doit se cumuler à ce mode de connexion.
+    const createdSession = createSession(userId, request);
+    sendRedirect(response, returnTo, {
+      "Set-Cookie": [...clearCookies, sessionCookie(createdSession.token)],
+    });
+} catch (error) {
+    // Un fournisseur injoignable ne doit pas laisser de trace de pile dans la
+    // réponse : le journal garde le diagnostic, l'utilisateur reçoit un code.
+    console.error(redactSecrets(error?.stack || error?.message || String(error)));
+    if (response.headersSent) return;
+    fail("fournisseur_indisponible");
+  }
+}
+
+// Deux appels réseau, tous deux bornés : le jeton d'accès d'échange, puis le profil
+// qui le porte. Aucun contenu n'est réutilisé pour une autre requête — ni le jeton
+// du fournisseur, ni son audience. `redirect: "error"` ferme la porte à une
+// redirection vers une autre origine : une réponse de jeton venue d'ailleurs ne
+// serait pas un jeton.
+async function fetchGoogleIdentity(code) {
+  const tokenResponse = await withTimeout(fetch(GOOGLE_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+    body: new URLSearchParams({
+      code,
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri: GOOGLE_REDIRECT_URI,
+      grant_type: "authorization_code",
+    }).toString(),
+    redirect: "error",
+  }), GOOGLE_HTTP_TIMEOUT_MS);
+  if (!tokenResponse.ok) {
+    throw new Error(`échange du code refusé (${tokenResponse.status})`);
+  }
+  const tokens = await tokenResponse.json();
+  const accessToken = cleanText(tokens?.access_token, 512);
+  if (!accessToken) throw new Error("le fournisseur n’a renvoyé aucun jeton d’accès");
+
+  const profileResponse = await withTimeout(fetch(GOOGLE_USERINFO_URL, {
+    headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+    redirect: "error",
+  }), GOOGLE_HTTP_TIMEOUT_MS);
+  if (!profileResponse.ok) {
+    throw new Error(`lecture du profil refusée (${profileResponse.status})`);
+  }
+  const profile = await profileResponse.json();
+
+  // `sub` est l'identifiant du compte chez le fournisseur, stable même quand
+  // l'adresse change. `email_verified` est une affirmation du fournisseur : sans elle,
+  // l'adresse n'est pas prouvée et rien ne peut être créé ni relié.
+  const subject = cleanText(profile?.sub, 128);
+  const email = normalizeEmail(profile?.email);
+  if (!subject || !email || profile?.email_verified !== true) return null;
+  return { subject, email, name: cleanText(profile?.name, MAX_NAME_LENGTH) };
+}
+
+// Le compte se cherche par l'identifiant externe, jamais par l'adresse : une adresse
+// Google peut changer, le `sub` non. Une identité connue retrouve donc toujours son
+// compte, et l'index unique interdit qu'un même `sub` s'y attache deux fois.
+function resolveGoogleUserId(identity) {
+  const known = db.prepare(`
+    SELECT id FROM users WHERE auth_provider = 'google' AND provider_id = ?
+  `).get(identity.subject);
+  if (known) return known.id;
+
+  // Aucune liaison automatique : une adresse en commun ne prouve rien. Un compte
+  // peut déjà porter cette adresse, créé par quelqu'un qui n'a jamais confirmé la
+  // sienne — lui remettre la session reviendrait à lui céder le compte. Le refus est
+  // la même réponse pour un compte local et pour un second compte Google : rien ne
+  // trahit l'existence du compte que l'adresse a déjà.
+  if (db.prepare("SELECT id FROM users WHERE email = ?").get(identity.email)) return null;
+
+  const fallback = [
+    identity.name,
+    cleanText(identity.email.split("@")[0], MAX_NAME_LENGTH),
+    "Compte Google",
+  ].find((candidate) => candidate.length >= 2) || "Compte Google";
+  const timestamp = now();
+  try {
+    // L'adresse est marquée vérifiée sans e-mail à envoyer : Google l'a vérifiée
+    // pour son propre compte, et c'est cette preuve-là qui est conservée.
+    const result = db.prepare(`
+      INSERT INTO users (
+        display_name, email, password_hash, created_at, email_verified_at, auth_provider, provider_id
+      )
+      VALUES (?, ?, NULL, ?, ?, 'google', ?)
+    `).run(fallback, identity.email, timestamp, timestamp, identity.subject);
+    return Number(result.lastInsertRowid);
+  } catch (error) {
+    if (String(error.message).includes("UNIQUE")) return null;
+    throw error;
+  }
+}
+
 async function handleAuthApi(request, response, url) {
+  // ── Connexion avec un compte tiers ─────────────────────────────────────────
+  //
+  // Un aller et un retour, tous deux en GET, tous deux sans session. Le `state` est
+  // le seul lien entre les deux : tiré au hasard au départ, mis en cookie `HttpOnly`,
+  // relu en comparaison constante au retour.
+  if (url.pathname.startsWith("/api/auth/google")) {
+    await handleGoogleAuthApi(request, response, url);
+    return;
+  }
+
   if (request.method === "GET" && url.pathname === "/api/auth/me") {
     const session = getSession(request);
+    // Dit à l'interface si un bouton « continuer avec Google » a un sens. Ce n'est
+    // pas un secret : sans identifiants configurés, la route répond de toute façon
+    // « introuvable », et le serveur reste utilisable hors ligne.
+    const googleEnabled = GOOGLE_AUTH_ENABLED;
     if (!session) {
-      sendJson(response, 200, { user: null, csrfToken: null });
+      sendJson(response, 200, { user: null, csrfToken: null, googleEnabled });
       return;
     }
     sendJson(response, 200, {
@@ -2359,6 +2780,7 @@ async function handleAuthApi(request, response, url) {
       csrfToken: session.csrfToken,
       entitlement: resolveEntitlement(session.userId),
       subscription: getSubscriptionSummary(session.userId),
+      googleEnabled,
     });
     return;
   }
