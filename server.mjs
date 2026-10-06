@@ -172,37 +172,129 @@ const MAIL_OUTBOX_DIRECTORY = process.env.QROOD_MAIL_OUTBOX_DIR
 const MAIL_API_URL = readStripeEnv("MAIL_API_URL");
 const MAIL_API_KEY = readStripeEnv("MAIL_API_KEY");
 
-// Connexion avec un compte Google. Sans identifiants configurés, le fournisseur
-// n'existe pas : les routes répondent « introuvable » et l'interface n'affiche
-// aucun bouton, plutôt que d'annoncer une connexion qui échouerait toujours.
-const GOOGLE_CLIENT_ID = readStripeEnv("GOOGLE_CLIENT_ID");
-const GOOGLE_CLIENT_SECRET = readStripeEnv("GOOGLE_CLIENT_SECRET");
-const GOOGLE_REDIRECT_URI = readStripeEnv("GOOGLE_REDIRECT_URI") || `${PUBLIC_ORIGIN}/api/auth/google/callback`;
-// Les trois points d'appel du fournisseur sont surchargeables, sinon aucun test ne
-// peut suivre le flux de bout en bout sans aller sur Internet. Le garde-fou de
-// production est deux lignes plus bas : en production, ils ne sont pas surchargeables.
-const GOOGLE_DEFAULT_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
-const GOOGLE_DEFAULT_TOKEN_URL = "https://oauth2.googleapis.com/token";
-const GOOGLE_DEFAULT_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo";
-const GOOGLE_AUTH_URL = cleanText(process.env.QROOD_GOOGLE_AUTH_URL, 500) || GOOGLE_DEFAULT_AUTH_URL;
-const GOOGLE_TOKEN_URL = cleanText(process.env.QROOD_GOOGLE_TOKEN_URL, 500) || GOOGLE_DEFAULT_TOKEN_URL;
-const GOOGLE_USERINFO_URL = cleanText(process.env.QROOD_GOOGLE_USERINFO_URL, 500) || GOOGLE_DEFAULT_USERINFO_URL;
-const GOOGLE_AUTH_ENABLED = Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
-const GOOGLE_HTTP_TIMEOUT_MS = 10_000;
+// ── Fournisseurs d'identité ───────────────────────────────────────────────
+//
+// Chaque fournisseur est décrit une fois, ici : le préfixe d'environnement qui porte
+// ses identifiants, ses points d'appel, ce qu'il demande, et — la seule différence qui
+// compte vraiment — ce qu'il affirme de l'adresse. Google certifie qu'elle est vérifiée,
+// et cette attestation est conservée comme preuve. Microsoft renvoie une adresse mais ne
+// la certifie pas : le compte qu'elle ouvre naît donc sans adresse confirmée.
+//
+// Un fournisseur sans identifiants complets n'existe pas : ses routes répondent
+// « introuvable » et l'interface n'affiche aucun bouton, plutôt que d'annoncer une
+// connexion qui échouerait toujours. Le reste de la plateforme fonctionne normalement.
+const OAUTH_PROVIDER_DEFINITIONS = [
+  {
+    id: "google",
+    label: "Google",
+    envPrefix: "GOOGLE",
+    defaultAuthUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+    defaultTokenUrl: "https://oauth2.googleapis.com/token",
+    defaultUserinfoUrl: "https://openidconnect.googleapis.com/v1/userinfo",
+    // `select_account` évite qu'un compte déjà présent dans la session du fournisseur
+    // s'impose à un utilisateur qui voulait en changer.
+    authorization: { prompt: "select_account" },
+    readIdentity(profile) {
+      const email = normalizeEmail(profile?.email);
+      if (!email || profile?.email_verified !== true) return null;
+      return { email, verified: true };
+    },
+  },
+  {
+    id: "microsoft",
+    label: "Microsoft",
+    envPrefix: "MICROSOFT",
+    // `common` accepte les comptes professionnels comme les comptes personnels. C'est
+    // aussi ce qui rend `sub` inutilisable pour retrouver un compte sans l'index
+    // unique : deux fournisseurs ne partageant jamais la même table, rien ne se croise.
+    defaultAuthUrl: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+    defaultTokenUrl: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    defaultUserinfoUrl: "https://graph.microsoft.com/oidc/userinfo",
+    authorization: { prompt: "select_account" },
+    // Microsoft expose une adresse pour un compte professionnel, mais sans jamais dire
+    // que la personne en est propriétaire : c'est un attribut d'annuaire, pas une
+    // preuve. Un compte personnel ne livre qu'un `preferred_username`, qui est un nom de
+    // connexion et non une boîte. L'un et l'autre font un contact ; aucun n'est un
+    // certificat. D'où `verified: false` — le compte sera créé sans confirmation et
+    // devra confirmer son adresse par e-mail comme une inscription locale.
+    readIdentity(profile) {
+      const email = normalizeEmail(profile?.email) || normalizeEmail(profile?.preferred_username);
+      if (!email) return null;
+      return { email, verified: false };
+    },
+  },
+];
 
-if (!/^https?:\/\/[^\s/]+/.test(GOOGLE_REDIRECT_URI)) {
-  throw new Error("GOOGLE_REDIRECT_URI doit être une URL HTTP ou HTTPS absolue.");
-}
-if (IS_PRODUCTION) {
-  if (!GOOGLE_REDIRECT_URI.startsWith("https://")) {
-    throw new Error("GOOGLE_REDIRECT_URI doit utiliser HTTPS en production.");
+const OAUTH_SCOPE = "openid email profile";
+const OAUTH_HTTP_TIMEOUT_MS = 10_000;
+
+function buildOAuthProvider(definition) {
+  const clientId = readStripeEnv(`${definition.envPrefix}_CLIENT_ID`);
+  const clientSecret = readStripeEnv(`${definition.envPrefix}_CLIENT_SECRET`);
+  const redirectUri =
+    readStripeEnv(`${definition.envPrefix}_REDIRECT_URI`) || `${PUBLIC_ORIGIN}/api/auth/${definition.id}/callback`;
+  // Les points d'appel sont surchargeables, sinon aucun test ne pourrait suivre le flux de
+  // bout en bout sans aller sur Internet. Le garde-fou de production est deux lignes plus
+  // bas : en production, ils ne se surchargent pas.
+  const authUrl = cleanText(process.env[`QROOD_${definition.envPrefix}_AUTH_URL`], 500) || definition.defaultAuthUrl;
+  const tokenUrl = cleanText(process.env[`QROOD_${definition.envPrefix}_TOKEN_URL`], 500) || definition.defaultTokenUrl;
+  const userinfoUrl =
+    cleanText(process.env[`QROOD_${definition.envPrefix}_USERINFO_URL`], 500) || definition.defaultUserinfoUrl;
+
+  if (!/^https?:\/\/[^\s/]+/.test(redirectUri)) {
+    throw new Error(`${definition.envPrefix}_REDIRECT_URI doit être une URL HTTP ou HTTPS absolue.`);
   }
-  if (GOOGLE_AUTH_URL !== GOOGLE_DEFAULT_AUTH_URL
-    || GOOGLE_TOKEN_URL !== GOOGLE_DEFAULT_TOKEN_URL
-    || GOOGLE_USERINFO_URL !== GOOGLE_DEFAULT_USERINFO_URL) {
-    throw new Error("Les points d'appel Google ne se surchargent pas en production.");
+  if (IS_PRODUCTION && !redirectUri.startsWith("https://")) {
+    throw new Error(`${definition.envPrefix}_REDIRECT_URI doit utiliser HTTPS en production.`);
   }
+  if (IS_PRODUCTION
+    && (authUrl !== definition.defaultAuthUrl
+      || tokenUrl !== definition.defaultTokenUrl
+      || userinfoUrl !== definition.defaultUserinfoUrl)) {
+    throw new Error(`Les points d'appel ${definition.label} ne se surchargent pas en production.`);
+  }
+
+  return {
+    ...definition,
+    clientId,
+    clientSecret,
+    redirectUri,
+    authUrl,
+    tokenUrl,
+    userinfoUrl,
+    enabled: Boolean(clientId && clientSecret),
+    // Un cookie et un chemin par fournisseur : celui de Google n'est pas même envoyé aux
+    // routes de Microsoft, donc un parcours ne peut pas se relire chez l'autre.
+    stateCookie: `qrood_oauth_state_${definition.id}`,
+    returnCookie: `qrood_oauth_next_${definition.id}`,
+    path: `/api/auth/${definition.id}`,
+  };
 }
+
+const OAUTH_PROVIDERS = new Map(
+  OAUTH_PROVIDER_DEFINITIONS.map((definition) => [definition.id, buildOAuthProvider(definition)]),
+);
+
+function findOAuthProvider(id) {
+  return OAUTH_PROVIDERS.get(cleanText(id, 32)) || null;
+}
+
+// Seuls les fournisseurs entièrement configurés apparaissent côté interface : un bouton
+// sans identifiants derrière lui n'aurait qu'à échouer, et son existence ne dépend pas
+// d'un secret.
+function listEnabledProviders() {
+  return OAUTH_PROVIDER_DEFINITIONS
+    .filter((definition) => OAUTH_PROVIDERS.get(definition.id).enabled)
+    .map((definition) => ({ id: definition.id, label: definition.label }));
+}
+
+// `auth_provider` n'accepte que des valeurs nommées ici : une colonne qui accueille un
+// fournisseur doit d'abord pouvoir l'écrire. La contrainte est interpolée dans les trois
+// DDL qui la portent — schéma neuf, ajout de colonne, reprise de table — pour qu'ajouter
+// un fournisseur ne se répète pas à chaque endroit.
+const AUTH_PROVIDER_IDS = ["local", ...OAUTH_PROVIDER_DEFINITIONS.map((definition) => definition.id)];
+const AUTH_PROVIDER_CHECK = `CHECK(auth_provider IN (${AUTH_PROVIDER_IDS.map((id) => `'${id}'`).join(",")}))`;
+
 
 if (IS_PRODUCTION && !PUBLIC_ORIGIN.startsWith("https://")) {
   throw new Error("QROOD_PUBLIC_ORIGIN doit utiliser HTTPS en production.");
@@ -256,7 +348,7 @@ db.exec(`
     -- une précaution de migration, c'est la garantie structurelle qu'un compte
     -- créé par une route publique ne puisse pas en hériter.
     is_super_admin INTEGER NOT NULL DEFAULT 0 CHECK(is_super_admin IN (0,1)),
-    auth_provider TEXT NOT NULL DEFAULT 'local' CHECK(auth_provider IN ('local','google')),
+    auth_provider TEXT NOT NULL DEFAULT 'local' ${AUTH_PROVIDER_CHECK},
     provider_id TEXT
   ) STRICT;
 
@@ -585,28 +677,31 @@ function ensureFreshSessionColumn() {
 function ensureAuthProviderColumns() {
   const names = new Set(db.prepare("PRAGMA table_info(users)").all().map((column) => column.name));
   if (!names.has("auth_provider")) {
-    db.exec("ALTER TABLE users ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'local' CHECK(auth_provider IN ('local','google'))");
+    db.exec(`ALTER TABLE users ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'local' ${AUTH_PROVIDER_CHECK}`);
   }
   if (!names.has("provider_id")) {
     db.exec("ALTER TABLE users ADD COLUMN provider_id TEXT");
   }
   // Un identifiant externe ne désigne qu'un compte, et un compte ne porte qu'un seul
-  // identifiant Google : l'index est la garantie matérielle en cas de deux callbacks
-  // simultanés, là où le SELECT voit le même état que la requête concurrente.
+  // identifiant de fournisseur : l'index est la garantie matérielle en cas de deux
+  // callbacks simultanés, là où le SELECT voit le même état que la requête concurrente.
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_users_provider_identity
       ON users(auth_provider, provider_id)
       WHERE provider_id IS NOT NULL
   `);
-  relaxPasswordHashNotNull();
+  migrateUsersTableShape();
 }
 
-// Un compte créé par Google n'a pas de mot de passe : `password_hash` devient
-// facultatif, `NULL` signifiant « aucun mot de passe local ». SQLite ne sait pas lever
-// un `NOT NULL`, donc la table est recréée à l'identique, lignes conservées, puis les
-// index reposés. Sept tables référencent `users` : `PRAGMA foreign_keys` est désactivé
-// autour de l'opération — le pragma est ignoré à l'intérieur d'une transaction — et
-// rétabli aussitôt après, que la reprise ait abouti ou non.
+// Un compte créé par un fournisseur n'a pas de mot de passe : `password_hash` devient
+// facultatif, `NULL` signifiant « aucun mot de passe local ». SQLite ne sait ni lever un
+// `NOT NULL`, ni ajouter une valeur à une contrainte `CHECK`, donc la table est recréée
+// à l'identique, lignes conservées, puis les index reposés. C'est aussi le seul moment où
+// `auth_provider` peut apprendre à nommer un nouveau fournisseur : une base déjà en
+// service garde sinon la liste figée au moment de sa création. Sept tables référencent
+// `users` : `PRAGMA foreign_keys` est désactivé autour de l'opération — le pragma est
+// ignoré à l'intérieur d'une transaction — et rétabli aussitôt après, que la reprise ait
+// abouti ou non.
 const USERS_COLUMNS = [
   "id",
   "display_name",
@@ -620,9 +715,13 @@ const USERS_COLUMNS = [
   "provider_id",
 ];
 
-function relaxPasswordHashNotNull() {
+function migrateUsersTableShape() {
   const declared = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'").get()?.sql || "";
-  if (!declared.includes("password_hash TEXT NOT NULL")) return;
+  const passwordIsMandatory = declared.includes("password_hash TEXT NOT NULL");
+  // Une contrainte déjà conforme suffit à ne rien faire. La comparer à la liste plutôt
+  // que chercher un `CHECK` suffit : c'est la seule restriction portant sur cette colonne.
+  const providersAreCurrent = AUTH_PROVIDER_IDS.every((id) => declared.includes(`'${id}'`));
+  if (!passwordIsMandatory && providersAreCurrent) return;
 
   const columns = db.prepare("PRAGMA table_info(users)").all().map((column) => column.name);
   const unexpected = columns.filter((name) => !USERS_COLUMNS.includes(name));
@@ -650,7 +749,7 @@ function relaxPasswordHashNotNull() {
         pending_email TEXT,
         is_super_admin INTEGER NOT NULL DEFAULT 0 CHECK(is_super_admin IN (0,1)),
         email_verified_at INTEGER,
-        auth_provider TEXT NOT NULL DEFAULT 'local' CHECK(auth_provider IN ('local','google')),
+        auth_provider TEXT NOT NULL DEFAULT 'local' ${AUTH_PROVIDER_CHECK},
         provider_id TEXT
       ) STRICT;
     `);
@@ -950,25 +1049,27 @@ function clearSessionCookie() {
   return attributes.join("; ");
 }
 
-// ── Connexion Google ────────────────────────────────────────────────────────
+// ── Parcours d'un fournisseur d'identité ────────────────────────────────────
 //
-// Le parcours OAuth est un aller-retour hors site : le navigateur revient de Google
+// Le parcours OAuth est un aller-retour hors site : le navigateur revient du fournisseur
 // par une navigation. Seul `SameSite=Lax` accompagne ce retour — `Strict` ne
 // renverrait pas le cookie, et la connexion serait impossible à boucler. Le cookie
 // reste `HttpOnly` (le script de la page ne peut ni le lire ni l'écrire) et borné au
-// préfixe des routes Google : il ne suit personne ailleurs, et expire en dix minutes.
-const GOOGLE_STATE_COOKIE = "qrood_oauth_state";
-const GOOGLE_RETURN_COOKIE = "qrood_oauth_next";
-const GOOGLE_STATE_TTL_MS = readInteger("QROOD_OAUTH_STATE_MINUTES", 10, 1, 30) * 60 * 1_000;
+// préfixe des routes de ce fournisseur : celui de Google n'est pas même envoyé aux
+// routes de Microsoft, et il expire en dix minutes.
+const OAUTH_STATE_TTL_MS = readInteger("QROOD_OAUTH_STATE_MINUTES", 10, 1, 30) * 60 * 1_000;
 
 // Le cookie d'état porte le nonce qui voyage vers le fournisseur, et l'intention que
-// ce aller-retour Accomplit : ouvrir une session, relier une identité à un compte, ou
+// ce aller-retour accomplit : ouvrir une session, relier une identité à un compte, ou
 // ré-authentifier la session qui le demande. Une intention de liaison ou de
 // ré-authentification est attachée au compte *et* à la session qui l'a émise : le
 // retour relit les deux dans le cookie et les confronte à la session courante. Un
 // aller commencé par un compte ne peut donc pas être terminé par un autre, et une
 // session fermée entre-temps ne laisse pas une liaison en suspens qui s'appliquerait
 // à quelqu'un d'autre.
+//
+// Le fournisseur n'y figure pas : il est déjà dans le nom et le chemin du cookie, si
+// bien qu'un parcours ne peut pas se relire chez un autre fournisseur.
 //
 // Le cookie est signé. Sans signature, quiconque peut poser un cookie à ce nom — un
 // hôte frère du même domaine, un trajet non chiffré, une fuite d'en-tête — choisirait
@@ -981,25 +1082,31 @@ const OAUTH_INTENTS = new Set(["login", "link", "reauth"]);
 // parcours en cours au redémarrage, ce qu'un flux de dix minutes ferait de toute façon.
 const OAUTH_FLOW_KEY = readStripeEnv("OAUTH_FLOW_KEY") || randomBytes(32);
 
-function signGoogleFlow(payload) {
+function signOauthFlow(payload) {
   return createHmac("sha256", OAUTH_FLOW_KEY).update(payload).digest("base64url").slice(0, 32);
 }
 
-function googleFlowCookie(state, intent, userId = 0, sessionId = 0) {
+function oauthFlowCookie(provider, state, intent, userId = 0, sessionId = 0) {
   const payload = `${state}.${intent}.${userId}.${sessionId}`;
   const attributes = [
-    `${GOOGLE_STATE_COOKIE}=${payload}.${signGoogleFlow(payload)}`,
-    "Path=/api/auth/google",
+    `${provider.stateCookie}=${payload}.${signOauthFlow(payload)}`,
+    `Path=${provider.path}`,
     "HttpOnly",
     "SameSite=Lax",
-    `Max-Age=${Math.floor(GOOGLE_STATE_TTL_MS / 1000)}`,
+    `Max-Age=${Math.floor(OAUTH_STATE_TTL_MS / 1000)}`,
   ];
   if (SECURE_COOKIES) attributes.push("Secure");
   return attributes.join("; ");
 }
 
-function clearGoogleStateCookie() {
-  const attributes = [`${GOOGLE_STATE_COOKIE}=`, "Path=/api/auth/google", "HttpOnly", "SameSite=Lax", "Max-Age=0"];
+function clearOauthStateCookie(provider) {
+  const attributes = [
+    `${provider.stateCookie}=`,
+    `Path=${provider.path}`,
+    "HttpOnly",
+    "SameSite=Lax",
+    "Max-Age=0",
+  ];
   if (SECURE_COOKIES) attributes.push("Secure");
   return attributes.join("; ");
 }
@@ -1008,33 +1115,39 @@ function clearGoogleStateCookie() {
 // altéré ne rend pas un aller-retour valide, il en fait un aller-retour sans
 // intention, donc un refus. Mieux vaut perdre une liaison que d'appliquer une
 // intention que le cookie ne portait pas — ou qu'un tiers en ait fabriquée une.
-function readGoogleFlow(raw) {
+function readOauthFlow(raw) {
   if (typeof raw !== "string") return null;
   const [state, intent, userId, sessionId, signature, ...rest] = raw.split(".");
   if (rest.length || !/^[A-Za-z0-9_-]{32,64}$/.test(state || "")) return null;
   if (!OAUTH_INTENTS.has(intent)) return null;
   if (!/^\d{1,15}$/.test(userId || "") || !/^\d{1,15}$/.test(sessionId || "")) return null;
-  if (!safeTokenEquals(signGoogleFlow(`${state}.${intent}.${userId}.${sessionId}`), signature || "")) return null;
+  if (!safeTokenEquals(signOauthFlow(`${state}.${intent}.${userId}.${sessionId}`), signature || "")) return null;
   return { state, intent, userId: Number(userId), sessionId: Number(sessionId) };
 }
 
 // La page de retour voyage dans son propre cookie, encodée : un chemin peut contenir
 // `;`, qui tronquerait un cookie en clair. Le décodage est encadré par la même
 // validation que la valeur reçue en query string — un cookie altéré ne gagne rien.
-function googleReturnCookie(path) {
+function oauthReturnCookie(provider, path) {
   const attributes = [
-    `${GOOGLE_RETURN_COOKIE}=${Buffer.from(path, "utf8").toString("base64url")}`,
-    "Path=/api/auth/google",
+    `${provider.returnCookie}=${Buffer.from(path, "utf8").toString("base64url")}`,
+    `Path=${provider.path}`,
     "HttpOnly",
     "SameSite=Lax",
-    `Max-Age=${Math.floor(GOOGLE_STATE_TTL_MS / 1000)}`,
+    `Max-Age=${Math.floor(OAUTH_STATE_TTL_MS / 1000)}`,
   ];
   if (SECURE_COOKIES) attributes.push("Secure");
   return attributes.join("; ");
 }
 
-function clearGoogleReturnCookie() {
-  const attributes = [`${GOOGLE_RETURN_COOKIE}=`, "Path=/api/auth/google", "HttpOnly", "SameSite=Lax", "Max-Age=0"];
+function clearOauthReturnCookie(provider) {
+  const attributes = [
+    `${provider.returnCookie}=`,
+    `Path=${provider.path}`,
+    "HttpOnly",
+    "SameSite=Lax",
+    "Max-Age=0",
+  ];
   if (SECURE_COOKIES) attributes.push("Secure");
   return attributes.join("; ");
 }
@@ -2649,26 +2762,33 @@ function readReturnCookie(raw) {
 // page d'accueil affiche un message en français, et le serveur n'écrit rien dans un
 // document. Les deux sorties — succès et échec — remettent à zéro le cookie d'état,
 // que le navigateur n'enverra donc plus au retour suivant.
-function sendAuthReturn(response, path, code, cookies) {
+function sendAuthReturn(response, path, code, cookies, providerId = "") {
   const target = new URL(path, PUBLIC_ORIGIN);
   target.searchParams.set("oauth", code);
+  // Le fournisseur accompagne le code : « Microsoft ne répond pas » et « Google n'a
+  // pas confirmé votre adresse » ne se disent pas de la même façon, et l'interface ne
+  // peut pas deviner lequel des deux a échoué. Ce n'est qu'un identifiant public, déjà
+  // présent dans l'adresse d'origine du parcours.
+  if (providerId) target.searchParams.set("oauth_provider", providerId);
   sendRedirect(response, `${target.pathname}${target.search}`, { "Set-Cookie": cookies });
 }
 
 // L'adresse d'autorisation, porteuse du nonce d'état. Les trois points d'entrée — le
 // bouton de l'accueil, la liaison et la ré-authentification depuis le compte —
 // construisent la même adresse : un seul endroit décide de ce que QROOD demande à
-// Google, donc un seul endroit à vérifier.
-function googleAuthorizationUrl(state) {
-  const authorization = new URL(GOOGLE_AUTH_URL);
-  authorization.searchParams.set("client_id", GOOGLE_CLIENT_ID);
-  authorization.searchParams.set("redirect_uri", GOOGLE_REDIRECT_URI);
+// chaque fournisseur, donc un seul endroit à vérifier.
+function providerAuthorizationUrl(provider, state) {
+  const authorization = new URL(provider.authUrl);
+  authorization.searchParams.set("client_id", provider.clientId);
+  authorization.searchParams.set("redirect_uri", provider.redirectUri);
   authorization.searchParams.set("response_type", "code");
-  authorization.searchParams.set("scope", "openid email profile");
+  authorization.searchParams.set("scope", OAUTH_SCOPE);
   authorization.searchParams.set("state", state);
-  // `select_account` évite qu'un compte déjà présent dans la session de Google
+  // `select_account` évite qu'un compte déjà présent dans la session du fournisseur
   // s'impose à un utilisateur qui voulait en changer.
-  authorization.searchParams.set("prompt", "select_account");
+  for (const [key, value] of Object.entries(provider.authorization || {})) {
+    authorization.searchParams.set(key, value);
+  }
   return authorization.href;
 }
 
@@ -2677,13 +2797,13 @@ function googleAuthorizationUrl(state) {
 // le recopier. La destination n'est libre que pour la connexion : une liaison ou une
 // ré-authentification revient toujours à la page du compte, quelle que soit la
 // demande reçue.
-function prepareGoogleFlow(intent, options = {}) {
+function prepareProviderFlow(provider, intent, options = {}) {
   const state = randomToken(32);
   return {
-    url: googleAuthorizationUrl(state),
+    url: providerAuthorizationUrl(provider, state),
     cookies: [
-      googleFlowCookie(state, intent, options.userId || 0, options.sessionId || 0),
-      googleReturnCookie(intent === "login" ? safeReturnPath(options.next) : "/compte"),
+      oauthFlowCookie(provider, state, intent, options.userId || 0, options.sessionId || 0),
+      oauthReturnCookie(provider, intent === "login" ? safeReturnPath(options.next) : "/compte"),
     ],
   };
 }
@@ -2691,50 +2811,54 @@ function prepareGoogleFlow(intent, options = {}) {
 // Un compte ne peut pas « avoir » un fournisseur qui ne l'est pas : les trois routes de
 // liaison et de ré-authentification partagent cette porte, plutôt que de répondre
 // chacune de leur manière à une configuration absente.
-function requireGoogleConfigured() {
-  if (!GOOGLE_AUTH_ENABLED) {
+function requireProviderConfigured(provider) {
+  if (!provider.enabled) {
     throw new HttpError(404, "La connexion avec un compte tiers n’est pas configurée.", "oauth_unavailable");
   }
 }
 
-async function handleGoogleAuthApi(request, response, url) {
-  requireGoogleConfigured();
-  if (request.method === "GET" && url.pathname === "/api/auth/google/start") {
+// Le chemin `/api/auth/<fournisseur>/…` porte le fournisseur, la suite est identique
+// pour tous : `start` ouvre le parcours, `callback` le referme, tout le reste est
+// inexistant. Un nom inconnu ne rend pas une 404 de plus — il n'a jamais existé.
+async function handleProviderAuthApi(provider, request, response, url) {
+  requireProviderConfigured(provider);
+
+  if (request.method === "GET" && url.pathname === `${provider.path}/start`) {
     checkRateLimit(`oauth-start:${getClientIp(request)}`, 10, 10 * 60 * 1_000);
     // Le bouton vit sur une page du site : la navigation est donc de même origine.
     // Un `state` fabriqué ailleurs ne franchit pas ce contrôle.
     verifyBrowserOrigin(request);
-    const flow = prepareGoogleFlow("login", { next: url.searchParams.get("next") });
+    const flow = prepareProviderFlow(provider, "login", { next: url.searchParams.get("next") });
     sendRedirect(response, flow.url, { "Set-Cookie": flow.cookies });
     return;
   }
 
-  if (request.method === "GET" && url.pathname === "/api/auth/google/callback") {
-    await completeGoogleAuth(request, response, url);
+  if (request.method === "GET" && url.pathname === `${provider.path}/callback`) {
+    await completeProviderAuth(provider, request, response, url);
     return;
   }
 
   throw new HttpError(404, "Ressource introuvable.", "not_found");
 }
 
-async function completeGoogleAuth(request, response, url) {
+async function completeProviderAuth(provider, request, response, url) {
   checkRateLimit(`oauth-callback:${getClientIp(request)}`, 20, 10 * 60 * 1_000);
   const cookies = parseCookies(request.headers.cookie);
-  const flow = readGoogleFlow(cookies.get(GOOGLE_STATE_COOKIE));
-  const returnTo = readReturnCookie(cookies.get(GOOGLE_RETURN_COOKIE));
-  const clearCookies = [clearGoogleStateCookie(), clearGoogleReturnCookie()];
-  const finish = (code) => sendAuthReturn(response, returnTo, code, clearCookies);
+  const flow = readOauthFlow(cookies.get(provider.stateCookie));
+  const returnTo = readReturnCookie(cookies.get(provider.returnCookie));
+  const clearCookies = [clearOauthStateCookie(provider), clearOauthReturnCookie(provider)];
+  const finish = (code) => sendAuthReturn(response, returnTo, code, clearCookies, provider.id);
 
   try {
     // Le `state` relie le retour à l'aller. Sans lui, un callback forgé connecterait
     // l'auteur de la requête sur le compte de la personne dont il usurpe le nom. Il est
-    // vérifié avant tout, y compris quand Google signale un refus : un abandon rendu
-    // par un tiers ne doit pas non plus pouvoir s'afficher.
+    // vérifié avant tout, y compris quand le fournisseur signale un refus : un abandon
+    // rendu par un tiers ne doit pas non plus pouvoir s'afficher.
     if (!flow || !safeTokenEquals(flow.state, url.searchParams.get("state"))) {
       finish("state_invalide");
       return;
     }
-    // Google signale un refus de l'utilisateur par `error`, sans code : c'est un
+    // Un fournisseur signale un refus de l'utilisateur par `error`, sans code : c'est un
     // abandon, pas une panne.
     if (url.searchParams.get("error")) {
       finish("refus");
@@ -2746,7 +2870,7 @@ async function completeGoogleAuth(request, response, url) {
       return;
     }
 
-    const identity = await fetchGoogleIdentity(code);
+    const identity = await fetchProviderIdentity(provider, code);
     if (!identity) {
       finish("identite_refusee");
       return;
@@ -2763,8 +2887,8 @@ async function completeGoogleAuth(request, response, url) {
         return;
       }
       const refusal = flow.intent === "link"
-        ? attachGoogleIdentity(session, identity)
-        : refreshGoogleProof(session, identity);
+        ? attachProviderIdentity(provider, session, identity)
+        : refreshProviderProof(session, identity);
       if (refusal) {
         finish(refusal);
         return;
@@ -2773,12 +2897,23 @@ async function completeGoogleAuth(request, response, url) {
       return;
     }
 
-    const account = resolveGoogleAccount(identity);
+    const account = resolveProviderAccount(provider, identity);
     if (account.refusal) {
       finish(account.refusal);
       return;
     }
     const createdSession = createSession(account.userId, request, true);
+    // L'adresse annoncée par un fournisseur qui ne la certifie pas reste à confirmer :
+    // le compte vient d'être ouvert, il reçoit donc son e-mail comme une inscription.
+    // Un envoi qui échoue n'annule pas pour autant la session — l'utilisateur est
+    // connecté, il pourra demander un nouvel envoi depuis son compte.
+    if (account.pendingVerification) {
+      try {
+        await issueAndSendVerification(account.userId);
+      } catch (error) {
+        console.error(redactSecrets(error?.stack || error?.message || String(error)));
+      }
+    }
     sendRedirect(response, returnTo, {
       "Set-Cookie": [...clearCookies, sessionCookie(createdSession.token)],
     });
@@ -2791,22 +2926,23 @@ async function completeGoogleAuth(request, response, url) {
   }
 }
 
-// Rattache une identité Google à un compte connecté, sans rien changer d'autre : la
-// liaison ouvre une seconde porte, elle ne remplace ni l'adresse ni le mot de passe.
+// Rattache une identité de fournisseur à un compte connecté, sans rien changer d'autre :
+// la liaison ouvre une seconde porte, elle ne remplace ni l'adresse ni le mot de passe.
 // Le `WHERE provider_id IS NULL` est la garantie qu'une liaison ne peut pas remplacer
 // une identité déjà attachée — deux onglets ouverts en même temps ne peuvent pas se
 // disputer le compte. Renvoie le motif du refus, ou `null` si l'identité est attachée.
-function attachGoogleIdentity(session, identity) {
+function attachProviderIdentity(provider, session, identity) {
   if (session.providerId) return "deja_lie";
-  // La double authentification gagne sur Google. Un compte qui exige un code à chaque
-  // connexion ne doit pas pouvoir être ouvert sans ce code : le retour par Google n'a
-  // aucun champ où le saisir, donc ce mode de connexion lui est refusé.
+  // La double authentification gagne sur tout fournisseur tiers. Un compte qui exige un
+  // code à chaque connexion ne doit pas pouvoir être ouvert sans ce code : le retour
+  // par une redirection n'a aucun champ où le saisir, donc ce mode de connexion lui est
+  // refusé.
   if (isTwoFactorEnrolled(twoFactorRecord(session.userId))) return "deux_facteurs";
   try {
     const result = db.prepare(`
-      UPDATE users SET auth_provider = 'google', provider_id = ?
+      UPDATE users SET auth_provider = ?, provider_id = ?
       WHERE id = ? AND provider_id IS NULL
-    `).run(identity.subject, session.userId);
+    `).run(provider.id, identity.subject, session.userId);
     if (result.changes === 1) return null;
     // La ligne a changé entre la lecture et l'écriture : une autre liaison a abouti.
     return "deja_lie";
@@ -2819,14 +2955,14 @@ function attachGoogleIdentity(session, identity) {
   }
 }
 
-// Ré-authentifie la session courante par l'identité Google qui lui est déjà attachée,
-// en dater la preuve dans la session. Rien n'est modifié sur le compte : la preuve ne
-// vaut que le temps de la fenêtre, et ne sert qu'aux actions qu'un mot de passe
-// autorise. Elle n'ouvre jamais de session : elle n'est lisible que depuis celle-ci.
-function refreshGoogleProof(session, identity) {
-  if (!session.providerId) return "google_non_lie";
+// Ré-authentifie la session courante par l'identité qui lui est déjà attachée, en dater
+// la preuve dans la session. Rien n'est modifié sur le compte : la preuve ne vaut que le
+// temps de la fenêtre, et ne sert qu'aux actions qu'un mot de passe autorise. Elle
+// n'ouvre jamais de session : elle n'est lisible que depuis celle-ci.
+function refreshProviderProof(session, identity) {
+  if (!session.providerId) return "identite_non_liee";
   // C'est l'identité rattachée qui doit se présenter, pas une autre : une identité
-  // Google différente ne prouverait rien sur ce compte.
+  // différente, chez ce fournisseur ou chez un autre, ne prouverait rien sur ce compte.
   if (!safeTokenEquals(session.providerId, identity.subject)) return "autre_identite";
   if (isTwoFactorEnrolled(twoFactorRecord(session.userId))) return "deux_facteurs";
   db.prepare("UPDATE sessions SET fresh_until = ? WHERE id = ? AND user_id = ?")
@@ -2839,19 +2975,19 @@ function refreshGoogleProof(session, identity) {
 // du fournisseur, ni son audience. `redirect: "error"` ferme la porte à une
 // redirection vers une autre origine : une réponse de jeton venue d'ailleurs ne
 // serait pas un jeton.
-async function fetchGoogleIdentity(code) {
-  const tokenResponse = await withTimeout(fetch(GOOGLE_TOKEN_URL, {
+async function fetchProviderIdentity(provider, code) {
+  const tokenResponse = await withTimeout(fetch(provider.tokenUrl, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
     body: new URLSearchParams({
       code,
-      client_id: GOOGLE_CLIENT_ID,
-      client_secret: GOOGLE_CLIENT_SECRET,
-      redirect_uri: GOOGLE_REDIRECT_URI,
+      client_id: provider.clientId,
+      client_secret: provider.clientSecret,
+      redirect_uri: provider.redirectUri,
       grant_type: "authorization_code",
     }).toString(),
     redirect: "error",
-  }), GOOGLE_HTTP_TIMEOUT_MS);
+  }), OAUTH_HTTP_TIMEOUT_MS);
   if (!tokenResponse.ok) {
     throw new Error(`échange du code refusé (${tokenResponse.status})`);
   }
@@ -2859,34 +2995,35 @@ async function fetchGoogleIdentity(code) {
   const accessToken = cleanText(tokens?.access_token, 512);
   if (!accessToken) throw new Error("le fournisseur n’a renvoyé aucun jeton d’accès");
 
-  const profileResponse = await withTimeout(fetch(GOOGLE_USERINFO_URL, {
+  const profileResponse = await withTimeout(fetch(provider.userinfoUrl, {
     headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
     redirect: "error",
-  }), GOOGLE_HTTP_TIMEOUT_MS);
+  }), OAUTH_HTTP_TIMEOUT_MS);
   if (!profileResponse.ok) {
     throw new Error(`lecture du profil refusée (${profileResponse.status})`);
   }
   const profile = await profileResponse.json();
 
   // `sub` est l'identifiant du compte chez le fournisseur, stable même quand
-  // l'adresse change. `email_verified` est une affirmation du fournisseur : sans elle,
-  // l'adresse n'est pas prouvée et rien ne peut être créé ni relié.
+  // l'adresse change. C'est lui, jamais l'adresse, qui rattache une identité à un
+  // compte. L'adresse, elle, se lit selon ce que le fournisseur sait certifier d'elle :
+  // c'est le seul écart entre deux fournisseurs, et il est écrit dans le registre.
   const subject = cleanText(profile?.sub, 128);
-  const email = normalizeEmail(profile?.email);
-  if (!subject || !email || profile?.email_verified !== true) return null;
-  return { subject, email, name: cleanText(profile?.name, MAX_NAME_LENGTH) };
+  const claimed = provider.readIdentity(profile);
+  if (!subject || !claimed) return null;
+  return { subject, email: claimed.email, verified: claimed.verified, name: cleanText(profile?.name, MAX_NAME_LENGTH) };
 }
 
-// Ouvre le compte correspondant à une identité Google, ou crée ce compte s'il n'existe
-// pas encore. Renvoie `{ userId }`, ou `{ refusal }` et le code court que l'interface
+// Ouvre le compte correspondant à une identité, ou crée ce compte s'il n'existe pas
+// encore. Renvoie `{ userId }`, ou `{ refusal }` et le code court que l'interface
 // traduira — le motif du refus ne traverse donc jamais le serveur en clair.
-function resolveGoogleAccount(identity) {
+function resolveProviderAccount(provider, identity) {
   // Le compte se cherche par l'identifiant externe, jamais par l'adresse : une adresse
-  // Google peut changer, le `sub` non. Une identité connue retrouve donc toujours son
-  // compte, et l'index unique interdit qu'un même `sub` s'y attache deux fois.
+  // peut changer, le `sub` non. Une identité connue retrouve donc toujours son compte,
+  // et l'index unique interdit qu'un même `sub` s'y attache deux fois.
   const known = db.prepare(`
-    SELECT id FROM users WHERE auth_provider = 'google' AND provider_id = ?
-  `).get(identity.subject);
+    SELECT id FROM users WHERE auth_provider = ? AND provider_id = ?
+  `).get(provider.id, identity.subject);
   if (known) {
     // La double authentification prime sur ce mode de connexion. Un compte qui exige
     // un code à chaque connexion ne s'ouvre pas par une redirection, faute de champ
@@ -2898,8 +3035,8 @@ function resolveGoogleAccount(identity) {
   // Aucune liaison automatique : une adresse en commun ne prouve rien. Un compte
   // peut déjà porter cette adresse, créé par quelqu'un qui n'a jamais confirmé la
   // sienne — lui remettre la session reviendrait à lui céder le compte. Le refus est
-  // la même réponse pour un compte local et pour un second compte Google : rien ne
-  // trahit l'existence du compte que l'adresse a déjà.
+  // la même réponse pour un compte local et pour un second compte de fournisseur :
+  // rien ne trahit l'existence du compte que l'adresse a déjà.
   if (db.prepare("SELECT id FROM users WHERE email = ?").get(identity.email)) {
     return { refusal: "email_deja_utilise" };
   }
@@ -2907,19 +3044,21 @@ function resolveGoogleAccount(identity) {
   const fallback = [
     identity.name,
     cleanText(identity.email.split("@")[0], MAX_NAME_LENGTH),
-    "Compte Google",
-  ].find((candidate) => candidate.length >= 2) || "Compte Google";
+    `Compte ${provider.label}`,
+  ].find((candidate) => candidate.length >= 2) || `Compte ${provider.label}`;
   const timestamp = now();
   try {
-    // L'adresse est marquée vérifiée sans e-mail à envoyer : Google l'a vérifiée
-    // pour son propre compte, et c'est cette preuve-là qui est conservée.
+    // Une adresse que le fournisseur certifie est marquée vérifiée sans e-mail à
+    // envoyer : c'est sa preuve qui est conservée. Une adresse seulement annoncée
+    // reste non confirmée, et le compte devra la confirmer par e-mail.
     const result = db.prepare(`
       INSERT INTO users (
         display_name, email, password_hash, created_at, email_verified_at, auth_provider, provider_id
       )
-      VALUES (?, ?, NULL, ?, ?, 'google', ?)
-    `).run(fallback, identity.email, timestamp, timestamp, identity.subject);
-    return { userId: Number(result.lastInsertRowid) };
+      VALUES (?, ?, NULL, ?, ?, ?, ?)
+    `).run(fallback, identity.email, timestamp, identity.verified ? timestamp : null, provider.id, identity.subject);
+    const userId = Number(result.lastInsertRowid);
+    return identity.verified ? { userId } : { userId, pendingVerification: true };
   } catch (error) {
     // Deux retours simultanés pour une même identité : le second perd, il n'a pas à
     // dire pourquoi — le compte existe déjà, c'est tout.
@@ -2933,20 +3072,24 @@ async function handleAuthApi(request, response, url) {
   //
   // Un aller et un retour, tous deux en GET, tous deux sans session. Le `state` est
   // le seul lien entre les deux : tiré au hasard au départ, mis en cookie `HttpOnly`,
-  // relu en comparaison constante au retour.
-  if (url.pathname.startsWith("/api/auth/google")) {
-    await handleGoogleAuthApi(request, response, url);
+  // relu en comparaison constante au retour. Le fournisseur est déduit du chemin, donc
+  // un ajout au registre rend ses routes existantes sans nouveau branchement ici. Un
+  // nom inconnu n'est pas un fournisseur : il poursuit vers les routes habituelles,
+  // qui répondront « introuvable ».
+  const pathProvider = findOAuthProvider(url.pathname.split("/")[3]);
+  if (pathProvider) {
+    await handleProviderAuthApi(pathProvider, request, response, url);
     return;
   }
 
   if (request.method === "GET" && url.pathname === "/api/auth/me") {
     const session = getSession(request);
-    // Dit à l'interface si un bouton « continuer avec Google » a un sens. Ce n'est
-    // pas un secret : sans identifiants configurés, la route répond de toute façon
+    // Dit à l'interface quels boutons « continuer avec … » ont un sens. Ce n'est pas un
+    // secret : sans identifiants configurés, la route répond de toute façon
     // « introuvable », et le serveur reste utilisable hors ligne.
-    const googleEnabled = GOOGLE_AUTH_ENABLED;
+    const providers = listEnabledProviders();
     if (!session) {
-      sendJson(response, 200, { user: null, csrfToken: null, googleEnabled });
+      sendJson(response, 200, { user: null, csrfToken: null, providers });
       return;
     }
     sendJson(response, 200, {
@@ -2954,12 +3097,12 @@ async function handleAuthApi(request, response, url) {
       csrfToken: session.csrfToken,
       entitlement: resolveEntitlement(session.userId),
       subscription: getSubscriptionSummary(session.userId),
-      googleEnabled,
-      // La page du compte a besoin de savoir si une identité Google est déjà attachée
-      // avant de proposer le geste, et si un mot de passe existe : un compte créé par
-      // Google n'en a pas, et les formulaires d'identité ne se présentent pas de la même
-      // façon.
-      googleLinked: Boolean(session.providerId),
+      providers,
+      // La page du compte a besoin de savoir quelle identité est déjà attachée avant de
+      // proposer le geste, et si un mot de passe existe : un compte créé par un
+      // fournisseur n'en a pas, et les formulaires d'identité ne se présentent pas de la
+      // même façon.
+      linkedProvider: session.authProvider === "local" ? null : session.authProvider,
       hasPassword: session.hasPassword,
     });
     return;
@@ -3360,89 +3503,99 @@ async function handleAccountApi(request, response, url, session) {
 
   // -- Modes de connexion ----------------------------------------------------
   //
-  // Relier une identité Google n'est pas un aller-retour d'anonyme vers un compte : le
-  // mot de passe est demandé avant, car c'est lui qui prouve que le compte appartient à
-  // celui qui demande. Un cookie de session volé ne suffirait pas à rattacher une
+  // Relier une identité à un compte n'est pas un aller-retour d'anonyme vers un compte :
+  // le mot de passe est demandé avant, car c'est lui qui prouve que le compte appartient
+  // à celui qui demande. Un cookie de session volé ne suffirait pas à rattacher une
   // identité tierce, donc à se garantir un accès durable après la perte du cookie.
   //
   // Les trois routes renvoient l'adresse du fournisseur plutôt qu'une redirection : le
   // navigateur ne peut pas suivre une `Location` vers un autre site depuis une requête
   // faite en JavaScript, donc c'est l'interface qui l'ouvre.
-
-  if (request.method === "POST" && url.pathname === "/api/account/google/link") {
+  //
+  // Un compte ne portant qu'une identité, la liaison est refusée dès qu'une autre est
+  // attachée, et la ré-authentification n'accepte que celle qui l'est déjà. Rien n'est
+  // remplacé ni repris sur une simple ressemblance d'adresse.
+  const accountAction = url.pathname.match(/^\/api\/account\/([a-z0-9_-]+)\/(link|unlink|reauth)$/);
+  const accountProvider = accountAction ? findOAuthProvider(accountAction[1]) : null;
+  if (request.method === "POST" && accountProvider) {
+    const action = accountAction[2];
     verifyCsrf(request, session);
-    requireGoogleConfigured();
-    checkRateLimit(`google-link:${session.userId}`, 5, 60 * 60 * 1_000);
-    await requireCurrentPassword(session, requireObject(await readJson(request)));
-    if (session.providerId) {
-      throw new HttpError(409, "Ce compte est déjà relié à une identité Google.", "google_already_linked");
+
+    if (action === "unlink") {
+      // Pas de garde de configuration ici, à la différence des deux autres : retirer une
+      // identité ne demande rien au fournisseur. Sans lui, un lien serait prisonnier d'une
+      // configuration disparue, sans aucun moyen de s'en défaire depuis le compte.
+      checkRateLimit(`oauth-unlink:${session.userId}`, 5, 60 * 60 * 1_000);
+      // L'identité ne peut venir que de son fournisseur : demander à l'un de retirer
+      // celle d'un autre n'aurait aucun sens, ni à l'un ni à l'autre.
+      if (session.authProvider !== accountProvider.id) {
+        throw new HttpError(
+          409,
+          `Aucune identité ${accountProvider.label} n'est reliée à ce compte.`,
+          "identity_not_linked",
+        );
+      }
+      // Ce refus précède la preuve : un compte sans mot de passe ne pourra jamais
+      // satisfaire la demande suivante, et le renvoyer vers le fournisseur pour découvrir
+      // ensuite qu'il devait d'abord définir un mot de passe serait un détour.
+      if (!session.hasPassword) {
+        throw new HttpError(
+          409,
+          `Ce compte n'a pas de mot de passe : définir-en un avant de délier l'identité ${accountProvider.label}.`,
+          "password_required_to_unlink",
+        );
+      }
+      await requireCurrentPassword(session, requireObject(await readJson(request)));
+      // L'identité devient de nouveau disponible pour un autre compte. Le délai de
+      // réflexion n'est pas mis en place : il faudrait garder le `sub` en attente, donc
+      // garder une trace de l'identité retirée, ce que la suppression du compte elle-même
+      // ne fait pas non plus. Le retrait est immédiat ou il n'est pas.
+      db.prepare(`
+        UPDATE users SET auth_provider = 'local', provider_id = NULL
+        WHERE id = ? AND provider_id IS NOT NULL
+      `).run(session.userId);
+      sendJson(response, 200, { ok: true });
+      return;
     }
+
+    // La liaison et la ré-authentification parlent toutes deux au fournisseur : sans lui,
+    // le parcours n'a nulle part où aller.
+    requireProviderConfigured(accountProvider);
+    // Déliaison, liaison et ré-authentification partagent une même limite par compte :
+    // elles ne sont pas trois fois plus permissives avec le même effet.
+    // La ré-authentification est plus fréquente qu'une liaison et sert aux actes
+    // sensibles : sa limite est plus large, celle de la liaison reste horaire.
+    checkRateLimit(`oauth-${action}:${session.userId}`, action === "reauth" ? 10 : 5, 60 * 60 * 1_000);
+    if (action === "link") {
+      // Relier ne demande rien au compte : c'est précisément elle qui va lui donner une
+      // identité. Le mot de passe précède tout, car c'est lui qui prouve que le compte
+      // appartient à celui qui demande la liaison.
+      await requireCurrentPassword(session, requireObject(await readJson(request)));
+      // Seule une identité à rattacher manque à l'appel : « déjà relié » vaut pour le
+      // fournisseur courant comme pour un autre, une identité n'en remplace jamais une
+      // autre sans déliaison préalable.
+      if (session.providerId) {
+        throw new HttpError(
+          409,
+          "Ce compte est déjà relié à une identité de fournisseur. Délie-la avant d'en relier une autre.",
+          "identity_already_linked",
+        );
+      }
+    } else if (!session.providerId || session.authProvider !== accountProvider.id) {
+      throw new HttpError(409, `Aucune identité ${accountProvider.label} n'est reliée à ce compte.`, "identity_not_linked");
+    }
+    // La double authentification gagne sur tout fournisseur tiers : un compte qui exige
+    // un code à chaque connexion ne doit pas pouvoir être rouvert par un aller-retour,
+    // qui n'a aucun champ où le saisir. Le refus vient après les garde-fous précédents :
+    // parler de second facteur à un compte qui n'a rien à prouver serait un détour.
     if (isTwoFactorEnrolled(twoFactorRecord(session.userId))) {
       throw new HttpError(
         409,
-        "Ce compte exige un code d'authentification à chaque connexion : la connexion Google y est désactivée.",
+        `Ce compte exige un code d'authentification à chaque connexion : la connexion ${accountProvider.label} y est désactivée.`,
         "two_factor_conflict",
       );
     }
-    const flow = prepareGoogleFlow("link", { userId: session.userId, sessionId: session.id });
-    sendJson(response, 200, { url: flow.url }, { "Set-Cookie": flow.cookies });
-    return;
-  }
-
-  // Délier retire une porte, il n'en ferme aucune : le mot de passe est exigé, sans quoi
-  // un cookie de session suffirait à supprimer le seul moyen de se reconnecter sans
-  // passer par le fournisseur. Un compte créé par Google n'a pas de mot de passe et ne
-  // peut donc pas être délié : il lui resterait un accès et aucune autre porte.
-  if (request.method === "POST" && url.pathname === "/api/account/google/unlink") {
-    verifyCsrf(request, session);
-    // Pas de garde de configuration ici, à la différence des deux autres : retirer une
-    // identité ne demande rien au fournisseur. Sans lui, un lien serait prisonnier d'une
-    // configuration disparue, sans aucun moyen de s'en défaire depuis le compte.
-    checkRateLimit(`google-unlink:${session.userId}`, 5, 60 * 60 * 1_000);
-    if (!session.providerId) {
-      throw new HttpError(409, "Aucune identité Google n'est reliée à ce compte.", "google_not_linked");
-    }
-    // Ce refus précède la preuve : un compte sans mot de passe ne pourra jamais
-    // satisfaire la demande suivante, et le renvoyer vers Google pour découvrir ensuite
-    // qu'il devait d'abord définir un mot de passe serait un détour.
-    if (!session.hasPassword) {
-      throw new HttpError(
-        409,
-        "Ce compte n'a pas de mot de passe : définir-en un avant de délier l'identité Google.",
-        "password_required_to_unlink",
-      );
-    }
-    await requireCurrentPassword(session, requireObject(await readJson(request)));
-    // L'identité devient de nouveau disponible pour un autre compte. Le délai de
-    // réflexion n'est pas mis en place : il faudrait garder le `sub` en attente, donc
-    // garder une trace de l'identité retirée, ce que la suppression du compte elle-même
-    // ne fait pas non plus. Le retrait est immédiat ou il n'est pas.
-    db.prepare(`
-      UPDATE users SET auth_provider = 'local', provider_id = NULL
-      WHERE id = ? AND provider_id IS NOT NULL
-    `).run(session.userId);
-    sendJson(response, 200, { ok: true });
-    return;
-  }
-
-  // Ré-authentifier ne demande rien d'autre que la session courante : c'est un aller-
-  // retour par le fournisseur, dont le retour datera la session. Utile aux seules
-  // actions qu'un mot de passe autorise sur un compte qui n'en a pas.
-  if (request.method === "POST" && url.pathname === "/api/account/google/reauth") {
-    verifyCsrf(request, session);
-    requireGoogleConfigured();
-    checkRateLimit(`google-reauth:${session.userId}`, 10, 10 * 60 * 1_000);
-    if (!session.providerId) {
-      throw new HttpError(409, "Aucune identité Google n'est reliée à ce compte.", "google_not_linked");
-    }
-    if (isTwoFactorEnrolled(twoFactorRecord(session.userId))) {
-      throw new HttpError(
-        409,
-        "Ce compte exige un code d'authentification à chaque connexion : la connexion Google y est désactivée.",
-        "two_factor_conflict",
-      );
-    }
-    const flow = prepareGoogleFlow("reauth", { userId: session.userId, sessionId: session.id });
+    const flow = prepareProviderFlow(accountProvider, action, { userId: session.userId, sessionId: session.id });
     sendJson(response, 200, { url: flow.url }, { "Set-Cookie": flow.cookies });
     return;
   }

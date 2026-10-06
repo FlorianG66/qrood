@@ -201,9 +201,18 @@ Tant que la double authentification n'est pas activée, chaque intervention dema
 - Le journal note le facteur réellement utilisé (`password`, `totp`, `recovery`), ce qui distingue une intervention validée par le propriétaire d'une intervention validée par un mot de passe volé.
 - Les tentatives sont limitées par période, activation et désactivation comprises.
 
-## Connexion avec un compte Google
+## Connexion avec un compte tiers (Google, Microsoft)
 
-### Mise en place
+Le registre `OAUTH_PROVIDER_DEFINITIONS` (`server.mjs`) décrit chaque fournisseur : identifiant, libellé, préfixe d'environnement, points d'appel par défaut et lecture de l'adresse. Google et Microsoft y sont déclarés ; en ajouter un revient à une entrée de plus dans cette liste — les routes `/api/auth/<fournisseur>/*` et `/api/account/<fournisseur>/*`, les cookies d'état et de retour (`qrood_oauth_state_<fournisseur>`, tracés au fournisseur) en sont déduits, sans nouveau branchement ailleurs.
+
+Les seules différences entre fournisseurs sont écrites dans le registre :
+
+- **La certification de l'adresse.** La lecture du profil (`readIdentity`) dit si l'adresse reçue fait preuve : Google exige `email_verified === true` et refuse sinon ; Microsoft rend `{ email, verified: false }` sans jamais certifier, alors le compte naît non confirmé et reçoit l'e-mail de confirmation d'une inscription locale (`email_verified_at` reste vide).
+- **Le libellé**, annoncé à l'interface par `GET /api/auth/me` → `providers: [{ id, label }]`, et employé dans les messages d'échec : « Connexion Microsoft expirée » et « Connexion Google expirée » ne se disent pas de la même façon, c'est pourquoi le retour porte `oauth_provider=<id>`.
+
+Sans identifiants, aucun bouton ne s'affiche et les routes répondent `404 oauth_unavailable` : le reste de la plateforme fonctionne normalement. L'ordre des boutons suit l'ordre du registre.
+
+### Mise en place (Google)
 
 1. Créer un client OAuth de type « Application Web » dans la console Google, avec l'autorisation `openid email profile` et l'URI de redirection exacte :
 
@@ -218,35 +227,52 @@ $env:QROOD_GOOGLE_CLIENT_ID = "…apps.googleusercontent.com"
 $env:QROOD_GOOGLE_CLIENT_SECRET = "GOCSPX-…"
 ```
 
-Le préfixe `GOOGLE_` est aussi accepté, sans le `QROOD_`. Sans ces deux valeurs, aucun bouton ne s'affiche et les routes répondent `404 oauth_unavailable` : le reste de la plateforme fonctionne normalement. `GOOGLE_REDIRECT_URI` n'est à définir que si l'URI de redirection déclarée chez Google n'est pas celle déduite de `QROOD_PUBLIC_ORIGIN`.
+Le préfixe `GOOGLE_` est aussi accepté, sans le `QROOD_`. `GOOGLE_REDIRECT_URI` n'est à définir que si l'URI de redirection déclarée chez Google n'est pas celle déduite de `QROOD_PUBLIC_ORIGIN`.
 
 Les points d'appel du fournisseur (`QROOD_GOOGLE_AUTH_URL`, `QROOD_GOOGLE_TOKEN_URL`, `QROOD_GOOGLE_USERINFO_URL`) sont surchargeables uniquement hors production : le serveur refuse de démarrer si l'un d'eux est modifié alors que `NODE_ENV=production`. C'est ce qui permet aux tests de suivre le flux de bout en bout sans sortir du réseau local.
+
+### Mise en place (Microsoft)
+
+1. Dans le portail Entra ID, enregistrer une application, ajouter l'API déléguée `openid email profile`, puis déclarer l'URI de redirection exacte :
+
+   ```
+   https://qr.example.com/api/auth/microsoft/callback
+   ```
+
+2. Déclarer les variables d'environnement :
+
+```powershell
+$env:QROOD_MICROSOFT_CLIENT_ID = "…"
+$env:QROOD_MICROSOFT_CLIENT_SECRET = "…"
+```
+
+Même règle que pour Google : sans les deux valeurs, aucun bouton Microsoft n'apparaît, et `QROOD_MICROSOFT_AUTH_URL` / `TOKEN_URL` / `USERINFO_URL` surchargent les points d'appel — le teneur `login.microsoftonline.com/common/…` par défaut se change ainsi si le tenant doit être fixé à une organisation. Microsoft ne certifie jamais l'adresse : le compte naît donc non confirmé, reçoit l'e-mail de confirmation d'une inscription locale, et reste ouvrable par le fournisseur en attendant (`email_verified_at` vide côté base).
 
 ### Fonctionnement
 
 - Le bouton n'est affiché que si le serveur confirme qu'un fournisseur est configuré : la décision est relue à chaque chargement, jamais supposée par l'interface.
-- Le parcours est le flux `code` d'OAuth 2.0 : aller sur `/api/auth/google/start`, échange du code contre un jeton d'accès, puis lecture du profil. Les deux appels réseau sont bornés à dix secondes et refusent toute redirection vers une autre origine.
+- Le parcours est le flux `code` d'OAuth 2.0 : aller sur `/api/auth/<fournisseur>/start`, échange du code contre un jeton d'accès, puis lecture du profil. Les deux appels réseau sont bornés à dix secondes et refusent toute redirection vers une autre origine.
 - Le compte est cherché par l'identifiant externe du fournisseur (`sub`), jamais par l'adresse : une adresse Google peut changer, l'identifiant non.
 - **Aucune liaison automatique.** Si un compte existe déjà avec cette adresse, la connexion est refusée. Une adresse en commun ne prouve rien — un compte peut avoir été créé par quelqu'un qui n'a jamais confirmé la sienne, et le lui remettre reviendrait à lui céder le compte.
-- Une identité dont l'adresse n'est pas déclarée vérifiée par le fournisseur est refusée, sans créer de compte.
-- Le `state` est tiré au hasard, mis dans un cookie `HttpOnly` borné à dix minutes et aux seules routes Google, puis relu en comparaison constante. Le cookie est effacé par la réponse, succès ou échec.
+- Une identité dont l'adresse est déclarée non vérifiée est refusée, sans créer de compte — sauf si le fournisseur certifie par construction qu'il ne certifie rien (Microsoft) : là, le compte naît non confirmé et reçoit l'e-mail de confirmation.
+- Le `state` est tiré au hasard, mis dans un cookie `HttpOnly` borné à dix minutes et aux seules routes du fournisseur (`Path=/api/auth/<fournisseur>`), puis relu en comparaison constante. Le cookie est effacé par la réponse, succès ou échec.
 - **Le cookie d'état est signé.** Il porte le `state`, l'intention du parcours, le compte et la session visés, plus une signature HMAC que le serveur seul peut produire. Sans elle, quiconque peut poser un cookie à ce nom — un hôte frère du même domaine, un trajet non chiffré, une fuite d'en-tête — désignerait lui-même le compte et la session, et une liaison s'appliquerait ensuite à la victime avec l'identité de l'attaquant. Un cookie dont la signature ne correspond pas est lu comme illisible : le parcours est refusé, jamais réinterprété.
 - La destination de retour ne peut être qu'un chemin de ce site : une URL absolue, un `//exemple.test` ou un `/\exemple.test` sont ramenés à la racine. Le `Location` rendu est relatif, il ne peut donc pas désigner un autre site.
-- Un compte créé par Google n'a pas de mot de passe (`password_hash` est `NULL`) et ne peut pas être ouvert par `POST /api/auth/login` : la réponse est identique à celle d'une adresse inconnue, sans révéler que le compte existe.
-- L'adresse déclarée vérifiée par Google est enregistrée comme vérifiée : c'est la preuve du fournisseur qui vaut confirmation, aucun e-mail n'est envoyé.
-- Les échecs sont rendus par un code court dans l'URL de retour (`?oauth=…`) ; le message est écrit par l'interface, jamais par le serveur. Aucun secret du fournisseur n'est écrit dans le journal.
+- Un compte créé par le fournisseur n'a pas de mot de passe (`password_hash` est `NULL`) et ne peut pas être ouvert par `POST /api/auth/login` : la réponse est identique à celle d'une adresse inconnue, sans révéler que le compte existe.
+- L'adresse déclarée vérifiée par le fournisseur est enregistrée comme vérifiée : c'est sa preuve qui vaut confirmation, aucun e-mail n'est envoyé.
+- Les échecs sont rendus par un code court dans l'URL de retour (`?oauth=…`, avec `oauth_provider=<fournisseur>`) ; le message est écrit par l'interface, jamais par le serveur — c'est elle qui nomme le fournisseur dans « Connexion Microsoft expirée ». Aucun secret du fournisseur n'est écrit dans le journal.
 
 ### Relier une identité à un compte existant
 
-La page « Mon compte » sait relier et délier une identité Google, et se ré-authentifier par elle.
+La page « Mon compte » sait relier et délier une identité, et se ré-authentifier par elle, pour chaque fournisseur configuré : les routes sont celles du registre, `POST /api/account/<fournisseur>/(link|unlink|reauth)`, et l'état affiché vient de `GET /api/auth/me` (`providers`, `linkedProvider`).
 
-- **Relier** (`POST /api/account/google/link`) exige le mot de passe actuel, puis un aller-retour par le fournisseur. Rien n'est remplacé : ni le mot de passe, ni l'adresse, ni les QR codes. Le compte garde la sienne — l'adresse déclarée par Google n'entre pas dans le compte.
+- **Relier** (`POST /api/account/<fournisseur>/link`) exige le mot de passe actuel, puis un aller-retour par le fournisseur. Rien n'est remplacé : ni le mot de passe, ni l'adresse, ni les QR codes. Le compte garde la sienne — l'adresse déclarée par le fournisseur n'entre pas dans le compte. Une identité déjà reliée à un autre compte est refusée (`identity_already_linked`), une identité inconnue du compte ouverte sans lien (`identity_not_linked`).
 - Le `state` de ce parcours est lié à la session et au compte : une liaison commencée par un compte et achevée dans une autre session est refusée (`session_expiree`), de même qu'un lien ouvert sans session. Une session fermée entre-temps ne laisse donc pas une liaison en suspens.
-- **Délier** (`POST /api/account/google/unlink`) exige le mot de passe actuel et est immédiat. L'identité libérée n'est plus rattachée à ce compte : la prochaine connexion avec elle crée un compte distinct, avec une bibliothèque vide. Un compte sans mot de passe ne peut pas être délié — il lui resterait un accès et aucune autre porte (`password_required_to_unlink`). Ce refus est rendu avant toute demande de preuve : sans mot de passe, aucun aller par Google n'y répondrait. Délier ne demande rien au fournisseur et reste donc possible même si la configuration Google disparaît ; un lien qui subsiste ne deviendrait pas impossible à retirer.
-- **La double authentification prime sur Google.** Un compte qui exige un code à chaque connexion ne peut ni se connecter par Google, ni y relier une identité, ni s'en servir pour se ré-authentifier (`two_factor_conflict`, `deux_facteurs`). Google ne remplace pas un second facteur : il en est un, parmi d'autres.
-- **Un compte sans mot de passe ne peut pas activer la double authentification** (`password_required_before_two_factor`). Elle fermerait partout la seule porte qui l'ouvre : connexion Google refusée, liaison et ré-authentification refusées, aucun mot de passe à saisir. Il ne resterait qu'une réinitialisation par e-mail, pour un compte qui n'en a jamais connu. La page du compte ne propose donc pas l'activation tant qu'aucun mot de passe n'est défini.
-- **Les comptes sans mot de passe.** Changer d'adresse, définir un mot de passe et supprimer le compte sont des actions qu'un mot de passe autorise. Sur un compte créé par Google, la preuve tient lieu de mot de passe : le retour du fournisseur date la session (`sessions.fresh_until`), et cette preuve vaut `QROOD_FRESH_WINDOW_MINUTES` minutes — quinze par défaut. Passé ce délai, l'action est refusée (`reauth_required`) et la page propose de renouveler la preuve (`POST /api/account/google/reauth`). Un compte qui reçoit un mot de passe referme cette voie : le mot de passe redevient exigé.
-- Un aller-retour de ré-authentification ne vaut que pour l'identité reliée au compte : ouvrir la page avec une autre identité Google est refusé (`autre_identite`), et aucune fenêtre n'est rouverte.
+- **Délier** (`POST /api/account/<fournisseur>/unlink`) exige le mot de passe actuel et est immédiat. L'identité libérée n'est plus rattachée à ce compte : la prochaine connexion avec elle crée un compte distinct, avec une bibliothèque vide. Un compte sans mot de passe ne peut pas être délié — il lui resterait un accès et aucune autre porte (`password_required_to_unlink`). Ce refus est rendu avant toute demande de preuve : sans mot de passe, aucun aller-retour n'y répondrait. Délier ne demande rien au fournisseur et reste donc possible même si sa configuration disparaît ; un lien qui subsiste ne deviendrait pas impossible à retirer.
+- **La double authentification prime sur le fournisseur.** Un compte qui exige un code à chaque connexion ne peut ni se connecter par Google ou Microsoft, ni y relier une identité, ni s'en servir pour se ré-authentifier (`two_factor_conflict`, `deux_facteurs`). Un fournisseur ne remplace pas un second facteur : il en est un, parmi d'autres.
+- **Un compte sans mot de passe ne peut pas activer la double authentification** (`password_required_before_two_factor`). Elle fermerait partout la seule porte qui l'ouvre : connexion par le fournisseur refusée, liaison et ré-authentification refusées, aucun mot de passe à saisir. Il ne resterait qu'une réinitialisation par e-mail, pour un compte qui n'en a jamais connu. La page du compte ne propose donc pas l'activation tant qu'aucun mot de passe n'est défini.
+- **Les comptes sans mot de passe.** Changer d'adresse, définir un mot de passe et supprimer le compte sont des actions qu'un mot de passe autorise. Sur un compte créé par le fournisseur, la preuve tient lieu de mot de passe : le retour date la session (`sessions.fresh_until`), et cette preuve vaut `QROOD_FRESH_WINDOW_MINUTES` minutes — quinze par défaut. Passé ce délai, l'action est refusée (`reauth_required`) et la page propose de renouveler la preuve (`POST /api/account/<fournisseur>/reauth`). Un compte qui reçoit un mot de passe referme cette voie : le mot de passe redevient exigé.
+- Un aller-retour de ré-authentification ne vaut que pour l'identité reliée au compte : ouvrir la page avec une autre identité du même fournisseur est refusé (`autre_identite`), et aucune fenêtre n'est rouverte.
 
 ## Configuration
 
@@ -310,14 +336,14 @@ Le back-office est couvert par `test/admin.test.mjs` (huit scénarios sur un ser
 - l'offre offerte : refus des offres inexistantes et des durées hors bornes, échéance conforme à la durée demandée, remplacement d'un accès précédent sans accumuler de lignes, refus sur un compte porteur d'un abonnement Stripe, et mention au journal de l'offre, de la durée et de l'offre précédente ;
 - la double authentification : repli par mot de passe, activation par code confirmé, rejet d'un code rejoué, code de récupération à usage unique, et mention du facteur utilisé au journal.
 
-La connexion Google est couverte par `test/oauth.test.mjs`, qui fait tourner un faux fournisseur sur la machine locale (quatorze scénarios) :
+La connexion par identité tierce est couverte par `test/oauth.test.mjs`, qui fait tourner un faux fournisseur sur la machine locale (seize scénarios) :
 
 - le flux complet : aller, échange du code authentifié, lecture du profil, création d'un compte sans mot de passe, session ouverte et identité retrouvée sur le retour suivant, même quand l'adresse du fournisseur a changé ;
 - le `state` : absent, différent, rejoué après effacement du cookie, code injecté sans échange préalable, refus de Google et code manquant ;
 - les identités non prouvées (adresse non vérifiée, absente ou mal formée) et un fournisseur qui répond mal, sans secret dans le journal ;
 - le refus de reprendre ou de lier un compte existant, et le fait qu'un compte sans mot de passe ne s'ouvre pas par `POST /api/auth/login` ;
 - la destination de retour : un chemin du site est conservé, toute adresse extérieure est ramenée à la racine ;
-- l'absence de configuration : `404 oauth_unavailable` et `googleEnabled: false`, mais une déliaison qui répond quand même au lieu de disparaître avec le fournisseur ;
+- l'absence de configuration : `404 oauth_unavailable` et `providers: []`, mais une déliaison qui répond quand même au lieu de disparaître avec le fournisseur ;
 - la migration d'une base d'avant la connexion Google : `password_hash` rendu facultatif, comptes conservés, références et index reposés, second démarrage sans effet ;
 - la liaison : mot de passe exigé, mot de passe conservé, adresse du fournisseur écartée, connexion Google ensuite dirigée vers le seul compte existant, seconde liaison refusée ;
 - la liaison et la session : refus sans session, refus sur une autre session, refus après fermeture de la session d'origine, et aucun changement en base ;
@@ -325,7 +351,19 @@ La connexion Google est couverte par `test/oauth.test.mjs`, qui fait tourner un 
 - la preuve d'un compte sans mot de passe : session fraîche au retour du fournisseur, expiration de la fenêtre, refus de changer d'adresse et de supprimer le compte sans preuve, refus de délier le dernier accès, ré-authentification par une autre identité refusée, puis changement d'adresse accepté — et, une fois un mot de passe défini, exigence du mot de passe revenue ;
 - la déliaison : refus quand rien n'est relié, exigence du mot de passe, mot de passe et session conservés, connexion par mot de passe intacte, et identité libérée qui crée son propre compte sans reprendre l'ancien ;
 - le cookie d'état forgé : un cookie qui désigne lui-même le compte et la session d'une victime est refusé sans échange du code, sans lien en base et sans compte créé, et réécrire l'intention ne change rien — la signature ne correspond plus, le cookie est illisible ;
-- l'activation de la double authentification sans mot de passe : refus avant l'émission de tout secret, refus de délier qui nomme le mot de passe plutôt qu'une preuve impossible, puis activation acceptée une fois le mot de passe défini.
+- l'activation de la double authentification sans mot de passe : refus avant l'émission de tout secret, refus de délier qui nomme le mot de passe plutôt qu'une preuve impossible, puis activation acceptée une fois le mot de passe défini ;
+- la connexion Microsoft : un fournisseur qui ne certifie pas l'adresse (le cas est inscrit dans le registre, pas deviné) fait naître le compte non confirmé, l'e-mail de confirmation part, et le retour suivant retrouve le compte au lieu d'en ouvrir un second ;
+- deux fournisseurs configurés à la fois : les deux boutons annoncés par `providers`, le retour de l'un présenté à l'autre refusé sans échange de code avec le nom du fournisseur qui a répondu, chaque parcours qui ouvre son propre compte, et une liaison demandée au mauvais fournisseur nommée comme telle.
+
+Au-delà des tests unitaires, le rendu se vérifie dans un vrai navigateur :
+
+```powershell
+npm run check:browser
+```
+
+`tools/browser-check.mjs` ouvre Chrome en mode sans-tête sur son port de débogage, le pilote par le protocole CDP (websocket de Node, sans dépendance), démarre un faux fournisseur local puis le serveur sur une base jetable, et enchaîne vingt-deux vérifications : boutons de connexion annoncés et pointant sur les bonnes adresses, message d'échec nommant le fournisseur, aller-retour de liaison complet sur `/compte`, connexion Microsoft complète avec compte non confirmé, champs de mot de passe masqués sur un compte sans mot de passe. L'écran final est capturé dans un répertoire temporaire dont le chemin est imprimé.
+
+Chrome se trouve dans les emplacements usuels ; sinon, `QROOD_CHROME` donne son chemin complet. Les ports (`QROOD_CHECK_APP_PORT`, `QROOD_CHECK_IDP_PORT`, `QROOD_CHECK_CDP_PORT`) se surchargent si l'un d'eux est pris. Le script n'entre pas dans `npm test`, qui reste exécutable sans navigateur installé.
 
 ## Passage en production
 

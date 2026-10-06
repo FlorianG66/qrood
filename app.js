@@ -45,6 +45,9 @@
     offers: null,
     offersError: "",
     subscription: null,
+    // Fournisseurs annoncés par le serveur : `{ id, label }`, la seule source des
+    // libellés affichés, y compris dans les messages d'échec d'un retour.
+    providers: [],
     contentDirty: false,
     isDirty: false,
     isSaving: false,
@@ -1017,12 +1020,17 @@
       showToast("Le serveur n’est pas disponible. Rechargez la page.");
     }
     await offersPromise;
-    window.addEventListener("load", () => {
+    // Le `load` peut être passé pendant les requêtes ci-dessus : dans ce cas,
+    // attendre l'événement reviendrait à ne jamais lire le retour du fournisseur
+    // ou du paiement, et l'utilisateur verrait une page muette après un aller-retour.
+    const afterLoad = () => {
       updatePreview();
       renderHistory();
       handleBillingReturn();
       handleOauthReturn();
-    }, { once: true });
+    };
+    if (document.readyState === "complete") afterLoad();
+    else window.addEventListener("load", afterLoad, { once: true });
   }
 
   function cacheElements() {
@@ -1105,8 +1113,7 @@
     elements.authError = $("#authError");
     elements.loginForm = $("#loginForm");
     elements.registerForm = $("#registerForm");
-    elements.googleAuth = $("#googleAuth");
-    elements.googleSignIn = $("#googleSignIn");
+    elements.providerAuth = $("#providerAuth");
     elements.statsModal = $("#statsModal");
     elements.toast = $("#toast");
     elements.toastMessage = $("#toastMessage");
@@ -1276,11 +1283,18 @@
     });
     elements.loginForm.addEventListener("submit", handleLogin);
     elements.registerForm.addEventListener("submit", handleRegister);
-    elements.googleSignIn?.addEventListener("click", () => {
+    // L'écoute est pose sur le conteneur et non sur chaque lien : les liens sont créés
+    // plus tard, quand le serveur a répondu, et un écouteur posé à l'initialisation
+    // n'existerait pas encore. Un seul point d'entrée suffit donc, et il survit à
+    // n'importe quel nombre de fournisseurs.
+    elements.providerAuth?.addEventListener("click", (event) => {
+      const link = event.target.closest("[data-oauth-start]");
+      if (!link) return;
       // Le serveur ne rend l'utilisateur qu'à une adresse de ce site : la page
       // courante est transmise pour qu'il revienne où il était, et il décide.
       const here = `${window.location.pathname}${window.location.search}`;
-      elements.googleSignIn.href = `/api/auth/google/start?next=${encodeURIComponent(here)}`;
+      link.href = `/api/auth/${encodeURIComponent(link.dataset.oauthStart)}/start`
+        + `?next=${encodeURIComponent(here)}`;
     });
     $$("[data-close-modal]").forEach((button) => {
       button.addEventListener("click", () => closeModal(button.dataset.closeModal));
@@ -2951,7 +2965,7 @@
     const attempt = state.authAttempt;
     const result = await api("/api/auth/me");
     if (attempt !== state.authAttempt) return;
-    renderGoogleAuth(result.googleEnabled);
+    renderProviderAuth(result.providers);
     if (!result.user) {
       clearSession();
       return;
@@ -2977,37 +2991,69 @@
     renderAuthState();
   }
 
-  // Le lien Google reste masqué tant que le serveur n'a pas dit qu'un fournisseur
-  // est configuré : annoncer une connexion qui n'existe pas serait pire que son
-  // absence. La décision vient du serveur à chaque chargement, jamais du cache.
-  function renderGoogleAuth(enabled) {
-    // Le bouton suit la configuration du serveur, jamais l'inverse : sans
-    // identifiants côté Google, un clic ne mènerait qu'à une page d'erreur.
-    if (elements.googleAuth) elements.googleAuth.hidden = !enabled;
+  // Les liens de connexion restent masqués tant que le serveur n'a pas dit quels
+  // fournisseurs sont configurés : annoncer une connexion qui n'existe pas serait pire
+  // que son absence. La décision vient du serveur à chaque chargement, jamais du
+  // cache, et le HTML ne contient qu'un gabarit sans nom propre.
+  function renderProviderAuth(providers) {
+    const available = Array.isArray(providers) ? providers : [];
+    // La même liste sert aux liens et aux libellés des messages d'échec : le serveur
+    // est seul à savoir comment il nomme chaque fournisseur.
+    state.providers = available;
+    const container = elements.providerAuth;
+    if (!container) return;
+    // Le conteneur est vidé avant chaque rendu : un fournisseur retiré de la
+    // configuration disparaît de la page, il ne reste pas d'un chargement précédent.
+    container.replaceChildren(...available.map(createProviderLink));
+    container.hidden = available.length === 0;
   }
 
-  // Le retour d'une connexion Google porte un code court, jamais un texte : le
-  // message est écrit ici, et l'URL est nettoyée pour qu'un rechargement ne
-  // répète pas l'annonce d'un échec déjà traitées.
+  function createProviderLink(provider) {
+    const link = document.createElement("a");
+    link.className = "auth-alt-link";
+    link.id = `providerSignIn-${provider.id}`;
+    link.href = `/api/auth/${encodeURIComponent(provider.id)}/start`;
+    link.dataset.oauthStart = provider.id;
+    // `textContent` plutôt qu'un gabarit HTML : le libellé vient du serveur.
+    link.textContent = `Continuer avec ${provider.label}`;
+    return link;
+  }
+
+  // Le retour d'une connexion porte un code court et le nom du fournisseur, jamais un
+  // texte : le message est écrit ici, et l'URL est nettoyée pour qu'un rechargement ne
+  // répète pas l'annonce d'un échec déjà traitée.
   const OAUTH_MESSAGES = {
-    refus: "Connexion Google annulée.",
-    state_invalide: "Connexion Google expirée. Recommencez depuis cette page.",
-    code_manquant: "Google n’a pas renvoyé de code d’autorisation. Recommencez.",
-    identite_refusee: "Google n’a pas confirmé votre adresse. Un compte Google vérifié est nécessaire.",
-    email_deja_utilise: "Un compte existe déjà avec cette adresse. Connectez-vous par mot de passe.",
-    fournisseur_indisponible: "Google ne répond pas. Réessayez dans un instant.",
+    refus: ({ label }) => `Connexion ${label} annulée.`,
+    state_invalide: ({ label }) => `Connexion ${label} expirée. Recommencez depuis cette page.`,
+    code_manquant: ({ label }) => `${label} n’a pas renvoyé de code d’autorisation. Recommencez.`,
+    identite_refusee: ({ label }) => `${label} n’a pas confirmé votre adresse.`,
+    email_deja_utilise: () => "Un compte existe déjà avec cette adresse. Connectez-vous par mot de passe.",
+    fournisseur_indisponible: ({ label }) => `${label} ne répond pas. Réessayez dans un instant.`,
   };
+
+  // Le fournisseur n'est pas déduit du code : le serveur l'ajoute à l'URL de retour,
+  // parce que seul lui sait lequel a échoué. Son libellé vient de la même liste que les
+  // boutons ; si la réponse n'est pas arrivée, la table ci-dessous complète, et un nom
+  // inconnu ne devient jamais une étiquette affichée telle quelle.
+  const OAUTH_PROVIDER_LABELS = { google: "Google", microsoft: "Microsoft" };
+
+  function oauthProviderLabel(id) {
+    const known = state.providers.find((provider) => provider.id === id);
+    if (known) return known.label;
+    return OAUTH_PROVIDER_LABELS[id] || "votre compte";
+  }
 
   function handleOauthReturn() {
     const params = new URLSearchParams(window.location.search);
     const code = params.get("oauth");
     if (!code) return;
+    const provider = { label: oauthProviderLabel(params.get("oauth_provider")) };
     window.history.replaceState({}, "", `${window.location.pathname}${window.location.hash}`);
     if (code === "succes") {
       showToast("Connexion réussie.");
       return;
     }
-    const message = OAUTH_MESSAGES[code] || "La connexion Google n’a pas abouti.";
+    const message = (OAUTH_MESSAGES[code] || (({}) => "La connexion n’a pas abouti."))(provider);
     if (state.user) showToast(message);
     else openAuthModal("login", message);
   }

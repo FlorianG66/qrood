@@ -551,9 +551,9 @@ test("comptes, isolation des QR codes et statistiques", async () => {
     assert.equal(repeatedLogout.status, 200);
     assert.match(repeatedLogout.headers.get("set-cookie") || "", /qrood_session=;/);
     const afterLogout = await request("/api/auth/me", { cookie: firstCookie });
-    // `googleEnabled` décrit le serveur, pas la session : ce serveur de test n'a aucun
+    // `providers` décrit le serveur, pas la session : ce serveur de test n'a aucun
     // fournisseur configuré, donc le bouton n'a rien à afficher.
-    assert.deepEqual(await afterLogout.json(), { user: null, csrfToken: null, googleEnabled: false });
+    assert.deepEqual(await afterLogout.json(), { user: null, csrfToken: null, providers: [] });
 
     const unauthenticatedLibrary = await request("/api/qrcodes");
     assert.equal(unauthenticatedLibrary.status, 401);

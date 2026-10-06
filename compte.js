@@ -17,9 +17,12 @@
     twoFactor: null,
     twoFactorMode: null,
     twoFactorSecret: null,
-    googleEnabled: false,
+    // Les fournisseurs configurés, tels que le serveur les annonce, et le nom de
+    // celui qui est éventuellement relié. Un compte n'en porte qu'un : `linkedProvider`
+    // est `null` pour un compte local.
+    providers: [],
     hasPassword: true,
-    googleLinked: false,
+    linkedProvider: null,
   };
 
   const elements = {};
@@ -42,12 +45,12 @@
       state.user = result.user;
       state.entitlement = result.entitlement;
       state.subscription = result.subscription;
-      // Ces trois indicateurs décident de ce que la page peut proposer : un compte
-      // sans mot de passe n'affiche pas les champs de mot de passe, et une identité
-      // déjà reliée n'affiche pas le formulaire de liaison.
-      state.googleEnabled = Boolean(result.googleEnabled);
+      // Ces indicateurs décident de ce que la page peut proposer : un compte sans mot de
+      // passe n'affiche pas les champs de mot de passe, et une identité déjà reliée
+      // n'affiche pas le formulaire de liaison.
+      state.providers = Array.isArray(result.providers) ? result.providers : [];
       state.hasPassword = result.hasPassword !== false;
-      state.googleLinked = Boolean(result.googleLinked);
+      state.linkedProvider = typeof result.linkedProvider === "string" ? result.linkedProvider : null;
       render();
       elements.accountMain.hidden = false;
       elements.accountLoading.remove();
@@ -103,13 +106,7 @@
     elements.emailPasswordGroup = $("#emailPasswordGroup");
     elements.oldPasswordGroup = $("#oldPasswordGroup");
     elements.deletePasswordGroup = $("#deletePasswordGroup");
-    elements.googleCard = $("#googleCard");
-    elements.googleStatus = $("#googleStatus");
-    elements.googleNote = $("#googleNote");
-    elements.googleLinkForm = $("#googleLinkForm");
-    elements.googleUnlinkForm = $("#googleUnlinkForm");
-    elements.googleActions = $("#googleActions");
-    elements.googleReauthButton = $("#googleReauthButton");
+    elements.providerCard = $("#providerCard");
     elements.planName = $("#planName");
     elements.planStatus = $("#planStatus");
     elements.planRenewal = $("#planRenewal");
@@ -148,9 +145,11 @@
     $("#portalButton").addEventListener("click", onPortal);
     $("#deleteForm").addEventListener("submit", onDelete);
     $("#logoutButton").addEventListener("click", onLogout);
-    $("#googleLinkForm").addEventListener("submit", onGoogleLink);
-    $("#googleUnlinkForm").addEventListener("submit", onGoogleUnlink);
-    elements.googleReauthButton.addEventListener("click", onGoogleReauth);
+    // Les formulaires de la carte fournisseurs sont créés à chaque rendu, avec le
+    // fournisseur en cours de traitement : l'écoute est donc déléguée au conteneur,
+    // qui existe une fois pour toute la session de la page.
+    elements.providerCard?.addEventListener("submit", onProviderFormSubmit);
+    elements.providerCard?.addEventListener("click", onProviderClick);
     elements.twoFactorActions.addEventListener("click", onTwoFactorClick);
     elements.twoFactorForm.addEventListener("submit", onTwoFactorSubmit);
     for (const button of document.querySelectorAll("[data-close-modal]")) {
@@ -218,7 +217,8 @@
   function reportError(error) {
     if (error.code === "reauth_required") {
       revealReauth();
-      showToast("Ta session n'est plus récente : prouve ton identité avec Google pour continuer.");
+      const linked = state.providers.find((provider) => provider.id === state.linkedProvider);
+      showToast(`Ta session n'est plus récente : prouve ton identité avec ${linked ? linked.label : "ton compte tiers"} pour continuer.`);
       return;
     }
     showToast(error.message || "L'opération a échoué.");
@@ -237,47 +237,134 @@
 
     showPendingEmail(state.user.pendingEmail);
     renderPlan();
-    renderGoogle();
+    renderProviders();
     renderPasswordFields();
     renderTwoFactor();
   }
 
-  // ── Connexion Google ───────────────────────────────────────────────────────
+  // ── Connexion par un fournisseur d'identité ────────────────────────────────
   //
-  // Google est une porte d'entrée, pas un compte à part : relier ajoute une entrée
-  // sans rien remplacer, délier en retire une, et la page suit l'état réel plutôt
-  // qu'un drapeau posé en mémoire.
-
-  function renderGoogle() {
-    elements.googleCard.hidden = !state.googleEnabled;
-    if (!state.googleEnabled) return;
+  // Un fournisseur est une porte d'entrée, pas un compte à part : relier ajoute une
+  // entrée sans rien remplacer, délier en retire une, et la page suit l'état réel
+  // plutôt qu'un drapeau posé en mémoire. La carte est construite pour le fournisseur
+  // relié s'il y en a un, sinon pour le premier configuré : il n'y a qu'une identité
+  // par compte, donc deux cartes ne rivalryseraient pas.
+  function renderProviders() {
+    const container = elements.providerCard;
+    if (!container) return;
+    // Les fournisseurs retirés de la configuration disparaissent de la page : le
+    // conteneur est vidé avant chaque rendu.
+    container.replaceChildren();
+    const providers = state.providers;
+    if (providers.length === 0) {
+      container.hidden = true;
+      return;
+    }
+    container.hidden = false;
 
     const enrolled = Boolean(state.twoFactor?.enrolled);
-    elements.googleStatus.textContent = state.googleLinked
-      ? "Identité reliée : ton compte s'ouvre avec Google, à côté de son mot de passe."
+    const linked = providers.find((provider) => provider.id === state.linkedProvider) || null;
+
+    const title = document.createElement("h2");
+    title.textContent = "Connexion par un compte tiers";
+    container.append(title);
+
+    const status = document.createElement("p");
+    status.className = "field-hint";
+    status.textContent = linked
+      ? `Identité ${linked.label} reliée : ton compte s'ouvre avec ${linked.label}, à côté de son mot de passe.`
       : "Aucune identité reliée : ton compte ne s'ouvre qu'avec son mot de passe.";
+    container.append(status);
 
     // Une double authentification occupe déjà le rôle de second facteur. La proposer
-    // quand même laisserait croire que Google peut s'y substituer : il ne le peut pas,
-    // et le serveur refuserait l'aller-retour.
+    // quand même laisserait croire qu'un fournisseur peut s'y substituer : il ne le
+    // peut pas, et le serveur refuserait l'aller-retour.
     if (enrolled) {
-      elements.googleNote.hidden = false;
-      elements.googleNote.textContent =
-        "Ta double authentification demande déjà un code à chaque connexion : la connexion Google y est désactivée, et le serveur la refusera.";
-      elements.googleLinkForm.hidden = true;
-      elements.googleUnlinkForm.hidden = true;
-      elements.googleActions.hidden = true;
+      container.append(providerNote(
+        "Ta double authentification demande déjà un code à chaque connexion : les connexions par compte tiers y sont désactivées, et le serveur les refusera.",
+      ));
       return;
     }
 
-    elements.googleNote.hidden = state.hasPassword;
-    elements.googleNote.textContent = state.hasPassword
-      ? ""
-      : "Ton compte n'a pas de mot de passe : Google tient lieu de preuve pour changer d'adresse, définir un mot de passe ou supprimer le compte. Cette preuve est valable une quinzaine de minutes, après quoi il faut la renouveler.";
+    if (!state.hasPassword) {
+      const label = linked ? linked.label : providers[0].label;
+      container.append(providerNote(
+        `Ton compte n'a pas de mot de passe : ${label} tient lieu de preuve pour changer d'adresse, définir un mot de passe ou supprimer le compte. Cette preuve est valable une quinzaine de minutes, après quoi il faut la renouveler.`,
+      ));
+    }
 
-    elements.googleLinkForm.hidden = state.googleLinked;
-    elements.googleUnlinkForm.hidden = !state.googleLinked || !state.hasPassword;
-    elements.googleActions.hidden = Boolean(state.hasPassword) || !state.googleLinked;
+    if (!linked) {
+      const available = providers[0];
+      container.append(providerLinkForm(available, "link"));
+      return;
+    }
+    // Délier exige un mot de passe : sans lui, un cookie de session suffirait à supprimer
+    // la seule porte de retour du compte. Un compte créé par un fournisseur n'en a pas.
+    if (state.hasPassword) container.append(providerLinkForm(linked, "unlink"));
+    if (!state.hasPassword) {
+      container.append(providerReauthButton(linked));
+    }
+  }
+
+  function providerNote(text) {
+    const note = document.createElement("p");
+    note.className = "account-note";
+    note.textContent = text;
+    return note;
+  }
+
+  // Un formulaire par geste, construit dans la langue de la page. L'identifiant du
+  // champ de mot de passe porte le fournisseur : deux formulaires ne peuvent donc pas
+  // partager une valeur, ni garder celle d'un rendu précédent.
+  function providerLinkForm(provider, action) {
+    const form = document.createElement("form");
+    form.dataset.provider = provider.id;
+    form.dataset.providerAction = action;
+
+    const label = document.createElement("label");
+    label.htmlFor = `providerPassword-${provider.id}-${action}`;
+    label.textContent = "Mot de passe actuel";
+    form.append(label);
+
+    const input = document.createElement("input");
+    input.id = `providerPassword-${provider.id}-${action}`;
+    input.name = "currentPassword";
+    input.type = "password";
+    input.maxLength = 128;
+    input.autocomplete = "current-password";
+    input.required = true;
+    form.append(input);
+
+    const hint = document.createElement("p");
+    hint.className = "field-hint";
+    hint.textContent = action === "link"
+      ? `${provider.label} est alors une porte d'entrée de plus, à côté du mot de passe.`
+      : `Délier est immédiat et définitif. Ensuite, te connecter avec cette identité ${provider.label} créera un compte distinct.`;
+    form.append(hint);
+
+    const button = document.createElement("button");
+    button.className = action === "link"
+      ? "button button-dark button-small"
+      : "button button-danger button-small";
+    button.type = "submit";
+    button.textContent = action === "link"
+      ? `Relier mon compte ${provider.label}`
+      : `Délier mon compte ${provider.label}`;
+    form.append(button);
+    return form;
+  }
+
+  function providerReauthButton(provider) {
+    const actions = document.createElement("div");
+    actions.className = "account-actions";
+    const button = document.createElement("button");
+    button.className = "button button-light button-small";
+    button.type = "button";
+    button.dataset.provider = provider.id;
+    button.dataset.providerAction = "reauth";
+    button.textContent = `Prouver mon identité avec ${provider.label}`;
+    actions.append(button);
+    return actions;
   }
 
   // La case de mot de passe disparaît quand le compte n'en a pas : la laisser visible,
@@ -292,71 +379,90 @@
   // Le bouton de preuve est déjà sur la page ; c'est le refus d'une action qui le rend
   // visible, quand la fenêtre d'un compte sans mot de passe s'est refermée entre-temps.
   function revealReauth() {
-    if (!state.googleEnabled || state.hasPassword || !state.googleLinked || state.twoFactor?.enrolled) return;
-    elements.googleActions.hidden = false;
-    elements.googleCard.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (state.hasPassword || !state.linkedProvider || state.twoFactor?.enrolled) return;
+    if (!state.providers.some((provider) => provider.id === state.linkedProvider)) return;
+    renderProviders();
+    elements.providerCard?.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 
   // Un aller-retour par le fournisseur ne se poursuit pas depuis une requête
   // JavaScript : le serveur renvoie l'adresse, et c'est la page qui l'ouvre.
-  async function startGoogleFlow(path, body = {}) {
-    const result = await api(path, { method: "POST", body });
+  async function startProviderFlow(provider, action, body = {}) {
+    const result = await api(`/api/account/${encodeURIComponent(provider)}/${action}`, {
+      method: "POST",
+      body,
+    });
     window.location.assign(result.url);
   }
 
-  function onGoogleLink(event) {
+  // Le formulaire et le bouton portent tous deux le fournisseur et le geste dans leurs
+  // attributs : un seul exécutant suffit, quel que soit le nombre de fournisseurs, et
+  // rien n'est lu d'un identifiant construit à la main.
+  function onProviderFormSubmit(event) {
+    const form = event.target.closest("form[data-provider]");
+    if (!form) return;
     event.preventDefault();
-    withBusy(event.currentTarget, async () => {
-      await startGoogleFlow("/api/account/google/link", { currentPassword: $("#googleLinkPassword").value });
+    const { provider, providerAction: action } = form.dataset;
+    const password = form.querySelector('input[name="currentPassword"]')?.value || "";
+    withBusy(event.submitter || form, async () => {
+      if (action === "unlink") {
+        await api(`/api/account/${encodeURIComponent(provider)}/unlink`, {
+          method: "POST",
+          body: { currentPassword: password },
+        });
+        // Le lien vient de disparaître de la page : elle est rechargée pour que rien
+        // n'y reste, et pour que le bouton « Déconnexion » ne repose pas sur un état
+        // que le serveur ne partage plus.
+        window.location.assign("/compte");
+        return;
+      }
+      await startProviderFlow(provider, "link", { currentPassword: password });
     });
   }
 
-  function onGoogleUnlink(event) {
-    event.preventDefault();
-    withBusy(event.currentTarget, async () => {
-      await api("/api/account/google/unlink", {
-        method: "POST",
-        body: { currentPassword: $("#googleUnlinkPassword").value },
-      });
-      // Le lien et le mot de passe viennent de disparaître de la page : elle est
-      // rechargée pour que rien n'y reste, et pour que le bouton « Déconnexion » ne
-      // repose pas sur un état que le serveur ne partage plus.
-      window.location.assign("/compte");
-    });
-  }
-
-  function onGoogleReauth() {
-    elements.googleReauthButton.disabled = true;
-    startGoogleFlow("/api/account/google/reauth").catch((error) => {
+  function onProviderClick(event) {
+    const button = event.target.closest("button[data-provider-action='reauth']");
+    if (!button) return;
+    button.disabled = true;
+    startProviderFlow(button.dataset.provider, "reauth").catch((error) => {
       reportError(error);
-      elements.googleReauthButton.disabled = false;
+      button.disabled = false;
     });
   }
 
   // Le retour du fournisseur se lit ici : la liaison et la ré-authentification
   // reviennent toutes deux à cette page, avec un code plutôt qu'un message.
   const OAUTH_MESSAGES = {
-    liaison_reussie: "Identité Google reliée à ton compte.",
-    reauth_reussie: "Identité prouvée : tu peux à nouveau modifier ton compte.",
-    refus: "Connexion Google annulée.",
-    state_invalide: "Demande expirée. Recommence depuis cette page.",
-    code_manquant: "Google n'a pas renvoyé de code d'autorisation. Recommence.",
-    session_expiree: "Ta session a changé pendant la connexion : reprends la demande ici.",
-    identite_refusee: "Google n'a pas confirmé ton adresse. Un compte Google vérifié est nécessaire.",
-    fournisseur_indisponible: "Google ne répond pas. Réessaie dans un instant.",
-    deux_facteurs: "Ton compte exige un code d'authentification : connecte-toi avec ton mot de passe.",
-    google_non_lie: "Aucune identité Google n'est reliée à ce compte.",
-    deja_lie: "Ton compte est déjà relié à une identité Google.",
-    identite_deja_liee: "Cette identité Google est déjà reliée à un autre compte.",
-    autre_identite: "L'identité Google qui s'ouvre n'est pas celle de ce compte.",
-    email_deja_utilise: "Un compte existe déjà avec cette adresse : connecte-toi par mot de passe.",
+    liaison_reussie: ({ label }) => `Identité ${label} reliée à ton compte.`,
+    reauth_reussie: () => "Identité prouvée : tu peux à nouveau modifier ton compte.",
+    refus: ({ label }) => `Connexion ${label} annulée.`,
+    state_invalide: () => "Demande expirée. Recommence depuis cette page.",
+    code_manquant: ({ label }) => `${label} n'a pas renvoyé de code d'autorisation. Recommence.`,
+    session_expiree: () => "Ta session a changé pendant la connexion : reprends la demande ici.",
+    identite_refusee: ({ label }) => `${label} n'a pas confirmé ton adresse.`,
+    fournisseur_indisponible: ({ label }) => `${label} ne répond pas. Réessaie dans un instant.`,
+    deux_facteurs: () => "Ton compte exige un code d'authentification : connecte-toi avec ton mot de passe.",
+    identite_non_liee: ({ label }) => `Aucune identité ${label} n'est reliée à ce compte.`,
+    deja_lie: () => "Ton compte est déjà relié à une identité de fournisseur.",
+    identity_already_linked: () => "Ton compte est déjà relié à une identité. Délie-la avant d'en relier une autre.",
+    identite_deja_liee: ({ label }) => `Cette identité ${label} est déjà reliée à un autre compte.`,
+    autre_identite: ({ label }) => `L'identité ${label} qui s'ouvre n'est pas celle de ce compte.`,
+    email_deja_utilise: () => "Un compte existe déjà avec cette adresse : connecte-toi par mot de passe.",
   };
 
+  // Le fournisseur est celui annoncé par le serveur dans l'URL de retour, résolu dans
+  // la liste que ce même serveur a envoyée : une étiquette inconnue ne s'affiche pas
+  // telle qu'elle a été reçue.
   function handleOauthReturn() {
-    const code = new URLSearchParams(window.location.search).get("oauth");
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("oauth");
     if (!code) return;
+    const providerId = params.get("oauth_provider");
+    const provider = state.providers.find((candidate) => candidate.id === providerId);
+    const context = { label: provider ? provider.label : "ce compte" };
     window.history.replaceState({}, "", "/compte");
-    showToast(OAUTH_MESSAGES[code] || "La connexion Google n'a pas abouti.");
+    const message = OAUTH_MESSAGES[code];
+    showToast(message ? message(context) : "La connexion n'a pas abouti.");
   }
 
   // L'offre nommée ici est l'offre effective, celle qui décide des quotas, et non
@@ -481,8 +587,8 @@
       });
       form.reset();
       // Un compte qui vient de recevoir son mot de passe n'est plus un compte sans
-      // mot de passe : les champs réapparaissent, et Google cesse d tenir lieu de
-      // preuve pour la suite.
+      // mot de passe : les champs réapparaissent, et l'identité de fournisseur cesse
+      // de tenir lieu de preuve pour la suite.
       state.hasPassword = true;
       render();
       showToast("Mot de passe mis à jour.");
@@ -557,13 +663,15 @@
     if (!status) return;
     elements.twoFactorActions.replaceChildren();
     // Un compte sans mot de passe ne peut pas activer la double authentification : elle
-    // fermerait la connexion Google, qui est sa seule porte, et le serveur la refuse.
-    // L'annoncer ici évite un bouton qui mènerait à un cul-de-sac.
+    // fermerait la connexion par compte tiers, qui peut être sa seule porte, et le
+    // serveur la refuse. L'annoncer ici évite un bouton qui mènerait à un cul-de-sac.
     const blocked = !status.enrolled && !state.hasPassword;
+    const linked = state.providers.find((provider) => provider.id === state.linkedProvider);
+    const entry = linked ? linked.label : "une connexion par compte tiers";
     elements.twoFactorStatus.textContent = status.enrolled
       ? `Active. Un code de 6 chiffres sera demandé à chaque connexion. ${status.recoveryCodesRemaining} code(s) de récupération restant(s).`
       : blocked
-        ? "Inactive, et indisponible : ton compte n'a pas de mot de passe. Google est ta seule porte d'entrée, et la double authentification la fermerait sans te laisser d'autre moyen de l'ouvrir."
+        ? `Inactive, et indisponible : ton compte n'a pas de mot de passe. ${entry} est ta seule porte d'entrée, et la double authentification la fermerait sans te laisser d'autre moyen de l'ouvrir.`
         : "Inactive : ton mot de passe est aujourd'hui le seul facteur de ton compte.";
 
     const add = (id, label, danger = false) => {
@@ -580,9 +688,9 @@
     } else if (!blocked) {
       add("setup", "Activer");
     }
-    // Activer ou désactiver le second facteur change ce que vaut une identité Google :
-    // la page du compte doit le refléter sans attendre un rechargement.
-    renderGoogle();
+    // Activer ou désactiver le second facteur change ce que vaut une identité de
+    // fournisseur : la page du compte doit le refléter sans attendre un rechargement.
+    renderProviders();
   }
 
   function onTwoFactorClick(event) {

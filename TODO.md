@@ -32,9 +32,9 @@ Tranché : intégration directe des fournisseurs, sans service intermédiaire. U
 - [x] Délier reste possible sans configuration Google : retirer une identité ne demande rien au fournisseur, faute de quoi un lien survivrait à la disparition des identifiants sans aucun moyen de s'en défaire
 - [x] Un compte sans mot de passe ne peut pas activer la double authentification : elle lui fermerait partout sa seule porte - connexion Google, liaison, ré-authentification et suppression d'un lien. Refus rendu avant l'émission de tout secret, bouton masqué sur `/compte`
 - [x] Un compte sans mot de passe ne peut pas être délié, et le refus nomme le mot de passe à définir avant de renvoyer vers une preuve Google qui n'y pourrait rien
-- [x] Tests : liaison, session étrangère, priorité de la double authentification, fenêtre de preuve qui expire, identité relibérée, cookie d'état forgé, activation A2F sans mot de passe — quatorze scénarios au total
-- [ ] Microsoft, puis tout autre fournisseur : même schéma, en généralisant le `state` au-delà de Google
-- [ ] Vérifier en navigateur : bouton, section du compte, messages d'échec, retour sur la bonne page
+- [x] Tests : liaison, session étrangère, priorité de la double authentification, fenêtre de preuve qui expire, identité relibérée, cookie d'état forgé, activation A2F sans mot de passe — seize scénarios au total
+- [x] Microsoft, puis tout autre fournisseur : même schéma, en généralisant le `state` au-delà de Google — registre de fournisseurs, routes `/api/auth/<fournisseur>/*` et `/api/account/<fournisseur>/*` déduites du chemin, cookies d'état nommés et tracés par fournisseur, `providers` annoncés à l'interface ; seuls la vérification de l'adresse et le libellé varient, écrits dans le registre
+- [x] Vérifier en navigateur : bouton, section du compte, messages d'échec, retour sur la bonne page — fait sous Chrome headless piloté par CDP (22 vérifications : les deux boutons annoncés par `providers`, message d'échec nommant le fournisseur puis adresse nettoyée, carte du compte et ses formulaires, aller-retour de liaison complet, connexion Microsoft qui change de compte, champs de mot de passe masqués sans mot de passe). **Correctif trouvé par ce biais** : `app.js` enregistrait `handleOauthReturn()` sur l'événement `load` après un `init()` asynchrone — l'événement était déjà passé, donc aucun message de retour ne s'affichait jamais. Exécution immédiate si `document.readyState === "complete"`.
 
 ## A2F pour les comptes utilisateurs
 
@@ -47,15 +47,15 @@ L'A2F existe mais est réservé au super-admin : points d'entrée sous `/api/adm
 
 ## À vérifier au navigateur
 
-Livré, mais jamais ouvert dans un vrai navigateur : aucun outil de pilotage navigateur n'est disponible ici. La validation passe par la syntaxe, la correspondance des identifiants HTML/JS et les tests d'API.
+Possible depuis `npm run check:browser` (`tools/browser-check.mjs`) : Chrome ouvre un port de débogage, et Node (websocket global, sans dépendance) pilote cibles et évaluations. Le script démarre un faux fournisseur local, le serveur sur une base jetable, enchaîne les scénarios puis capture l'écran ; il ne couvre que ce qu'on lui écrit. Chrome se cherche dans les emplacements usuels, sinon `QROOD_CHROME` ; les trois ports se surchargent par `QROOD_CHECK_APP_PORT`, `QROOD_CHECK_IDP_PORT` et `QROOD_CHECK_CDP_PORT`. Il n'entre pas dans `npm test`, qui reste sans dépendance de navigateur.
 
 - [ ] Suppression d'un compte : toast « Compte supprimé. », fiche refermée, liste mise à jour (correctif `e696e64`)
 - [ ] Mise à jour instantanée de toutes les interventions du back-office (même correctif)
 - [ ] Rendu de la modale A2F : QR code, secret de secours, codes de récupération
 - [ ] Raccourci `/compte` → `/back-office` et affichage conditionné au rôle
 - [ ] Affichage d'une offre offerte sur `/compte` (« Offert, aucun abonnement », « Jusqu'au »)
-- [ ] Bouton « Continuer avec Google » dans la modale d'authentification, et messages d'échec du retour
-- [ ] Section « Connexion Google » sur `/compte` : champs masqués pour un compte sans mot de passe, lien de preuve révélé après un refus `reauth_required`, avertissement avant une déliaison
+- [x] Bouton « Continuer avec Google » dans la modale d'authentification, et messages d'échec du retour — vérifié avec les deux fournisseurs
+- [x] Section « Connexion Google » sur `/compte` : champs masqués pour un compte sans mot de passe, lien de preuve révélé après un refus `reauth_required`, avertissement avant une déliaison — vérifié pour la liaison, la déliaison et un compte sans mot de passe ; il reste à voir le refus `reauth_required` qui révèle le bouton de preuve
 - [ ] A2F sur `/compte` : pas de bouton « Activer » sans mot de passe, et la ligne d'état qui explique pourquoi
 
 Si un point se reproduit, le diagnostic se fait dans le navigateur : `jsdom` et `linkedom` ne sont pas installés, et `admin.js` n'a pas de point d'entrée testable sans ajouter une dépendance.

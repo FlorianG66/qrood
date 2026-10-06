@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import { createServer } from "node:net";
 import os from "node:os";
@@ -11,22 +11,34 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const CLIENT_ID = "client-de-test.apps.googleusercontent.com";
-const CLIENT_SECRET = "secret-de-test";
 const PASSWORD = "MotDePassePlan789";
-const REDIRECT_URI_PATH = "/api/auth/google/callback";
 let PORT;
 let ORIGIN;
 
-// ── Faux fournisseur Google ─────────────────────────────────────────────────
+// Le fournisseur courant du harnais. `bootOauth` le fixe : les tests écrivent le
+// parcours une seule fois, et les détails propres au fournisseur — adresse de retour,
+// identifiants, nom du cookie d'état — sont lus d'ici plutôt que répétés.
+let ACTIVE = null;
+let REDIRECT_URI_PATH = "";
+let CLIENT_ID = "";
+let CLIENT_SECRET = "";
+let STATE_COOKIE = "";
+let RETURN_COOKIE = "";
+
+// ── Faux fournisseur ────────────────────────────────────────────────────────
 //
-// Google n'est pas joignable depuis un test : les trois points d'appel sont donc
-// remplacés par un serveur local qui répond comme lui. C'est ce qui permet de suivre
-// le flux de bout en bout, échange de jeton et lecture du profil compris, sans
+// Aucun fournisseur réel n'est joignable depuis un test : les trois points d'appel sont
+// donc remplacés par un serveur local qui répond comme lui. C'est ce qui permet de
+// suivre le flux de bout en bout, échange de jeton et lecture du profil compris, sans
 // qu'aucun test ne dépende du réseau ni d'un compte réel.
-function startFakeGoogle(profile = {}) {
+//
+// Les deux fournisseurs ne se distinguent que par leur nom, leur préfixe
+// d'environnement et leur profil : c'est le seul écart qui les sépare côté serveur,
+// donc aussi le seul que le faux doit reproduire. Le profil par défaut imite Google,
+// `email_verified` compris ; pour Microsoft, le test écrit le sien.
+function startFakeProvider({ clientId, clientSecret, profile }) {
   const calls = {
-    profile: { sub: "sub-camille", email: "camille@example.test", email_verified: true, name: "Camille Martin", ...profile },
+    profile,
     tokenStatus: 200,
     userinfoStatus: 200,
     tokenRequest: null,
@@ -65,8 +77,10 @@ function startFakeGoogle(profile = {}) {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
       const address = server.address();
-      resolve({
+resolve({
         calls,
+        clientId,
+        clientSecret,
         origin: `http://127.0.0.1:${address.port}`,
         close: () => new Promise((done) => server.close(() => done())),
       });
@@ -90,11 +104,14 @@ async function getFreePort() {
 
 function buildChildEnvironment(overrides = {}) {
   const environment = { ...process.env };
-  // Les variables du poste sont écartées : un développeur qui a configuré Google pour
-  // autre chose ne doit pas voir ses identifiants arriver dans un test, ni voir un
-  // test démarrer un serveur configuré alors qu'il veut l'inverse.
+  // Les variables du poste sont écartées : un développeur qui a configuré un
+  // fournisseur pour autre chose ne doit pas voir ses identifiants arriver dans un
+  // test, ni voir un test démarrer un serveur configuré alors qu'il veut l'inverse.
+  // Les préfixes viennent du registre de fournisseurs plutôt que d'une liste écrite ici.
   for (const key of Object.keys(environment)) {
-    if (key.startsWith("QROOD_") || key.startsWith("GOOGLE_")) delete environment[key];
+    if (key.startsWith("QROOD_") || OAUTH_PROVIDERS.some((provider) => key.startsWith(`${provider.envPrefix}_`))) {
+      delete environment[key];
+    }
   }
   return Object.assign(environment, {
     QROOD_PORT: String(PORT),
@@ -183,11 +200,100 @@ function countUsers(databasePath) {
   }
 }
 
-// Démarre un faux Google puis le serveur QROOD branché dessus. `configured: false`
+// Le transport local `outbox` écrit un fichier JSON par message, dans un dossier posé
+// à côté de la base. Un fournisseur qui ne certifie pas l'adresse fait naître un compte
+// qui doit confirmer la sienne : c'est ce dépôt qui le prouve.
+async function waitForOutbox(databasePath, needle, timeoutMs = 3_000) {
+  const directory = path.join(path.dirname(databasePath), "outbox");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    // Le dossier n'existe qu'après le premier envoi : attendre vaut mieux que de
+    // faire échouer la lecture avant même que le courrier parte.
+    let files = [];
+    try {
+      files = readdirSync(directory).sort();
+    } catch {
+      files = [];
+    }
+    for (let i = files.length - 1; i >= 0; i -= 1) {
+      const raw = readFileSync(path.join(directory, files[i]), "utf8");
+      if (raw.includes(needle)) return JSON.parse(raw);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`aucun courrier contenant « ${needle} » dans ${directory}`);
+}
+
+// Les deux fournisseurs que ces tests couvrent, décrits du côté du serveur : nom,
+// préfixe d'environnement, profil par défaut. Le reste — le code — est identique pour
+// tous, et c'est justement ce que ces descriptions permettent d'éprouver : un tableau
+// de différences, pas deux implémentations.
+const OAUTH_PROVIDERS = [
+  {
+    id: "google",
+    label: "Google",
+    envPrefix: "GOOGLE",
+    clientId: "client-de-test.apps.googleusercontent.com",
+    clientSecret: "secret-de-test",
+    // Google certifie l'adresse : c'est le seul champ qui rend cette identité recevable
+    // sans confirmation par e-mail.
+    profile: {
+      sub: "sub-camille",
+      email: "camille@example.test",
+      email_verified: true,
+      name: "Camille Martin",
+    },
+    expectsVerified: true,
+  },
+  {
+    id: "microsoft",
+    label: "Microsoft",
+    envPrefix: "MICROSOFT",
+    clientId: "client-de-test.microsoft.test",
+    clientSecret: "secret-de-test-microsoft",
+    // Microsoft ne certifie pas l'adresse. Le profil n'en porte donc pas, et le compte
+    // doit naître sans confirmation — un test qui oublierait ce point validerait une
+    // promesse que le fournisseur ne fait pas.
+    profile: {
+      sub: "sub-camille-microsoft",
+      email: "camille@entreprise.test",
+      name: "Camille Martin",
+    },
+    expectsVerified: false,
+  },
+];
+
+const GOOGLE = OAUTH_PROVIDERS[0];
+const MICROSOFT = OAUTH_PROVIDERS[1];
+
+function providerById(id) {
+  const provider = OAUTH_PROVIDERS.find((candidate) => candidate.id === id);
+  if (!provider) throw new Error(`Fournisseur de test inconnu : ${id}`);
+  return provider;
+}
+
+function redirectUriPath(provider) {
+  return `/api/auth/${provider.id}/callback`;
+}
+
+function stateCookieName(provider) {
+  return `qrood_oauth_state_${provider.id}`;
+}
+
+// Démarre un faux fournisseur puis le serveur QROOD branché dessus. `configured: false`
 // démarre le serveur sans aucun identifiant, ce qui est l'état par défaut d'une
 // installation : le fournisseur n'existe pas et la route doit le dire.
-async function bootOauth({ profile = {}, configured = true } = {}) {
-  const google = await startFakeGoogle(profile);
+async function bootOauth({
+  provider = GOOGLE,
+  profile = {},
+  configured = true,
+  alsoConfigure = [],
+} = {}) {
+  const fake = await startFakeProvider({
+    clientId: provider.clientId,
+    clientSecret: provider.clientSecret,
+    profile: { ...provider.profile, ...profile },
+  });
   const directory = mkdtempSync(path.join(os.tmpdir(), "qrood-oauth-test-"));
   const databasePath = path.join(directory, "test.sqlite");
   const logSink = { value: "" };
@@ -195,13 +301,35 @@ async function bootOauth({ profile = {}, configured = true } = {}) {
   const environment = { QROOD_DB_PATH: databasePath };
   if (configured) {
     Object.assign(environment, {
-      GOOGLE_CLIENT_ID: CLIENT_ID,
-      GOOGLE_CLIENT_SECRET: CLIENT_SECRET,
-      QROOD_GOOGLE_AUTH_URL: `${google.origin}/o/oauth2/v2/auth`,
-      QROOD_GOOGLE_TOKEN_URL: `${google.origin}/token`,
-      QROOD_GOOGLE_USERINFO_URL: `${google.origin}/userinfo`,
+      [`${provider.envPrefix}_CLIENT_ID`]: provider.clientId,
+      [`${provider.envPrefix}_CLIENT_SECRET`]: provider.clientSecret,
+      [`QROOD_${provider.envPrefix}_AUTH_URL`]: `${fake.origin}/o/oauth2/v2/auth`,
+      [`QROOD_${provider.envPrefix}_TOKEN_URL`]: `${fake.origin}/token`,
+      [`QROOD_${provider.envPrefix}_USERINFO_URL`]: `${fake.origin}/userinfo`,
     });
   }
+  // Un second fournisseur configuré permet d'éprouver l'isolation entre deux parcours
+  // sans démarrer un second serveur.
+  for (const extraId of alsoConfigure) {
+    const extra = providerById(extraId);
+    Object.assign(environment, {
+      [`${extra.envPrefix}_CLIENT_ID`]: extra.clientId,
+      [`${extra.envPrefix}_CLIENT_SECRET`]: extra.clientSecret,
+      [`QROOD_${extra.envPrefix}_AUTH_URL`]: `${fake.origin}/o/oauth2/v2/auth`,
+      [`QROOD_${extra.envPrefix}_TOKEN_URL`]: `${fake.origin}/token`,
+      [`QROOD_${extra.envPrefix}_USERINFO_URL`]: `${fake.origin}/userinfo`,
+    });
+  }
+
+  // Le parcours est écrit une fois, dans les termes du fournisseur du harnais : c'est
+  // ce harnais qui donne l'adresse de retour, les identifiants et le nom du cookie
+  // d'état, plutôt que de les répéter dans chacun des tests.
+  ACTIVE = provider;
+  REDIRECT_URI_PATH = redirectUriPath(provider);
+  CLIENT_ID = provider.clientId;
+  CLIENT_SECRET = provider.clientSecret;
+  STATE_COOKIE = stateCookieName(provider);
+  RETURN_COOKIE = `qrood_oauth_next_${provider.id}`;
 
   PORT = await getFreePort();
   ORIGIN = `http://localhost:${PORT}`;
@@ -217,23 +345,27 @@ async function bootOauth({ profile = {}, configured = true } = {}) {
     return server;
   };
 
-  return {
-    google,
+return {
+    provider,
+    fake,
+    // `google` reste un alias lu par les tests déjà écrits : ce sont les mêmes appels,
+    // seulement faits sur le fournisseur du harnais.
+    google: fake,
     databasePath,
     logSink,
     restart,
     stop: async () => {
       await stopServer(server);
       rmSync(directory, { recursive: true, force: true });
-      await google.close();
+      await fake.close();
     },
   };
 }
 
 // Le début du flux : le serveur renvoie vers le fournisseur et pose ses cookies. Le
 // `state` est relu ici, car c'est lui que le callback devra présenter.
-async function startFlow(query = "") {
-  const start = await request(`/api/auth/google/start${query}`, {
+async function startFlow(query = "", provider = GOOGLE) {
+  const start = await request(`/api/auth/${provider.id}/start${query}`, {
     headers: { Origin: ORIGIN, "Sec-Fetch-Site": "same-origin" },
   });
   return {
@@ -294,17 +426,24 @@ async function accountAction(path, account, body = {}) {
   });
 }
 
-async function finishAccountFlow(flow) {
-  return request(`${REDIRECT_URI_PATH}?code=code-valide&state=${encodeURIComponent(flow.state)}`, {
+async function finishAccountFlow(flow, provider = GOOGLE) {
+  return request(`${redirectUriPath(provider)}?code=code-valide&state=${encodeURIComponent(flow.state)}`, {
     cookie: flow.cookie,
   });
 }
 
+// L'échec revient par la même porte que le succès : un code court dans la destination,
+// suivi du fournisseur qui l'a renvoyé, puisque « Microsoft ne répond pas » et « Google
+// n'a pas confirmé votre adresse » ne se disent pas de la même façon.
+function oauthReturn(code, path = "/") {
+  return `${path}${path.includes("?") ? "&" : "?"}oauth=${code}&oauth_provider=${ACTIVE.id}`;
+}
+
 // Changer l'identité que renvoie le fournisseur, en gardant le reste du profil : c'est
-// ainsi qu'on éprouve un compte Google différent du premier, et non une adresse en
-// général non vérifiée — que le serveur, à raison, refuserait d'abord.
+// ainsi qu'on éprouve un compte différent du premier, et non une adresse en général
+// non prouvée — que le serveur, à raison, refuserait d'abord.
 function swapProfile(harness, profile) {
-  harness.google.calls.profile = { ...harness.google.calls.profile, ...profile };
+  harness.fake.calls.profile = { ...harness.fake.calls.profile, ...profile };
 }
 
 // La double authentification s'active par l'API, avec un code recalculé ici à partir de
@@ -422,7 +561,7 @@ test("connexion Google : le flux crée un compte sans mot de passe et ouvre une 
     // porte le nonce - le `state` que le fournisseur recopie - puis l'intention du
     // parcours et le compte et la session concernes : `0.0` pour une connexion.
     const stateCookie = flow.response.headers.getSetCookie()
-      .find((entry) => entry.startsWith("qrood_oauth_state="));
+      .find((entry) => entry.startsWith(`${STATE_COOKIE}=`));
 assert.ok(stateCookie, "le cookie d'état doit être posé");
     assert.match(stateCookie, /HttpOnly/);
     assert.match(stateCookie, /SameSite=Lax/);
@@ -475,7 +614,7 @@ assert.ok(stateCookie, "le cookie d'état doit être posé");
     assert.equal(me.status, 200, logSink.value);
     assert.equal(meBody.user.email, "camille@example.test");
     assert.equal(meBody.user.emailVerified, true);
-    assert.equal(meBody.googleEnabled, true);
+    assert.deepEqual(meBody.providers, [{ id: ACTIVE.id, label: ACTIVE.label }]);
 
     // ── Le retour suivant ────────────────────────────────────────────────────
     // Le compte se retrouve par l'identifiant externe, pas par l'adresse : le second
@@ -512,7 +651,7 @@ test("connexion Google : le state protège le callback et ne se rejoue pas", asy
     // une page tierce qui tente de connecter sa propre session.
     const forged = await request(`${REDIRECT_URI_PATH}?code=code-valide&state=state-fabrique`);
     assert.equal(forged.status, 302, logSink.value);
-    assert.equal(forged.headers.get("location"), "/?oauth=state_invalide");
+    assert.equal(forged.headers.get("location"), oauthReturn("state_invalide"));
     assert.equal(countUsers(databasePath), 0, "aucun compte ne doit être créé");
 
     // ── Un state différent ───────────────────────────────────────────────────
@@ -521,22 +660,22 @@ test("connexion Google : le state protège le callback et ne se rejoue pas", asy
       `${REDIRECT_URI_PATH}?code=code-valide&state=autre-state`,
       { cookie: flow.cookie },
     );
-    assert.equal(mismatched.headers.get("location"), "/?oauth=state_invalide");
+    assert.equal(mismatched.headers.get("location"), oauthReturn("state_invalide"));
     assert.equal(countUsers(databasePath), 0);
 
     // ── Le code du fournisseur ne vaut rien sans le state ────────────────────
     const forgedCode = await request(`${REDIRECT_URI_PATH}?code=code-injecte&state=state-fabrique`, {
       cookie: flow.cookie,
     });
-    assert.equal(forgedCode.headers.get("location"), "/?oauth=state_invalide");
+    assert.equal(forgedCode.headers.get("location"), oauthReturn("state_invalide"));
     assert.equal(harness.google.calls.tokenRequest, null, "le code ne doit même pas être échangé");
 
     // ── Un aller comme un autre ──────────────────────────────────────────────
     const wrongCookie = await request(
       `${REDIRECT_URI_PATH}?code=code-valide&state=${encodeURIComponent(flow.state)}`,
-      { cookie: flow.cookie.replace(/qrood_oauth_state=[^;]*/, "qrood_oauth_state=autre") },
+      { cookie: flow.cookie.replace(new RegExp(`${STATE_COOKIE}=[^;]*`), `${STATE_COOKIE}=autre`) },
     );
-    assert.equal(wrongCookie.headers.get("location"), "/?oauth=state_invalide");
+    assert.equal(wrongCookie.headers.get("location"), oauthReturn("state_invalide"));
     assert.equal(countUsers(databasePath), 0);
 
     // ── Le même aller, deux fois ─────────────────────────────────────────────
@@ -555,7 +694,7 @@ test("connexion Google : le state protège le callback et ne se rejoue pas", asy
       `${REDIRECT_URI_PATH}?code=code-valide&state=${encodeURIComponent(flow.state)}`,
       { cookie: sessionCookie(once) },
     );
-    assert.equal(replayed.headers.get("location"), "/?oauth=state_invalide");
+    assert.equal(replayed.headers.get("location"), oauthReturn("state_invalide"));
     assert.equal(sessionCookie(replayed), "", "aucune seconde session ne doit être ouverte");
     assert.equal(countUsers(databasePath), 1);
 
@@ -565,7 +704,7 @@ test("connexion Google : le state protège le callback et ne se rejoue pas", asy
       `${REDIRECT_URI_PATH}?error=access_denied&state=${encodeURIComponent(abandoned.state)}`,
       { cookie: abandoned.cookie },
     );
-    assert.equal(refused.headers.get("location"), "/?oauth=refus");
+    assert.equal(refused.headers.get("location"), oauthReturn("refus"));
     assert.equal(sessionCookie(refused), "");
 
     const withoutCode = await startFlow();
@@ -573,7 +712,7 @@ test("connexion Google : le state protège le callback et ne se rejoue pas", asy
       `${REDIRECT_URI_PATH}?state=${encodeURIComponent(withoutCode.state)}`,
       { cookie: withoutCode.cookie },
     );
-    assert.equal(missing.headers.get("location"), "/?oauth=code_manquant");
+    assert.equal(missing.headers.get("location"), oauthReturn("code_manquant"));
     assert.equal(sessionCookie(missing), "");
   } finally {
     await harness.stop();
@@ -591,7 +730,7 @@ test("connexion Google : une identité non prouvée ne crée aucun compte", asyn
       `${REDIRECT_URI_PATH}?code=code-valide&state=${encodeURIComponent(unverified.state)}`,
       { cookie: unverified.cookie },
     );
-    assert.equal(refused.headers.get("location"), "/?oauth=identite_refusee", logSink.value);
+    assert.equal(refused.headers.get("location"), oauthReturn("identite_refusee"), logSink.value);
     assert.equal(countUsers(databasePath), 0);
     assert.equal(sessionCookie(refused), "");
 
@@ -603,7 +742,7 @@ test("connexion Google : une identité non prouvée ne crée aucun compte", asyn
         `${REDIRECT_URI_PATH}?code=code-valide&state=${encodeURIComponent(flow.state)}`,
         { cookie: flow.cookie },
       );
-      assert.equal(response.headers.get("location"), "/?oauth=identite_refusee", JSON.stringify(profile));
+      assert.equal(response.headers.get("location"), oauthReturn("identite_refusee"), JSON.stringify(profile));
       assert.equal(countUsers(databasePath), 0, JSON.stringify(profile));
     }
 
@@ -614,7 +753,7 @@ test("connexion Google : une identité non prouvée ne crée aucun compte", asyn
       `${REDIRECT_URI_PATH}?code=code-expire&state=${encodeURIComponent(broken.state)}`,
       { cookie: broken.cookie },
     );
-    assert.equal(exchange.headers.get("location"), "/?oauth=fournisseur_indisponible");
+    assert.equal(exchange.headers.get("location"), oauthReturn("fournisseur_indisponible"));
     assert.equal(countUsers(databasePath), 0);
 
     // Le secret du fournisseur ne doit pas fuiter dans le journal de démarrage, que
@@ -646,7 +785,7 @@ test("connexion Google : un compte existant n'est jamais repris ni lié", async 
       `${REDIRECT_URI_PATH}?code=code-valide&state=${encodeURIComponent(flow.state)}`,
       { cookie: flow.cookie },
     );
-    assert.equal(refused.headers.get("location"), "/?oauth=email_deja_utilise", logSink.value);
+    assert.equal(refused.headers.get("location"), oauthReturn("email_deja_utilise"), logSink.value);
     assert.equal(sessionCookie(refused), "");
 
     // Le compte est intact : ni converti, ni lié, ni mot de passe remplacé.
@@ -727,7 +866,7 @@ test("connexion Google : la destination de retour reste sur le site", async () =
       `${REDIRECT_URI_PATH}?code=code-valide&state=state-fabrique`,
       { cookie: hostile.cookie },
     );
-    assert.equal(failure.headers.get("location"), "/?oauth=state_invalide");
+    assert.equal(failure.headers.get("location"), oauthReturn("state_invalide"));
   } finally {
     await harness.stop();
   }
@@ -753,7 +892,7 @@ test("connexion Google : sans identifiants, la route n'existe pas", async () => 
 // L'interface n'a rien à afficher : elle ne demande pas un bouton pour un
     // fournisseur qui n'existe pas.
     const me = await (await request("/api/auth/me")).json();
-    assert.equal(me.googleEnabled, false);
+    assert.deepEqual(me.providers, []);
 
     // Délier, en revanche, ne demande rien au fournisseur. Le garder fermé derrière la
     // même configuration piégerait un lien qui subsiste après la disparition des
@@ -762,7 +901,7 @@ test("connexion Google : sans identifiants, la route n'existe pas", async () => 
     const account = await registerLocal("camille@example.test");
     const unlink = await accountAction("/api/account/google/unlink", account, { currentPassword: PASSWORD });
     assert.equal(unlink.status, 409, logSink.value);
-    assert.equal(await errorCode(unlink), "google_not_linked");
+    assert.equal(await errorCode(unlink), "identity_not_linked");
     assert.ok(readUser(databasePath, "camille@example.test"), "le compte reste joignable");
   } finally {
     await harness.stop();
@@ -865,8 +1004,8 @@ test("compte : une identité Google se relie sans remplacer le mot de passe", as
     const account = await registerLocal("camille@example.test");
     assert.equal(account.response.status, 201, logSink.value);
     assert.equal(account.me.hasPassword, true);
-    assert.equal(account.me.googleLinked, false);
-    assert.equal(account.me.googleEnabled, true);
+    assert.equal(account.me.linkedProvider, null);
+    assert.deepEqual(account.me.providers, [{ id: ACTIVE.id, label: ACTIVE.label }]);
 
 // ── Le mot de passe d'abord ───────────────────────────────────────────────
     const withoutToken = await startAccountFlow("/api/account/google/link", { session: account.session }, {
@@ -892,7 +1031,7 @@ test("compte : une identité Google se relie sans remplacer le mot de passe", as
     assert.equal(flow.url.origin, harness.google.origin);
     assert.ok(flow.state && flow.state.length >= 32);
 
-    const returnCookie = flow.response.headers.getSetCookie().find((entry) => entry.startsWith("qrood_oauth_next="));
+    const returnCookie = flow.response.headers.getSetCookie().find((entry) => entry.startsWith(`${RETURN_COOKIE}=`));
     assert.ok(returnCookie);
     assert.match(returnCookie, /HttpOnly/);
     // La destination d'une liaison n'est pas négociable : elle revient à la page du
@@ -902,7 +1041,7 @@ test("compte : une identité Google se relie sans remplacer le mot de passe", as
 
     const callback = await finishAccountFlow(flow);
     assert.equal(callback.status, 302, logSink.value);
-    assert.equal(callback.headers.get("location"), "/compte?oauth=liaison_reussie");
+    assert.equal(callback.headers.get("location"), oauthReturn("liaison_reussie", "/compte"));
     assert.equal(sessionCookie(callback), "", "une liaison ne change pas de session");
 
     // ── Le compte ─────────────────────────────────────────────────────────────
@@ -917,7 +1056,7 @@ test("compte : une identité Google se relie sans remplacer le mot de passe", as
     );
 
     const me = await (await request("/api/auth/me", { cookie: account.session })).json();
-    assert.equal(me.googleLinked, true);
+    assert.equal(me.linkedProvider, ACTIVE.id);
     assert.equal(me.hasPassword, true);
 
     // ── La connexion Google ouvre ce compte, et lui seul ───────────────────────
@@ -934,7 +1073,7 @@ test("compte : une identité Google se relie sans remplacer le mot de passe", as
     // ── Relier deux fois ──────────────────────────────────────────────────────
     const again = await startAccountFlow("/api/account/google/link", account, { currentPassword: PASSWORD });
     assert.equal(again.response.status, 409);
-    assert.equal(await errorCode(again.response), "google_already_linked");
+    assert.equal(await errorCode(again.response), "identity_already_linked");
   } finally {
     await harness.stop();
   }
@@ -957,7 +1096,7 @@ test("compte : une liaison ne s'achève ni sans session ni sur une autre session
       { cookie: flow.flowCookie },
     );
     assert.equal(anonymous.status, 302);
-    assert.equal(anonymous.headers.get("location"), "/compte?oauth=session_expiree");
+    assert.equal(anonymous.headers.get("location"), oauthReturn("session_expiree", "/compte"));
     assert.equal(sessionCookie(anonymous), "", "aucune session ne doit être ouverte");
 
     // ── Une autre session, après la fermeture de la première ──────────────────
@@ -974,7 +1113,7 @@ test("compte : une liaison ne s'achève ni sans session ni sur une autre session
       { cookie: `${malik.session}; ${flow.flowCookie}` },
     );
     assert.equal(mixed.status, 302);
-    assert.equal(mixed.headers.get("location"), "/compte?oauth=session_expiree");
+    assert.equal(mixed.headers.get("location"), oauthReturn("session_expiree", "/compte"));
     assert.equal(sessionCookie(mixed), "", "la session de Malik ne doit pas être réémise");
 
     // ── Rien n'a été lié, ni d'un côté ni de l'autre ───────────────────────────
@@ -1005,7 +1144,7 @@ const link = await startAccountFlow("/api/account/google/link", account, { curre
     // avant même qu'on parle de la double authentification.
     const reauth = await startAccountFlow("/api/account/google/reauth", account, {});
     assert.equal(reauth.response.status, 409);
-    assert.equal(await errorCode(reauth.response), "google_not_linked");
+    assert.equal(await errorCode(reauth.response), "identity_not_linked");
 
     // ── Lié avant d'être protégé : c'est l'ordre réel d'un utilisateur ─────────
     const second = await registerLocal("malik@example.test");
@@ -1015,7 +1154,7 @@ const link = await startAccountFlow("/api/account/google/link", account, { curre
     assert.equal(flow.response.status, 200, logSink.value);
     assert.equal(
       (await finishAccountFlow(flow)).headers.get("location"),
-      "/compte?oauth=liaison_reussie",
+      oauthReturn("liaison_reussie", "/compte"),
       logSink.value,
     );
     assert.equal(readUser(databasePath, "malik@example.test").auth_provider, "google");
@@ -1035,7 +1174,7 @@ const protectedAccount = await enrollTwoFactor(second);
       { cookie: login.cookie },
     );
     assert.equal(refused.status, 302);
-    assert.equal(refused.headers.get("location"), "/?oauth=deux_facteurs");
+    assert.equal(refused.headers.get("location"), oauthReturn("deux_facteurs"));
     assert.equal(sessionCookie(refused), "", "le second facteur ne se contourne pas par Google");
 
     // ── Le mot de passe et le code suffisent toujours ─────────────────────────
@@ -1064,7 +1203,7 @@ test("compte : sans mot de passe, une identité Google ne vaut preuve que le tem
     const session = sessionCookie(callback);
 const me = await (await request("/api/auth/me", { cookie: session })).json();
     assert.equal(me.hasPassword, false);
-    assert.equal(me.googleLinked, true);
+    assert.equal(me.linkedProvider, ACTIVE.id);
 
     // Le retour du fournisseur vient de prouver le compte : la session est fraîche
     // d'emblée, sans quoi le compte créé par Google ne pourrait rien faire de plus.
@@ -1112,7 +1251,7 @@ const me = await (await request("/api/auth/me", { cookie: session })).json();
     assert.equal(wrongIdentity.response.status, 200, logSink.value);
     swapProfile(harness, { sub: "sub-autre", email: "autre@example.test" });
     const mismatch = await finishAccountFlow(wrongIdentity);
-    assert.equal(mismatch.headers.get("location"), "/compte?oauth=autre_identite");
+    assert.equal(mismatch.headers.get("location"), oauthReturn("autre_identite", "/compte"));
     assert.equal(readFreshness(databasePath, "camille@example.test"), 0, "aucune preuve n'est accordée");
 
     // ── La bonne identité ─────────────────────────────────────────────────────
@@ -1122,7 +1261,7 @@ const me = await (await request("/api/auth/me", { cookie: session })).json();
     assert.equal(proof.url.origin, harness.google.origin);
     const refreshed = await finishAccountFlow(proof);
     assert.equal(refreshed.status, 302, logSink.value);
-    assert.equal(refreshed.headers.get("location"), "/compte?oauth=reauth_reussie");
+    assert.equal(refreshed.headers.get("location"), oauthReturn("reauth_reussie", "/compte"));
     assert.ok(readFreshness(databasePath, "camille@example.test") > Date.now(), "la fenêtre doit rouvrir");
 
     const changed = await sendChange({ email: "nouvelle@example.test" });
@@ -1170,11 +1309,11 @@ test("compte : délier Google laisse le mot de passe en place et libère l'ident
 // ── Rien à délier ─────────────────────────────────────────────────────────
     const nothing = await accountAction("/api/account/google/unlink", account, { currentPassword: PASSWORD });
     assert.equal(nothing.status, 409);
-    assert.equal(await errorCode(nothing), "google_not_linked");
+    assert.equal(await errorCode(nothing), "identity_not_linked");
 
     const link = await startAccountFlow("/api/account/google/link", account, { currentPassword: PASSWORD });
     assert.equal(link.response.status, 200, logSink.value);
-    assert.equal((await finishAccountFlow(link)).headers.get("location"), "/compte?oauth=liaison_reussie");
+    assert.equal((await finishAccountFlow(link)).headers.get("location"), oauthReturn("liaison_reussie", "/compte"));
 
     // ── Le mot de passe d'abord ───────────────────────────────────────────────
     const withoutToken = await accountAction("/api/account/google/unlink", { session: account.session }, {
@@ -1196,7 +1335,7 @@ test("compte : délier Google laisse le mot de passe en place et libère l'ident
     assert.ok(user.password_hash, "le mot de passe reste");
 
     const me = await (await request("/api/auth/me", { cookie: account.session })).json();
-    assert.equal(me.googleLinked, false);
+    assert.equal(me.linkedProvider, null);
     assert.equal(me.hasPassword, true);
 
     // ── Le mot de passe ouvre toujours le compte ──────────────────────────────
@@ -1251,14 +1390,14 @@ test("compte : un cookie d'état forgé ne lie aucune identité à un compte", a
       {
         cookie: [
           victim.session,
-          `qrood_oauth_state=${state}.link.${victimUserId}.${victimSessionId}.signature-inventee`,
+          `${STATE_COOKIE}=${state}.link.${victimUserId}.${victimSessionId}.signature-inventee`,
         ].join("; "),
       },
     );
     assert.equal(forged.status, 302, logSink.value);
     // La destination ne vient que du cookie de retour, absent ici : un cookie d'état
     // illisible ne peut pas rediriger nulle part en particulier.
-    assert.equal(forged.headers.get("location"), "/?oauth=state_invalide");
+    assert.equal(forged.headers.get("location"), oauthReturn("state_invalide"));
     assert.equal(harness.google.calls.tokenRequest, null, "le code ne doit même pas être échangé");
 
     // Le lien est la seule chose que l'attaque cherche à obtenir.
@@ -1266,8 +1405,8 @@ test("compte : un cookie d'état forgé ne lie aucune identité à un compte", a
     assert.equal(user.provider_id, null, "aucune identité ne doit être reliée");
     assert.equal(user.auth_provider, "local");
     const me = await (await request("/api/auth/me", { cookie: victim.session })).json();
-    assert.equal(me.googleLinked, false);
-    assert.equal(me.googleEnabled, true, "le fournisseur, lui, fonctionne toujours");
+    assert.equal(me.linkedProvider, null);
+    assert.deepEqual(me.providers, [{ id: ACTIVE.id, label: ACTIVE.label }], "le fournisseur, lui, fonctionne toujours");
     assert.equal(countUsers(databasePath), 1, "aucun compte ne doit être créé");
 
 // ── Réécrire l'intention n'aide pas non plus ──────────────────────────────
@@ -1283,7 +1422,7 @@ test("compte : un cookie d'état forgé ne lie aucune identité à un compte", a
       `${REDIRECT_URI_PATH}?code=code-valide&state=${encodeURIComponent(intent.state)}`,
       { cookie: `${victim.session}; ${rewritten}` },
     );
-    assert.equal(retagged.headers.get("location"), "/compte?oauth=state_invalide", logSink.value);
+    assert.equal(retagged.headers.get("location"), oauthReturn("state_invalide", "/compte"), logSink.value);
     assert.equal(readUser(databasePath, "victime@example.test").provider_id, null);
     assert.equal(countUsers(databasePath), 1);
   } finally {
@@ -1336,7 +1475,7 @@ test("compte : sans mot de passe, la double authentification refuse de s'activer
     // possède encore, et la fenêtre refermée ne vaut plus rien.
     const proof = await startAccountFlow("/api/account/google/reauth", account, {});
     assert.equal(proof.response.status, 200, logSink.value);
-    assert.equal((await finishAccountFlow(proof)).headers.get("location"), "/compte?oauth=reauth_reussie");
+    assert.equal((await finishAccountFlow(proof)).headers.get("location"), oauthReturn("reauth_reussie", "/compte"));
 
     const setPassword = await accountAction("/api/account/password", account, {
       newPassword: "NouveauMotDePasse789",
@@ -1349,6 +1488,132 @@ test("compte : sans mot de passe, la double authentification refuse de s'activer
     assert.equal(allowed.status, 200, logSink.value);
     const pending = await allowed.json();
     assert.ok(pending.secret && pending.uri, "un secret doit être proposé");
+  } finally {
+    await harness.stop();
+  }
+});
+
+test("connexion Microsoft : une adresse que le fournisseur ne certifie pas reste à confirmer", async () => {
+  const harness = await bootOauth({ provider: MICROSOFT });
+  const { databasePath, logSink } = harness;
+
+  try {
+    // ── L'aller ──────────────────────────────────────────────────────────────
+    const flow = await startFlow("", MICROSOFT);
+    assert.equal(flow.response.status, 302, logSink.value);
+    assert.equal(flow.location.origin, harness.fake.origin);
+    assert.equal(flow.location.searchParams.get("client_id"), MICROSOFT.clientId);
+
+    // Le cookie d'état porte le nom et le chemin du fournisseur : le parcours de
+    // Microsoft n'a rien à voir avec celui de Google, même servis par la même machine.
+    const stateCookie = flow.response.headers.getSetCookie()
+      .find((entry) => entry.startsWith(`${STATE_COOKIE}=`));
+    assert.ok(stateCookie, "le cookie d'état doit être posé");
+    assert.match(stateCookie, /Path=\/api\/auth\/microsoft/);
+
+    // ── Le retour ────────────────────────────────────────────────────────────
+    const callback = await request(
+      `${REDIRECT_URI_PATH}?code=code-valide&state=${encodeURIComponent(flow.state)}`,
+      { cookie: flow.cookie },
+    );
+    assert.equal(callback.status, 302, logSink.value);
+    assert.equal(callback.headers.get("location"), "/");
+    const session = sessionCookie(callback);
+    assert.ok(session, "une session doit être ouverte");
+
+    // ── Le compte ────────────────────────────────────────────────────────────
+    // C'est le seul point qui distingue les deux fournisseurs, et il est écrit dans le
+    // registre plutôt que deviné : une adresse que Microsoft expose sans la certifier
+    // est un contact, pas une preuve, donc le compte naît non confirmé.
+    const user = readUser(databasePath, "camille@entreprise.test");
+    assert.ok(user, "le compte doit exister");
+    assert.equal(user.auth_provider, "microsoft");
+    assert.equal(user.provider_id, "sub-camille-microsoft");
+    assert.equal(Boolean(user.email_verified_at), MICROSOFT.expectsVerified);
+    assert.equal(user.password_hash, null, "un compte Microsoft n'a pas de mot de passe");
+
+    // L'adresse doit se confirmer comme après une inscription : sans elle, le compte
+    // ne pourrait ni recevoir d'e-mail ni se récupérer.
+    const mail = await waitForOutbox(databasePath, "verifie=");
+    assert.ok(mail, "un e-mail de confirmation doit être envoyé");
+
+    const me = await (await request("/api/auth/me", { cookie: session })).json();
+    assert.equal(me.user.emailVerified, false);
+    assert.equal(me.linkedProvider, "microsoft");
+    assert.deepEqual(me.providers, [{ id: MICROSOFT.id, label: MICROSOFT.label }]);
+
+    // ── Le retour suivant ────────────────────────────────────────────────────
+    // Le compte se retrouve par son identifiant, comme chez Google : un compte à
+    // confirmer n'est pas un compte à refaire.
+    const again = await startFlow("", MICROSOFT);
+    const second = await request(
+      `${REDIRECT_URI_PATH}?code=code-valide&state=${encodeURIComponent(again.state)}`,
+      { cookie: again.cookie },
+    );
+    assert.equal(second.status, 302, logSink.value);
+    assert.equal(countUsers(databasePath), 1, "une identité connue ne crée pas de second compte");
+  } finally {
+    await harness.stop();
+  }
+});
+
+test("deux fournisseurs configurés : les parcours ne se relisent pas l'un l'autre", async () => {
+  const harness = await bootOauth({ alsoConfigure: ["microsoft"] });
+  const { databasePath, logSink } = harness;
+
+  try {
+    // ── Les deux boutons existent ────────────────────────────────────────────
+    const anonymous = await (await request("/api/auth/me")).json();
+    assert.deepEqual(anonymous.providers, [
+      { id: GOOGLE.id, label: GOOGLE.label },
+      { id: MICROSOFT.id, label: MICROSOFT.label },
+    ]);
+
+    // ── Le retour de l'un n'ouvre pas chez l'autre ───────────────────────────
+    const google = await startFlow();
+    const crossed = await request(
+      `${redirectUriPath(MICROSOFT)}?code=code-valide&state=${encodeURIComponent(google.state)}`,
+      { cookie: google.cookie },
+    );
+    assert.equal(crossed.status, 302, logSink.value);
+    // Le cookie de Google n'a même pas été présenté : Microsoft n'a aucun état à lire,
+    // donc aucun code à échanger — et c'est son nom qui accompagne le refus.
+    assert.equal(crossed.headers.get("location"), "/?oauth=state_invalide&oauth_provider=microsoft");
+    assert.equal(harness.google.calls.tokenRequest, null, "le code ne doit pas être échangé");
+
+    // ── Chacun aboutit chez soi ──────────────────────────────────────────────
+    const googleReturn = await finishAccountFlow(google, GOOGLE);
+    assert.equal(googleReturn.status, 302, logSink.value);
+    const googleSession = sessionCookie(googleReturn);
+    assert.ok(googleSession, "la connexion Google doit ouvrir une session");
+    assert.equal(readUser(databasePath, "camille@example.test").auth_provider, "google");
+
+    swapProfile(harness, MICROSOFT.profile);
+    const microsoft = await startFlow("", MICROSOFT);
+    const microsoftReturn = await finishAccountFlow(microsoft, MICROSOFT);
+    assert.equal(microsoftReturn.status, 302, logSink.value);
+    const microsoftSession = sessionCookie(microsoftReturn);
+    assert.ok(microsoftSession, "la connexion Microsoft doit ouvrir une session");
+    assert.equal(readUser(databasePath, "camille@entreprise.test").auth_provider, "microsoft");
+    assert.equal(countUsers(databasePath), 2, "deux identités distinctes, deux comptes");
+
+    // ── Chaque session porte sa propre identité ──────────────────────────────
+    const googleMe = await (await request("/api/auth/me", { cookie: googleSession })).json();
+    assert.equal(googleMe.linkedProvider, "google");
+    const microsoftMe = await (await request("/api/auth/me", { cookie: microsoftSession })).json();
+    assert.equal(microsoftMe.linkedProvider, "microsoft");
+    assert.deepEqual(microsoftMe.providers, [
+      { id: GOOGLE.id, label: GOOGLE.label },
+      { id: MICROSOFT.id, label: MICROSOFT.label },
+    ]);
+
+    // ── La liaison se demande au fournisseur du compte ───────────────────────
+    // Retirer l'identité de Google à un compte Microsoft n'a aucun sens : le refus
+    // nomme le fournisseur qu'on a interpellé, pas celui qui est relié.
+    const account = { session: microsoftSession, csrf: microsoftMe.csrfToken };
+    const wrongProvider = await accountAction("/api/account/google/unlink", account, { currentPassword: PASSWORD });
+    assert.equal(wrongProvider.status, 409, logSink.value);
+    assert.equal(await errorCode(wrongProvider), "identity_not_linked");
   } finally {
     await harness.stop();
   }

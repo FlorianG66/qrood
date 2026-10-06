@@ -96,40 +96,10 @@
           </form>
         </section>
 
-        <section class="account-card" aria-labelledby="googleTitle" id="googleCard" hidden>
-          <h2 id="googleTitle">Connexion Google</h2>
-          <p class="field-hint" id="googleStatus">Chargement.</p>
-          <p class="account-note" id="googleNote" hidden></p>
-
-          <form id="googleLinkForm" hidden>
-            <div class="field-group">
-              <label for="googleLinkPassword">Mot de passe actuel</label>
-              <input id="googleLinkPassword" name="currentPassword" type="password" maxlength="128" autocomplete="current-password" required />
-              <p class="field-hint">
-                Relier n'efface rien : ni ton mot de passe, ni ton adresse, ni tes QR codes ne changent.
-                Google est alors une porte d'entrée de plus, à côté du mot de passe.
-              </p>
-            </div>
-            <button class="button button-dark button-small" type="submit">Relier mon compte Google</button>
-          </form>
-
-          <form id="googleUnlinkForm" hidden>
-            <div class="field-group">
-              <label for="googleUnlinkPassword">Mot de passe actuel</label>
-              <input id="googleUnlinkPassword" name="currentPassword" type="password" maxlength="128" autocomplete="current-password" required />
-              <p class="field-hint">
-                Délier est immédiat et définitif. Ensuite, te connecter avec cette identité Google créera
-                un compte distinct du tien, avec une bibliothèque vide : garde ton mot de passe, c'est lui
-                qui rouvre le bon compte.
-              </p>
-            </div>
-            <button class="button button-danger button-small" type="submit">Délier mon compte Google</button>
-          </form>
-
-          <div class="account-actions" id="googleActions" hidden>
-            <button class="button button-light button-small" id="googleReauthButton" type="button">Prouver mon identité avec Google</button>
-          </div>
-        </section>
+        <!-- Le contenu de cette carte est construit par compte.js : le serveur est seul à
+             savoir quels fournisseurs sont configurés et lequel est relié. Sans lui,
+             la carte reste vide et masquée. -->
+        <section class="account-card" aria-label="Connexion par un compte tiers" id="providerCard" hidden></section>
 
         <section class="account-card" aria-labelledby="twoFactorTitle">
           <h2 id="twoFactorTitle">Double authentification</h2>

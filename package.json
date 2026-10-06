@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "check:browser": "node tools/browser-check.mjs"
   },
   "dependencies": {
     "stripe": "^22.6.2"
